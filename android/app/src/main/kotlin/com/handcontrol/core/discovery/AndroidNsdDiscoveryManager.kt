@@ -149,6 +149,6 @@ class AndroidNsdDiscoveryManager @Inject constructor(
     }
 
     companion object {
-        private const val SERVICE_TYPE = "_handcontrol._tcp"
+        private const val SERVICE_TYPE = "_handcontrol._tcp.local."
     }
 }

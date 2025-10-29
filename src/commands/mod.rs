@@ -1,3 +1,5 @@
 pub mod executor;
 pub mod parameters;
-pub mod streaming;
+
+pub use executor::{execute_command, CommandOutput, ExecutionResult};
+pub use parameters::{substitute_parameters, validate_parameters};

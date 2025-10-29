@@ -79,7 +79,7 @@ class EnrollmentViewModel @Inject constructor(
                         Timber.i("Approval pairing pending: ${result.requestId}")
                         _uiState.value = EnrollmentUiState.ApprovalPending(
                             requestId = result.requestId,
-                            verificationCode = "000-000", // TODO: Get from server response
+                            verificationCode = result.verificationCode,
                             timeoutSeconds = result.timeoutSeconds
                         )
                         // Start polling for approval status

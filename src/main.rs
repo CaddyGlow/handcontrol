@@ -3,8 +3,11 @@ use clap::{Parser, Subcommand};
 use handcontrol::cli::enroll::handle_qr_enrollment;
 use handcontrol::config::{default_config_path, load_config, validate_config};
 use handcontrol::grpc::server::{start_server, RemoteControlService};
+use handcontrol::mdns::service::MdnsService;
+use handcontrol::notifications::NotificationManager;
 use handcontrol::security::certificates::ensure_server_certificate;
 use handcontrol::security::enrollment::EnrollmentTokenManager;
+use handcontrol::security::pairing::PairingRequestManager;
 use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
 use handcontrol::utils::logging;
@@ -201,6 +204,25 @@ async fn start_handcontrol_server() -> Result<()> {
     let enrollment_manager = EnrollmentTokenManager::new(enrollment_ttl);
     info!("Enrollment token TTL: {} seconds", enrollment_ttl);
 
+    // Initialize pairing request manager
+    let pairing_timeout = config.security.enrollment.approval_timeout_seconds;
+    let pairing_manager = PairingRequestManager::new(pairing_timeout);
+    info!("Pairing request timeout: {} seconds", pairing_timeout);
+
+    // Initialize notification manager
+    info!("Initializing notification manager...");
+    let notification_manager = NotificationManager::new();
+    if notification_manager.is_available() {
+        info!("Notification system available");
+    } else {
+        info!("Notification system unavailable, using fallback");
+    }
+
+    // Get values needed for mDNS before moving into Arc
+    let mdns_instance_name = config.server.mdns_instance_name.clone();
+    let mdns_port = config.server.port;
+    let cert_fingerprint = server_cert.fingerprint_display();
+
     // Create gRPC service
     info!("Creating gRPC service...");
     let service = RemoteControlService::new(
@@ -209,6 +231,8 @@ async fn start_handcontrol_server() -> Result<()> {
         server_id,
         client_store,
         enrollment_manager,
+        pairing_manager,
+        notification_manager,
     );
 
     // Parse bind address
@@ -219,12 +243,38 @@ async fn start_handcontrol_server() -> Result<()> {
     info!("Server initialization complete");
     info!("gRPC server will listen on {}", addr);
 
-    // TODO: Initialize mDNS service (Phase 7)
+    // Initialize mDNS service (Phase 7)
+    info!("Initializing mDNS service...");
+    let instance_name = mdns_instance_name
+        .unwrap_or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|h| h.into_string().ok())
+                .unwrap_or_else(|| "HandControl".to_string())
+        });
+
+    let mdns_service = MdnsService::new(
+        instance_name.clone(),
+        mdns_port,
+        server_id,
+        cert_fingerprint,
+    );
+
+    if let Err(e) = mdns_service.start() {
+        tracing::warn!("Failed to start mDNS service (continuing without discovery): {}", e);
+    } else {
+        info!("mDNS service started: instance_name={}", instance_name);
+    }
 
     // Start gRPC server
     start_server(addr, service)
         .await
         .context("gRPC server failed")?;
+
+    // Clean shutdown: stop mDNS service
+    if let Err(e) = mdns_service.stop() {
+        tracing::warn!("Failed to stop mDNS service during shutdown: {}", e);
+    }
 
     Ok(())
 }

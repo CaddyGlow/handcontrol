@@ -1,0 +1,33 @@
+# Gradle
+/.gradle/
+/build/
+/local.properties
+/gradle-app.setting
+/gradle-app.properties
+
+# Android Studio / IntelliJ
+/.idea/
+*.iml
+*.ipr
+*.iws
+.DS_Store
+
+# Module build directories
+/app/build/
+/app/.cxx/
+
+# Generated artifacts
+/captures/
+/outputs/
+/reports/
+.cxx/
+/.kotlin/
+
+# Signing assets
+*.keystore
+*.jks
+
+# Distribution archives
+*.ap_
+*.aab
+*.apk

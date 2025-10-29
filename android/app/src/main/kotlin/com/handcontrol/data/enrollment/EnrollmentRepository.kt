@@ -10,15 +10,24 @@ sealed interface EnrollmentResult {
 
 interface EnrollmentRepository {
     suspend fun enrollWithToken(
+        host: String,
+        port: Int,
         token: String,
         deviceName: String
     ): EnrollmentResult
 
     suspend fun requestApproval(
+        host: String,
+        port: Int,
         deviceName: String,
         deviceModel: String?
     ): EnrollmentResult
 
-    suspend fun pollApprovalStatus(requestId: String): EnrollmentResult
+    suspend fun pollApprovalStatus(
+        host: String,
+        port: Int,
+        requestId: String
+    ): EnrollmentResult
+
     suspend fun activeClientCertificate(): ClientCertificate?
 }

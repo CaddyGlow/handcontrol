@@ -132,22 +132,52 @@
 - `android/app/src/main/kotlin/com/handcontrol/core/discovery/AndroidNsdDiscoveryManager.kt` (implementation)
 - `android/app/src/main/kotlin/com/handcontrol/di/DiscoveryModule.kt` (Hilt module)
 
+### 9. Command Repository
+- Implemented `GrpcCommandRepository` for command management
+- Server info retrieval (hostname, version, OS)
+- Command listing with full parameter metadata
+- Streaming command execution with real-time output
+- Complete domain models for commands and parameters
+
+**Features:**
+- `getServerInfo()` - Retrieve server metadata
+- `listCommands()` - Get all available commands with parameters
+- `executeCommand()` - Execute with streaming stdout/stderr/exit code
+- Full parameter type support (slider, text, toggle, dropdown)
+- gRPC error mapping to user-friendly messages
+- Automatic channel lifecycle management
+
+**Domain Models:**
+- `Command` - Command metadata (id, name, description, icon, tags, parameters)
+- `CommandParameter` - Parameter definition with type-specific fields
+- `ParameterType` - Enum (SLIDER, TEXT, TOGGLE, DROPDOWN)
+- `CommandExecutionResult` - Sealed interface (Output, ExitCode, Error)
+- `ServerInfo` - Server metadata
+
+**Files:**
+- `android/app/src/main/kotlin/com/handcontrol/data/commands/CommandModels.kt`
+- `android/app/src/main/kotlin/com/handcontrol/data/commands/CommandRepository.kt` (interface)
+- `android/app/src/main/kotlin/com/handcontrol/data/commands/GrpcCommandRepository.kt` (implementation)
+- `android/app/src/main/kotlin/com/handcontrol/di/DataModule.kt` (Hilt module)
+- `android/app/src/test/kotlin/com/handcontrol/data/commands/CommandModelsTest.kt` (10 tests)
+
 ## Next Steps
 
 ### Immediate Priorities
 
-3. **Enrollment UI Flows**
+1. **Enrollment UI Flows**
    - Welcome/onboarding screen
    - QR code scanner (using CameraX + ML Kit)
    - Server discovery list
    - Approval pairing screen with verification code display
    - Pairing status polling UI
 
-4. **Command Repository**
-   - Implement `ListCommands` RPC integration
-   - Command caching for offline preview
-   - Command execution with streaming output
-   - Parameter validation
+2. **Command UI Flows**
+   - Server connection screen
+   - Command list screen with search/filter
+   - Command detail screen with parameter inputs
+   - Command execution screen with streaming output
+   - Error handling and retry logic
 
 5. **Additional Testing**
    - Unit tests for EnrollmentRepository (mock gRPC)
@@ -170,9 +200,11 @@
 3. Device model extraction (Android Build info) for approval mode
 
 ## Testing Status
-- ✅ Unit tests: VerificationCodeGenerator (8/8 passing)
+- ✅ Unit tests: VerificationCodeGenerator (12/12 passing)
+- ✅ Unit tests: CommandModels (10/10 passing)
 - ⏳ Unit tests: CertificateManager (pending)
 - ⏳ Unit tests: EnrollmentRepository (pending)
+- ⏳ Unit tests: CommandRepository (pending)
 - ⏳ Integration tests: Enrollment flows (pending)
 - ⏳ UI tests: (pending)
 

@@ -33,18 +33,20 @@ private val Context.enrollmentDataStore: DataStore<Preferences> by preferencesDa
 class GrpcEnrollmentRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val certificateManager: ClientCertificateManager,
-    private val channelProvider: () -> ManagedChannel
+    private val channelFactory: com.handcontrol.core.network.GrpcChannelFactory
 ) : EnrollmentRepository {
 
     private val CLIENT_ID_KEY = stringPreferencesKey("client_id")
 
     override suspend fun enrollWithToken(
+        host: String,
+        port: Int,
         token: String,
         deviceName: String
     ): EnrollmentResult {
         return try {
             val certificate = certificateManager.loadOrCreate()
-            val channel = channelProvider()
+            val channel = channelFactory.createChannel(host, port)
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
             val request = EnrollRequest.newBuilder()
@@ -54,6 +56,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                 .build()
 
             val response = stub.enroll(request)
+
+            channelFactory.shutdownChannel(channel)
 
             if (response.success) {
                 saveClientId(response.clientId)
@@ -73,12 +77,14 @@ class GrpcEnrollmentRepository @Inject constructor(
     }
 
     override suspend fun requestApproval(
+        host: String,
+        port: Int,
         deviceName: String,
         deviceModel: String?
     ): EnrollmentResult {
         return try {
             val certificate = certificateManager.loadOrCreate()
-            val channel = channelProvider()
+            val channel = channelFactory.createChannel(host, port)
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
             val serverCertDer = extractServerCertificate(channel)
@@ -140,9 +146,13 @@ class GrpcEnrollmentRepository @Inject constructor(
         }
     }
 
-    override suspend fun pollApprovalStatus(requestId: String): EnrollmentResult {
+    override suspend fun pollApprovalStatus(
+        host: String,
+        port: Int,
+        requestId: String
+    ): EnrollmentResult {
         return try {
-            val channel = channelProvider()
+            val channel = channelFactory.createChannel(host, port)
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
             val request = CheckPairingStatusRequest.newBuilder()
@@ -150,6 +160,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                 .build()
 
             val response = stub.checkPairingStatus(request)
+
+            channelFactory.shutdownChannel(channel)
 
             when (response.status) {
                 PairingStatus.PAIRING_STATUS_APPROVED -> {

@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package handcontrol.v1;
+
+option java_multiple_files = true;
+option java_package = "com.handcontrol.grpc";
+option java_outer_classname = "HandControlProto";
+
+// Main service
+service RemoteControl {
+  // Enrollment: QR code mode (token-based)
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Enrollment: Approval mode (interactive)
+  rpc RequestPairing(RequestPairingRequest) returns (RequestPairingResponse);
+  rpc CheckPairingStatus(CheckPairingStatusRequest) returns (CheckPairingStatusResponse);
+
+  // Get server information
+  rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
+
+  // List available commands
+  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+
+  // Execute a command with streaming output
+  rpc ExecuteCommand(ExecuteCommandRequest) returns (stream ExecuteCommandResponse);
+}
+
+// Enrollment (QR code mode)
+message EnrollRequest {
+  string enrollment_token = 1;
+  bytes client_certificate = 2;  // Full X.509 certificate (DER-encoded)
+  string device_name = 3;
+}
+
+message EnrollResponse {
+  bool success = 1;
+  string client_id = 2;
+  string error_message = 3;
+}
+
+// Enrollment (Approval mode with verification code)
+message RequestPairingRequest {
+  string device_name = 1;
+  string device_model = 2;
+  bytes client_certificate = 3;     // Full X.509 certificate (DER-encoded)
+  string verification_code = 4;     // Client's computed verification code
+}
+
+message RequestPairingResponse {
+  bool pending = 1;
+  string pairing_request_id = 2;
+  int32 timeout_seconds = 3;
+  string verification_code = 4;     // Server's computed verification code
+  bytes server_cert_fingerprint = 5; // SHA256 of server certificate
+  string error_message = 6;         // If verification mismatch, approval mode disabled, or other error
+}
+
+message CheckPairingStatusRequest {
+  string pairing_request_id = 1;
+}
+
+message CheckPairingStatusResponse {
+  PairingStatus status = 1;
+  string client_id = 2;
+  string error_message = 3;
+}
+
+enum PairingStatus {
+  PAIRING_STATUS_UNSPECIFIED = 0;
+  PAIRING_STATUS_PENDING = 1;
+  PAIRING_STATUS_APPROVED = 2;
+  PAIRING_STATUS_REJECTED = 3;
+  PAIRING_STATUS_TIMEOUT = 4;
+}
+
+// Server info
+message ServerInfoRequest {}
+
+message ServerInfoResponse {
+  string server_id = 1;
+  string hostname = 2;
+  string version = 3;
+  string os = 4;
+}
+
+// Command listing
+message ListCommandsRequest {}
+
+message ListCommandsResponse {
+  repeated Command commands = 1;
+}
+
+message Command {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  string icon = 4;
+  repeated string tags = 5;
+  repeated Parameter parameters = 6;
+}
+
+message Parameter {
+  string name = 1;
+  ParameterType type = 2;
+  string description = 3;
+
+  // Type-specific fields (optional, depends on type)
+  optional int32 min = 4;           // For slider
+  optional int32 max = 5;           // For slider
+  optional string default_value = 6;
+  repeated string options = 7;      // For dropdown
+  optional string validation = 8;   // Regex for text
+  optional string label_on = 9;     // For toggle
+  optional string label_off = 10;   // For toggle
+}
+
+enum ParameterType {
+  PARAMETER_TYPE_UNSPECIFIED = 0;
+  PARAMETER_TYPE_SLIDER = 1;
+  PARAMETER_TYPE_TEXT = 2;
+  PARAMETER_TYPE_TOGGLE = 3;
+  PARAMETER_TYPE_DROPDOWN = 4;
+}
+
+// Command execution
+message ExecuteCommandRequest {
+  string command_id = 1;
+  map<string, string> parameters = 2;
+}
+
+message ExecuteCommandResponse {
+  oneof response {
+    string stdout = 1;      // Chunk of stdout
+    string stderr = 2;      // Chunk of stderr
+    int32 exit_code = 3;    // Final exit code (last message)
+    string error = 4;       // Error message if command fails to start
+  }
+
+  // Metadata
+  optional int64 timestamp_ms = 5;
+}

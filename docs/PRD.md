@@ -150,8 +150,8 @@ The mode is configurable via the server config file and can be disabled/enabled 
 
 3. **Android scans QR:**
    - Validates JSON structure
-   - Generates client certificate (self-signed X.509, 10-year validity)
-   - Private key stored in Android Keystore (never transmitted)
+   - Generates client certificate (self-signed X.509, ECDSA P-256, 10-year validity)
+   - Private key stored in Android Keystore hardware-backed (never transmitted)
    - Connects to server via TLS
    - Verifies server certificate fingerprint matches QR code
 
@@ -171,9 +171,9 @@ The mode is configurable via the server config file and can be disabled/enabled 
    ```
 
    **Certificate Format:**
-   - Android generates self-signed X.509 certificate with 10-year validity
-   - Private key stored in Android Keystore (never transmitted)
-   - Full certificate (including public key) sent to server
+   - Android generates self-signed X.509 certificate with ECDSA P-256, 10-year validity
+   - Private key stored in Android Keystore hardware-backed (never transmitted)
+   - Full certificate (including ECDSA P-256 public key) sent to server
    - Server stores complete certificate for mTLS validation
 
 5. **Server validates:**
@@ -217,7 +217,7 @@ The mode is configurable via the server config file and can be disabled/enabled 
    - User taps "Request Pairing"
 
 2. **Android initiates pairing request (over TLS, server cert not yet pinned):**
-   - Generates client certificate (self-signed X.509)
+   - Generates client certificate (self-signed X.509, ECDSA P-256)
    - Computes verification code from both certificates
 
    ```protobuf
@@ -239,9 +239,9 @@ The mode is configurable via the server config file and can be disabled/enabled 
    ```
 
    **Certificate Format:**
-   - Android generates self-signed X.509 certificate with 10-year validity
-   - Private key stored in Android Keystore (never transmitted)
-   - Full certificate (including public key) sent to server
+   - Android generates self-signed X.509 certificate with ECDSA P-256, 10-year validity
+   - Private key stored in Android Keystore hardware-backed (never transmitted)
+   - Full certificate (including ECDSA P-256 public key) sent to server
    - Server stores complete certificate for mTLS validation
 
 3. **Verification code generation:**
@@ -384,12 +384,14 @@ All subsequent connections use mutual TLS:
 **Server Certificates:**
 - **Location:** `~/.config/handcontrol/server.crt` and `server.key`
 - **Generation:** Auto-generated on first run using `rcgen`
+- **Algorithm:** ECDSA P-256 (secp256r1) for smaller key sizes and better performance
 - **Validity:** 10 years (long-lived)
 - **Rotation:** Manual (user deletes files, server regenerates)
 
 **Client Certificates:**
 - **Storage:** Android Keystore (hardware-backed)
 - **Generation:** On-device during enrollment
+- **Algorithm:** ECDSA P-256 (secp256r1) - hardware-backed on most modern devices
 - **Validity:** 10 years
 - **Revocation:** Server removes from `authorized_clients/` directory
 
@@ -744,8 +746,8 @@ message ExecuteCommandResponse {
 4. App validates QR structure
 5. Shows server details (name, IP, fingerprint)
 6. User confirms pairing
-7. App generates client certificate (self-signed X.509, 10-year validity)
-8. Private key stored in Android Keystore (never transmitted)
+7. App generates client certificate (self-signed X.509, ECDSA P-256, 10-year validity)
+8. Private key stored in Android Keystore hardware-backed (never transmitted)
 9. Connects to server via TLS, verifies cert fingerprint matches QR
 10. Sends `Enroll` RPC with enrollment token and full client certificate
 11. Server validates token and stores full client certificate
@@ -758,7 +760,7 @@ message ExecuteCommandResponse {
 2. App auto-discovers servers via mDNS
 3. User sees list of discovered servers (unpaired)
 4. User taps server → "Request Pairing"
-5. App generates client certificate (self-signed X.509)
+5. App generates client certificate (self-signed X.509, ECDSA P-256)
 6. App computes verification code: `SHA256(SHA256(client_cert) || SHA256(server_cert) || server_id)` → first 6 digits
 7. Sends `RequestPairing` RPC with full client certificate and verification code
 8. **Server validates verification code (MANDATORY):**

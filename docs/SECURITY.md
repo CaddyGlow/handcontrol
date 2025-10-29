@@ -70,7 +70,8 @@ HandControl uses mTLS (mutual TLS) for all communication after initial pairing. 
        │     TXT: cert_fingerprint=SHA256:...    │
        │                                         │
        │  2. Generate client certificate        │
-       │     (self-signed X.509, 10-year)        │
+       │     (self-signed X.509, ECDSA P-256,    │
+       │      10-year, hardware-backed)          │
        │     Store private key in Keystore       │
        │                                         │
        │  3. Connect via TLS (unverified)       │
@@ -312,14 +313,33 @@ After enrollment, all connections use mutual TLS:
 
 ## Implementation Notes
 
+### Certificate Algorithm Selection
+
+**ECDSA P-256 (secp256r1) Benefits:**
+- Smaller key sizes (256-bit vs 2048-bit RSA) = smaller certificates
+- Better performance on mobile devices
+- Hardware-backed support on modern Android devices (Keystore)
+- Equivalent security to RSA-3072
+- Widely supported by TLS implementations (rustls, OkHttp)
+
+**Server Certificate:**
+- Algorithm: ECDSA with P-256 curve
+- Generated using `rcgen` crate with ECDSA key generation
+- Self-signed for local network use
+
+**Client Certificate (Android):**
+- Algorithm: ECDSA with P-256 curve
+- Hardware-backed generation via Android Keystore
+- Private key never leaves secure hardware
+
 ### Verification Code Generation
 
 ```rust
 use sha2::{Sha256, Digest};
 
 fn generate_verification_code(
-    client_cert_der: &[u8],  // Full DER-encoded certificate
-    server_cert_der: &[u8],  // Full DER-encoded certificate
+    client_cert_der: &[u8],  // Full DER-encoded ECDSA P-256 certificate
+    server_cert_der: &[u8],  // Full DER-encoded ECDSA P-256 certificate
     server_id: &Uuid,
 ) -> String {
     // Compute fingerprints first

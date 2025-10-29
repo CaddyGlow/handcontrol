@@ -266,8 +266,9 @@ async fn start_handcontrol_server() -> Result<()> {
         info!("mDNS service started: instance_name={}", instance_name);
     }
 
-    // Start gRPC server
-    start_server(addr, service)
+    // Start gRPC server with TLS
+    info!("Starting gRPC server with TLS...");
+    start_server(addr, service, cert_path, key_path)
         .await
         .context("gRPC server failed")?;
 

@@ -546,14 +546,33 @@ impl RemoteControl for RemoteControlService {
     }
 }
 
-/// Start the gRPC server
+/// Start the gRPC server with TLS
 pub async fn start_server(
     addr: SocketAddr,
     service: RemoteControlService,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
 ) -> Result<()> {
-    info!("Starting gRPC server on {}", addr);
+    use tonic::transport::{Identity, ServerTlsConfig};
+
+    info!("Starting gRPC server with TLS on {}", addr);
+
+    // Load certificate and key from PEM files
+    let cert_pem = std::fs::read(&cert_path)
+        .with_context(|| format!("Failed to read certificate file: {}", cert_path.display()))?;
+    let key_pem = std::fs::read(&key_path)
+        .with_context(|| format!("Failed to read key file: {}", key_path.display()))?;
+
+    // Create server identity from certificate and key
+    let identity = Identity::from_pem(cert_pem, key_pem);
+
+    // Configure TLS (without client certificate verification for now)
+    // TODO: Implement custom client certificate verification (see IMPLEMENTATION_GAPS.md #18)
+    let tls_config = ServerTlsConfig::new().identity(identity);
 
     Server::builder()
+        .tls_config(tls_config)
+        .context("Failed to configure TLS")?
         .add_service(RemoteControlServer::new(service))
         .serve(addr)
         .await

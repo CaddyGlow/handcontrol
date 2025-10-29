@@ -19,7 +19,7 @@ impl NotificationProvider for FallbackNotificationProvider {
     fn show_pairing_notification(
         &self,
         device_name: &str,
-        verification_code: &str,
+        _verification_code: &str,
     ) -> Result<bool> {
         // Log to console - user must have terminal access
         info!("=================================================================");

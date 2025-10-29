@@ -16,7 +16,11 @@ sealed interface Route {
     data class EnrollmentQr(val serverHost: String, val serverPort: Int) : Route
 
     @Serializable
-    data class EnrollmentApproval(val serverHost: String, val serverPort: Int) : Route
+    data class EnrollmentApproval(
+        val serverHost: String,
+        val serverPort: Int,
+        val serverId: String? = null
+    ) : Route
 
     @Serializable
     data class CommandList(val serverHost: String, val serverPort: Int) : Route

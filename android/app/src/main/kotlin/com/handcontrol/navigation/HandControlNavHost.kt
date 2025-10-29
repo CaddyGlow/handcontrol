@@ -32,8 +32,8 @@ fun HandControlNavHost(
                 onNavigateToQrEnrollment = {
                     navController.navigate(Route.EnrollmentQr("", 0))
                 },
-                onNavigateToApprovalEnrollment = { host, port ->
-                    navController.navigate(Route.EnrollmentApproval(host, port))
+                onNavigateToApprovalEnrollment = { host, port, serverId ->
+                    navController.navigate(Route.EnrollmentApproval(host, port, serverId))
                 }
             )
         }
@@ -57,6 +57,7 @@ fun HandControlNavHost(
             com.handcontrol.feature.enrollment.ApprovalPairingScreen(
                 serverHost = route.serverHost,
                 serverPort = route.serverPort,
+                serverId = route.serverId,
                 onNavigateBack = {
                     navController.popBackStack()
                 },

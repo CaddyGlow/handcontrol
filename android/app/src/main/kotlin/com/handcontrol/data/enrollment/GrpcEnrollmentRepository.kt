@@ -80,7 +80,8 @@ class GrpcEnrollmentRepository @Inject constructor(
         host: String,
         port: Int,
         deviceName: String,
-        deviceModel: String?
+        deviceModel: String?,
+        serverId: String?
     ): EnrollmentResult {
         return try {
             val certificate = certificateManager.loadOrCreate()
@@ -92,11 +93,11 @@ class GrpcEnrollmentRepository @Inject constructor(
                 return EnrollmentResult.Error("Failed to extract server certificate")
             }
 
-            val serverId = "unknown"
+            val effectiveServerId = serverId ?: "unknown"
             val verificationCode = VerificationCodeGenerator.generate(
                 certificate.certificateDer,
                 serverCertDer,
-                serverId
+                effectiveServerId
             )
 
             val request = RequestPairingRequest.newBuilder()
@@ -131,7 +132,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                 Timber.i("Approval pairing pending: requestId=${response.pairingRequestId}")
                 EnrollmentResult.Pending(
                     response.pairingRequestId,
-                    response.timeoutSeconds
+                    response.timeoutSeconds,
+                    verificationCode
                 )
             } else {
                 Timber.w("Approval pairing not pending")

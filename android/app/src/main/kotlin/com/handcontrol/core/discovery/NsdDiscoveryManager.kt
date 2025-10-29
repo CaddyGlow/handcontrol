@@ -6,7 +6,9 @@ data class DiscoveredServer(
     val name: String,
     val host: String,
     val port: Int,
-    val fingerprint: String?
+    val fingerprint: String?,
+    val serverId: String?,
+    val version: String?
 )
 
 interface NsdDiscoveryManager {

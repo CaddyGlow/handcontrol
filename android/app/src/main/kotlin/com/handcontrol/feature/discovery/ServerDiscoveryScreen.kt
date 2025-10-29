@@ -46,7 +46,7 @@ import com.handcontrol.ui.theme.HandControlTheme
 @Composable
 fun ServerDiscoveryScreen(
     onNavigateToQrEnrollment: () -> Unit,
-    onNavigateToApprovalEnrollment: (String, Int) -> Unit,
+    onNavigateToApprovalEnrollment: (String, Int, String?) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ServerDiscoveryViewModel = hiltViewModel()
 ) {
@@ -101,7 +101,7 @@ fun ServerDiscoveryScreen(
                     ServerListView(
                         servers = uiState.servers,
                         onServerSelected = { server ->
-                            onNavigateToApprovalEnrollment(server.host, server.port)
+                            onNavigateToApprovalEnrollment(server.host, server.port, server.serverId)
                         },
                         onScanQr = onNavigateToQrEnrollment
                     )

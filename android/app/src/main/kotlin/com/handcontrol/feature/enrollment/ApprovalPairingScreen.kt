@@ -47,6 +47,7 @@ import com.handcontrol.ui.theme.HandControlTheme
 fun ApprovalPairingScreen(
     serverHost: String,
     serverPort: Int,
+    serverId: String?,
     onNavigateBack: () -> Unit,
     onNavigateToCommands: (String, Int) -> Unit,
     modifier: Modifier = Modifier,
@@ -55,7 +56,7 @@ fun ApprovalPairingScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
-        viewModel.requestApprovalPairing(serverHost, serverPort)
+        viewModel.requestApprovalPairing(serverHost, serverPort, serverId)
     }
 
     Scaffold(

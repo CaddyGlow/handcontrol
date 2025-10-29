@@ -64,13 +64,15 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                             name = serviceInfo.serviceName,
                             host = serviceInfo.host.hostAddress ?: serviceInfo.host.hostName,
                             port = serviceInfo.port,
-                            fingerprint = fingerprint
+                            fingerprint = fingerprint,
+                            serverId = serverId,
+                            version = version
                         )
 
                         discoveredServers[serviceInfo.serviceName] = server
                         _servers.value = discoveredServers.values.toList()
 
-                        Timber.d("Server added: $server (version=$version, serverId=$serverId)")
+                        Timber.d("Server added: $server")
                     }
                 })
             }

@@ -65,14 +65,14 @@ class EnrollmentViewModel @Inject constructor(
         }
     }
 
-    fun requestApprovalPairing(host: String, port: Int) {
+    fun requestApprovalPairing(host: String, port: Int, serverId: String?) {
         viewModelScope.launch {
             try {
                 Timber.i("Requesting approval pairing")
 
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
                 val deviceModel = Build.MODEL
-                val result = enrollmentRepository.requestApproval(host, port, deviceName, deviceModel)
+                val result = enrollmentRepository.requestApproval(host, port, deviceName, deviceModel, serverId)
 
                 when (result) {
                     is EnrollmentResult.Pending -> {

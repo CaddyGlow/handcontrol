@@ -35,6 +35,7 @@ impl Default for ClientRegistry {
 }
 
 /// Manager for authorized client certificates
+#[derive(Debug)]
 pub struct ClientStore {
     clients_dir: PathBuf,
     metadata_path: PathBuf,

@@ -94,20 +94,47 @@
 - All tests passing
 - Build: `gradle testDebugUnitTest` successful
 
+### 7. gRPC Channel Factory with mTLS
+- Implemented `MtlsGrpcChannelFactory` with full mutual TLS support
+- Client certificate authentication using Android Keystore
+- Server certificate validation with fingerprint pinning
+- Server certificate extraction for verification code generation
+- Channel lifecycle management (creation, shutdown, cleanup)
+
+**Features:**
+- mTLS using OkHttp-based gRPC channels
+- Custom TrustManager that captures and validates server certificates
+- Automatic fingerprint pinning verification
+- Graceful shutdown with timeout handling
+- Thread-safe channel tracking
+
+**Files:**
+- `android/app/src/main/kotlin/com/handcontrol/core/network/GrpcChannelFactory.kt` (interface)
+- `android/app/src/main/kotlin/com/handcontrol/core/network/MtlsGrpcChannelFactory.kt` (implementation)
+- `android/app/src/main/kotlin/com/handcontrol/di/NetworkModule.kt` (Hilt module)
+
+### 8. NSD Discovery Manager
+- Implemented `AndroidNsdDiscoveryManager` using Android NSD API
+- Service discovery for `_handcontrol._tcp` mDNS services
+- Extracts TXT record attributes (version, server_id, cert_fingerprint)
+- Reactive Flow-based API for discovered servers
+- Automatic service resolution with host/port extraction
+
+**Features:**
+- Real-time server discovery via mDNS/Bonjour
+- Automatic service resolution (host, port)
+- TXT record parsing (fingerprint, server ID, version)
+- StateFlow-based reactive updates
+- Proper lifecycle management (start/stop discovery)
+
+**Files:**
+- `android/app/src/main/kotlin/com/handcontrol/core/discovery/NsdDiscoveryManager.kt` (interface)
+- `android/app/src/main/kotlin/com/handcontrol/core/discovery/AndroidNsdDiscoveryManager.kt` (implementation)
+- `android/app/src/main/kotlin/com/handcontrol/di/DiscoveryModule.kt` (Hilt module)
+
 ## Next Steps
 
 ### Immediate Priorities
-1. **gRPC Channel Factory Implementation**
-   - Implement TLS channel builder with mTLS
-   - Server certificate validation
-   - Connection pooling and lifecycle management
-   - Location: `android/app/src/main/kotlin/com/handcontrol/core/network/GrpcChannelFactory.kt`
-
-2. **NSD Discovery Implementation**
-   - Android NSD API integration
-   - Service discovery for `_handcontrol._tcp.local.`
-   - Parse TXT records (version, server_id, cert_fingerprint)
-   - Location: `android/app/src/main/kotlin/com/handcontrol/core/discovery/NsdDiscoveryManager.kt`
 
 3. **Enrollment UI Flows**
    - Welcome/onboarding screen

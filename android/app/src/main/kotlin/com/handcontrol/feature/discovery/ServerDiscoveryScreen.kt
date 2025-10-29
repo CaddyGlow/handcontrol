@@ -333,8 +333,8 @@ private fun ServerListPreview() {
     HandControlTheme {
         ServerListView(
             servers = listOf(
-                DiscoveredServer("desktop-pc", "192.168.1.100", 8443, "SHA256:abcd1234"),
-                DiscoveredServer("laptop", "192.168.1.101", 8443, "SHA256:efgh5678")
+                DiscoveredServer("desktop-pc", "192.168.1.100", 8443, "SHA256:abcd1234", null, null),
+                DiscoveredServer("laptop", "192.168.1.101", 8443, "SHA256:efgh5678", null, null)
             ),
             onServerSelected = {},
             onScanQr = {}

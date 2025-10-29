@@ -35,6 +35,18 @@ enum Commands {
     },
     /// Start the HandControl server
     Serve,
+    /// Approve a pending pairing request
+    Approve {
+        /// Request ID to approve
+        request_id: String,
+    },
+    /// Reject a pending pairing request
+    Reject {
+        /// Request ID to reject
+        request_id: String,
+    },
+    /// List pending pairing requests
+    ListPending,
 }
 
 #[tokio::main]
@@ -54,6 +66,15 @@ async fn main() -> Result<()> {
                 eprintln!("Please specify --qr for QR code enrollment");
                 std::process::exit(1);
             }
+        }
+        Some(Commands::Approve { request_id }) => {
+            handle_approve_command(&request_id).await?;
+        }
+        Some(Commands::Reject { request_id }) => {
+            handle_reject_command(&request_id).await?;
+        }
+        Some(Commands::ListPending) => {
+            handle_list_pending_command().await?;
         }
         Some(Commands::Serve) | None => {
             // Default: start server
@@ -114,6 +135,42 @@ async fn handle_enroll_command() -> Result<()> {
     handle_qr_enrollment(&server_cert, server_id, addr, &enrollment_manager).await?;
 
     Ok(())
+}
+
+async fn handle_approve_command(request_id: &str) -> Result<()> {
+    info!("Approving pairing request: {}", request_id);
+
+    // Note: In a production system, the pairing manager would persist its state
+    // For now, we load it from the running server's state
+    println!("Error: Cannot approve pairing request from CLI.");
+    println!("The pairing manager state is only available while the server is running.");
+    println!("Please use OS notifications to approve pairing requests.");
+    println!("\nAlternatively, you can:");
+    println!("  1. Check the server logs for the verification code");
+    println!("  2. Ensure the verification codes match on both devices");
+    println!("  3. Wait for the approval timeout to expire and try again");
+
+    anyhow::bail!("Pairing approval requires server to be running")
+}
+
+async fn handle_reject_command(request_id: &str) -> Result<()> {
+    info!("Rejecting pairing request: {}", request_id);
+
+    println!("Error: Cannot reject pairing request from CLI.");
+    println!("The pairing manager state is only available while the server is running.");
+    println!("Please use OS notifications to reject pairing requests.");
+
+    anyhow::bail!("Pairing rejection requires server to be running")
+}
+
+async fn handle_list_pending_command() -> Result<()> {
+    info!("Listing pending pairing requests");
+
+    println!("Error: Cannot list pairing requests from CLI.");
+    println!("The pairing manager state is only available while the server is running.");
+    println!("Please check the server logs for pending pairing requests.");
+
+    anyhow::bail!("Listing pairing requests requires server to be running")
 }
 
 async fn start_handcontrol_server() -> Result<()> {

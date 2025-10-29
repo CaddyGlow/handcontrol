@@ -111,7 +111,7 @@ fun ApprovalPairingScreen(
                         message = state.message,
                         onRetry = {
                             viewModel.clearError()
-                            viewModel.requestApprovalPairing(serverHost, serverPort)
+                            viewModel.requestApprovalPairing(serverHost, serverPort, serverId)
                         },
                         onCancel = {
                             viewModel.cancelEnrollment()

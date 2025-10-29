@@ -172,7 +172,7 @@ class GrpcEnrollmentRepository @Inject constructor(
                     EnrollmentResult.Success(response.clientId)
                 }
                 PairingStatus.PAIRING_STATUS_PENDING -> {
-                    EnrollmentResult.Pending(requestId, 0)
+                    EnrollmentResult.Pending(requestId, 0, "")
                 }
                 PairingStatus.PAIRING_STATUS_REJECTED -> {
                     Timber.w("Approval pairing rejected by user")

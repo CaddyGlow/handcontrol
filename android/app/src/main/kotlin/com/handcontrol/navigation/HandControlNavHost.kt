@@ -30,7 +30,7 @@ fun HandControlNavHost(
         composable<Route.ServerDiscovery> {
             com.handcontrol.feature.discovery.ServerDiscoveryScreen(
                 onNavigateToQrEnrollment = {
-                    // TODO: Navigate to QR enrollment
+                    navController.navigate(Route.EnrollmentQr("", 0))
                 },
                 onNavigateToApprovalEnrollment = { host, port ->
                     navController.navigate(Route.EnrollmentApproval(host, port))
@@ -40,17 +40,43 @@ fun HandControlNavHost(
 
         composable<Route.EnrollmentQr> { backStackEntry ->
             val route = backStackEntry.toRoute<Route.EnrollmentQr>()
-            // QR enrollment screen - to be implemented
+            com.handcontrol.feature.enrollment.QrScannerScreen(
+                onNavigateBack = {
+                    navController.popBackStack()
+                },
+                onQrCodeScanned = { host, port, token ->
+                    navController.navigate(Route.CommandList(host, port)) {
+                        popUpTo(Route.Welcome) { inclusive = true }
+                    }
+                }
+            )
         }
 
         composable<Route.EnrollmentApproval> { backStackEntry ->
             val route = backStackEntry.toRoute<Route.EnrollmentApproval>()
-            // Approval enrollment screen - to be implemented
+            com.handcontrol.feature.enrollment.ApprovalPairingScreen(
+                serverHost = route.serverHost,
+                serverPort = route.serverPort,
+                onNavigateBack = {
+                    navController.popBackStack()
+                },
+                onNavigateToCommands = { host, port ->
+                    navController.navigate(Route.CommandList(host, port)) {
+                        popUpTo(Route.Welcome) { inclusive = true }
+                    }
+                }
+            )
         }
 
         composable<Route.CommandList> { backStackEntry ->
             val route = backStackEntry.toRoute<Route.CommandList>()
-            // Command list screen - to be implemented
+            com.handcontrol.feature.commands.CommandListScreen(
+                serverHost = route.serverHost,
+                serverPort = route.serverPort,
+                onNavigateToCommandExecution = { host, port, commandId ->
+                    navController.navigate(Route.CommandExecution(host, port, commandId))
+                }
+            )
         }
 
         composable<Route.CommandDetail> { backStackEntry ->
@@ -60,7 +86,14 @@ fun HandControlNavHost(
 
         composable<Route.CommandExecution> { backStackEntry ->
             val route = backStackEntry.toRoute<Route.CommandExecution>()
-            // Command execution screen - to be implemented
+            com.handcontrol.feature.commands.CommandExecutionScreen(
+                serverHost = route.serverHost,
+                serverPort = route.serverPort,
+                commandId = route.commandId,
+                onNavigateBack = {
+                    navController.popBackStack()
+                }
+            )
         }
     }
 }

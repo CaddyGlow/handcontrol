@@ -1,7 +1,13 @@
+pub mod client;
+pub mod tokens;
+
 use crate::config::parser::RelayConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
+
+pub use client::RelayClient;
+pub use tokens::TokenIssuer;
 
 /// Payload sent over the control WebSocket immediately after `/register`.
 #[derive(Debug, Serialize, PartialEq)]

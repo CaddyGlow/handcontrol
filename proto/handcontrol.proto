@@ -43,6 +43,9 @@ message EnrollResponse {
   bool success = 1;
   string client_id = 2;
   string error_message = 3;
+
+  // Optional relay information for cross-network connectivity
+  optional RelayInfo relay_info = 4;
 }
 
 message GenerateEnrollmentQRRequest {}
@@ -88,6 +91,9 @@ message CheckPairingStatusResponse {
   PairingStatus status = 1;
   string client_id = 2;
   string error_message = 3;
+
+  // Optional relay information for cross-network connectivity
+  optional RelayInfo relay_info = 4;
 }
 
 message ApprovePairingRequest {

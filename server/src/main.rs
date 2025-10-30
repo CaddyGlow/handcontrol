@@ -10,6 +10,7 @@ use handcontrol::grpc::proto::{
 use handcontrol::grpc::server::{RemoteControlService, start_server};
 use handcontrol::mdns::service::MdnsService;
 use handcontrol::notifications::NotificationManager;
+use handcontrol::relay::{RelayClient, TokenIssuer};
 use handcontrol::security::certificates::ensure_server_certificate;
 use handcontrol::security::enrollment::EnrollmentTokenManager;
 use handcontrol::security::pairing::PairingRequestManager;
@@ -499,6 +500,24 @@ async fn start_handcontrol_server() -> Result<()> {
         info!("Notification system unavailable, using fallback");
     }
 
+    // Initialize relay infrastructure
+    let token_issuer = if config.relay.enabled {
+        info!("Relay support enabled, initializing token issuer...");
+        let relay_key_path = paths::config_dir()
+            .context("Failed to determine config directory")?
+            .join("relay-key.pem");
+
+        let issuer = Arc::new(
+            TokenIssuer::new(server_id, &relay_key_path)
+                .context("Failed to initialize relay token issuer")?
+        );
+
+        info!("Relay token issuer initialized");
+        Some(issuer)
+    } else {
+        None
+    };
+
     // Get values needed for networking/mDNS before moving into Arc
     let mdns_instance_name = config.server.mdns_instance_name.clone();
     let server_port = config.server.port;
@@ -536,7 +555,7 @@ async fn start_handcontrol_server() -> Result<()> {
     // Create gRPC service
     info!("Creating gRPC service...");
     let service = RemoteControlService::new(
-        config_arc,
+        config_arc.clone(),
         Arc::new(server_cert),
         server_id,
         client_store,
@@ -546,6 +565,7 @@ async fn start_handcontrol_server() -> Result<()> {
         config_version,
         config_broadcaster,
         last_config_update,
+        token_issuer.clone(),
     );
 
     // Parse bind address
@@ -580,6 +600,28 @@ async fn start_handcontrol_server() -> Result<()> {
         );
     } else {
         info!("mDNS service started: instance_name={}", instance_name);
+    }
+
+    // Start relay client if enabled
+    if let Some(ref issuer) = token_issuer {
+        let relay_config = config_arc.read().unwrap().relay.clone();
+        if relay_config.enabled {
+            info!("Starting relay client...");
+            let relay_client = Arc::new(RelayClient::new(
+                relay_config,
+                server_id,
+                issuer.clone(),
+                addr,
+            ));
+
+            // Spawn relay client task
+            let relay_client_clone = relay_client.clone();
+            tokio::spawn(async move {
+                relay_client_clone.start().await;
+            });
+
+            info!("Relay client started");
+        }
     }
 
     // Start gRPC server with TLS

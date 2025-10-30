@@ -43,6 +43,7 @@ pub struct RemoteControlService {
     config_version: Arc<AtomicU64>,
     config_broadcaster: Arc<ConfigBroadcaster>,
     last_config_update: Arc<AtomicU64>,
+    token_issuer: Option<Arc<crate::relay::TokenIssuer>>,
 }
 
 impl RemoteControlService {
@@ -57,6 +58,7 @@ impl RemoteControlService {
         config_version: Arc<AtomicU64>,
         config_broadcaster: Arc<ConfigBroadcaster>,
         last_config_update: Arc<AtomicU64>,
+        token_issuer: Option<Arc<crate::relay::TokenIssuer>>,
     ) -> Self {
         Self {
             config,
@@ -69,6 +71,31 @@ impl RemoteControlService {
             config_version,
             config_broadcaster,
             last_config_update,
+            token_issuer,
+        }
+    }
+
+    /// Generate relay info for enrollment responses
+    fn generate_relay_info(&self, client_id: &str) -> Option<super::proto::RelayInfo> {
+        let config = self.config.read().unwrap();
+
+        if !config.relay.enabled || !config.relay.include_in_enrollment {
+            return None;
+        }
+
+        let token_issuer = self.token_issuer.as_ref()?;
+        let relay_url = config.relay.relay_server_url.as_ref()?;
+
+        match token_issuer.generate_relay_token(client_id, relay_url, 24) {
+            Ok(token) => Some(super::proto::RelayInfo {
+                relay_url: relay_url.clone(),
+                relay_token: token,
+                relay_required: false,
+            }),
+            Err(e) => {
+                tracing::error!("Failed to generate relay token for {}: {}", client_id, e);
+                None
+            }
         }
     }
 }
@@ -104,6 +131,7 @@ impl RemoteControl for RemoteControlService {
                 success: false,
                 client_id: String::new(),
                 error_message: "QR code enrollment is disabled on this server".to_string(),
+                relay_info: None,
             }));
         }
 
@@ -117,6 +145,7 @@ impl RemoteControl for RemoteControlService {
                 success: false,
                 client_id: String::new(),
                 error_message: format!("Invalid enrollment token: {}", e),
+                relay_info: None,
             }));
         }
 
@@ -153,10 +182,13 @@ impl RemoteControl for RemoteControlService {
             req.device_name, client_id
         );
 
+        let relay_info = self.generate_relay_info(&client_id);
+
         Ok(Response::new(EnrollResponse {
             success: true,
             client_id,
             error_message: String::new(),
+            relay_info,
         }))
     }
 
@@ -447,6 +479,7 @@ impl RemoteControl for RemoteControlService {
                     status: super::proto::PairingStatus::Unspecified as i32,
                     client_id: String::new(),
                     error_message: "Pairing request not found".to_string(),
+                    relay_info: None,
                 }));
             }
         };
@@ -501,10 +534,17 @@ impl RemoteControl for RemoteControlService {
             }
         };
 
+        let relay_info = if status == super::proto::PairingStatus::Approved as i32 {
+            self.generate_relay_info(&client_id)
+        } else {
+            None
+        };
+
         Ok(Response::new(CheckPairingStatusResponse {
             status,
             client_id,
             error_message,
+            relay_info,
         }))
     }
 

@@ -23,6 +23,11 @@ tokio-tungstenite = { version = "0.25", default-features = false, features = ["r
 tungstenite = "0.21"
 futures-util = "0.3"
 tower = "0.5"
+jsonwebtoken = { version = "10.1", features = ["rust_crypto"] }
+ed25519-dalek = "2.2.0"
+base64 = "0.22"
+base64ct = "1.8"
+spki = "0.7"
 
 [workspace.dependencies.prost-build]
 version = "0.14"

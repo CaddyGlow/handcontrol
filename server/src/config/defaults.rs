@@ -1,6 +1,6 @@
 use super::parser::{
-    CommandConfig, Config, EnrollmentConfig, NetworkConfig, ParameterConfig, SecurityConfig,
-    ServerConfig,
+    CommandConfig, Config, EnrollmentConfig, NetworkConfig, ParameterConfig, RelayConfig,
+    SecurityConfig, ServerConfig,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -29,6 +29,7 @@ pub fn generate_default_config() -> Result<Config> {
             },
         },
         network: NetworkConfig::default(),
+        relay: RelayConfig::default(),
         command: commands,
     })
 }

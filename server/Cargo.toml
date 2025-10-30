@@ -48,6 +48,10 @@ notify = { version = "8.0", default-features = false, features = [
   "macos_kqueue",
 ] }
 async-stream = "0.3"
+tokio-tungstenite = { workspace = true }
+tungstenite = { workspace = true }
+futures-util = { workspace = true }
+url = "2.5"
 
 # Platform-specific notification support
 [target.'cfg(target_os = "linux")'.dependencies]

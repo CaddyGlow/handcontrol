@@ -11,6 +11,8 @@ pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
     #[serde(default)]
+    pub relay: RelayConfig,
+    #[serde(default)]
     pub command: Vec<CommandConfig>,
 }
 
@@ -84,6 +86,35 @@ impl Default for NetworkConfig {
             prefer_stable_addresses: true,
             excluded_interface_prefixes: default_excluded_interfaces(),
             max_advertised_addresses: default_max_addresses(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct RelayConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    pub relay_server_url: Option<String>,
+    pub relay_auth_secret: Option<String>,
+    pub max_relay_tunnels: Option<u32>,
+    #[serde(default = "default_true")]
+    pub auto_connect: bool,
+    #[serde(default = "default_true")]
+    pub include_in_enrollment: bool,
+    #[serde(default = "default_relay_reconnect_delay")]
+    pub reconnect_delay_seconds: u64,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relay_server_url: None,
+            relay_auth_secret: None,
+            max_relay_tunnels: None,
+            auto_connect: true,
+            include_in_enrollment: true,
+            reconnect_delay_seconds: default_relay_reconnect_delay(),
         }
     }
 }
@@ -164,6 +195,10 @@ fn default_excluded_interfaces() -> Vec<String> {
         "tun".to_string(),
         "tap".to_string(),
     ]
+}
+
+fn default_relay_reconnect_delay() -> u64 {
+    30
 }
 
 /// Load configuration from a TOML file

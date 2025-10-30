@@ -282,6 +282,13 @@ Clients wait for `connect_ack` before emitting `tunnel_ready`. After both sides 
 - If the relay cannot validate a token or secret it sends an error frame and closes the WebSocket with code `4401` (custom “unauthorized”).
 - Idle tunnels are closed after `idle_timeout_seconds` (default 600) with clean close code `1000`.
 
+#### Synchronization & Race Prevention
+
+- The relay tracks each tunnel in a `Pending` state until it has received `tunnel_ready` from both server and client; only then does it transition to `Active` and begin forwarding bytes.
+- If the client sends `tunnel_ready` before the server connects, the relay queues the signal and starts a 5-second timer; if the server does not arrive before timeout, the relay responds with an error and closes the socket gracefully.
+- Conversely, if the server opens the tunnel first, its `tunnel_ready` is buffered until the client-initialized socket confirms readiness.
+- This handshake ensures neither side processes application data until the opposite endpoint is confirmed, eliminating race conditions where one party might start writing TLS records into a half-open tunnel.
+
 #### Preserving End-to-End TLS
 
 Because the relay only sees opaque TLS bytes inside the WebSocket tunnel, it never terminates or inspects the mutual TLS session between Android and the PC server. Certificate validation and client authentication continue to happen exactly as they do on a direct connection. The relay simply copies binary frames in both directions.
@@ -324,6 +331,31 @@ Because the relay only sees opaque TLS bytes inside the WebSocket tunnel, it nev
 
 ## Implementation Plan
 
+### Rust Dependency Updates
+
+Before coding, update the three workspace manifests to add the WebSocket and HTTP tooling this design requires:
+
+- `Cargo.toml` (workspace root): add shared dependencies for `axum = "0.7"`, `tokio-tungstenite = "0.25"`, `tungstenite = "0.21"`, `futures-util = "0.3"`, and `tower = "0.5"`.
+- `relay/Cargo.toml`: depend on `axum`, `hyper = "1"`, `http = "1"`, `tokio-tungstenite`, `tungstenite`, and `futures-util`, dropping the now-unused `tonic`/`prost` crates after the WebSocket migration.
+- `server/Cargo.toml`: add `tokio-tungstenite`, `tungstenite`, `futures-util`, and `url` to support the client-side tunnel connector.
+
+Validate `cargo metadata` still succeeds after these edits before proceeding with code changes.
+
+#### 1.0 Relay Configuration
+
+Ship a default `relay/relay.toml` alongside the binary so administrators have a starting point:
+
+```toml
+bind_address = "0.0.0.0"
+port = 443
+handshake_timeout_seconds = 5
+
+[registration_secrets]
+"00000000-0000-0000-0000-000000000001" = "base64-secret-generated-per-server"
+```
+
+The CLI accepts an optional `--config` argument; when omitted, it falls back to `relay.toml` in the working directory.
+
 ### Phase 1: Relay Server Foundation (Weeks 1-2)
 
 #### 1.1 Project Structure
@@ -350,134 +382,181 @@ handcontrol/
 **File:** `relay/src/main.rs`
 
 ```rust
-use std::{collections::HashMap, sync::Arc};
-
-use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
-    response::IntoResponse,
-    routing::get,
-    Router,
-};
-use tokio::sync::RwLock;
-use tokio_stream::StreamExt;
-
-#[derive(Clone)]
-struct RelayState {
-    registered_servers: Arc<RwLock<HashMap<String, ServerControlSocket>>>,
-}
-
-struct ServerControlSocket {
-    server_id: String,
-    websocket: WebSocket,
-    last_seen: Instant,
-    public_key: Arc<VerifyingKey>,
-}
-
-async fn register_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<RelayState>,
-) -> impl IntoResponse {
-    ws.protocols(["handcontrol-relay.v1"]).on_upgrade(|socket| async move {
-        if let Err(err) = handle_register_socket(socket, state).await {
-            tracing::warn!("register socket ended: {err:?}");
-        }
-    })
-}
-
-async fn tunnel_handler(
-    ws: WebSocketUpgrade,
-    Path(tunnel_id): Path<Uuid>,
-    State(state): State<RelayState>,
-) -> impl IntoResponse {
-    ws.protocols(["handcontrol-relay.v1"]).on_upgrade(|socket| async move {
-        handle_tunnel_socket(socket, tunnel_id, state).await;
-    })
-}
-
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let state = RelayState {
-        registered_servers: Arc::new(RwLock::new(HashMap::new())),
-    };
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    tracing_subscriber::fmt::init();
+
+    let config_path = cli.config.unwrap_or_else(default_config_path);
+    let config = load_config(&config_path)?;
+
+    let state = Arc::new(AppState::new(config));
 
     let app = Router::new()
         .route("/register", get(register_handler))
         .route("/connect", get(connect_handler))
         .route("/tunnel/:tunnel_id", get(tunnel_handler))
-        .with_state(state);
+        .with_state(state.clone());
 
-    axum::Server::bind(&relay_config.bind_addr())
-        .tls_config(relay_config.tls.clone())?
-        .serve(app.into_make_service())
+    let addr: SocketAddr = state.listen_addr.parse()?;
+    axum::serve(tokio::net::TcpListener::bind(addr).await?, app.into_make_service()).await?;
+    Ok(())
+}
+
+struct RegisteredServer {
+    control_tx: mpsc::Sender<ServerCommand>,
+    decoding_key: Arc<DecodingKey>,
+}
+
+impl ServerCommand {
+    fn into_message(self) -> Message {
+        match self {
+            ServerCommand::OpenTunnel { tunnel_id, client_id, preferred_protocol, expires_at } => {
+                Message::Text(
+                    serde_json::json!({
+                        "type": "open_tunnel",
+                        "tunnel_id": tunnel_id.to_string(),
+                        "client_id": client_id.to_string(),
+                        "preferred_protocol": preferred_protocol,
+                        "expires_at": expires_at,
+                    })
+                    .to_string(),
+                )
+            }
+        }
+    }
+}
+
+async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> Result<()> {
+    let payload = recv_text(&mut socket, "register")?;
+    let msg: RegisterPayload = serde_json::from_str(&payload)?;
+    let server_id = Uuid::parse_str(&msg.server_id)?;
+
+    if !state.validate_secret(&server_id, &msg.relay_secret).await {
+        send_error(&mut socket, "register_ack", "unauthorized").await?;
+        return Ok(());
+    }
+
+    let raw_key = Base64.decode(msg.public_key.as_bytes())?;
+    let verifying_key = VerifyingKey::from_bytes(raw_key.as_slice().try_into()?)?;
+    let public_key_der = verifying_key.to_public_key_der()?;
+    let decoding_key = Arc::new(DecodingKey::from_ed_der(public_key_der.as_ref()));
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "register_ack",
+                "status": "ok",
+                "retry_after_seconds": 0
+            })
+            .to_string(),
+        ))
         .await?;
 
+    let (tx, mut rx) = mpsc::channel(32);
+    state.upsert_server(
+        server_id,
+        Arc::new(RegisteredServer {
+            control_tx: tx,
+            decoding_key,
+        }),
+    ).await;
+
+    while let Some(cmd) = rx.recv().await {
+        socket.send(cmd.into_message()).await?;
+    }
+
+    state.remove_server(&server_id).await;
+    Ok(())
+}
+
+async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> Result<()> {
+    let payload = recv_text(&mut socket, "connect")?;
+    let msg: ConnectPayload = serde_json::from_str(&payload)?;
+    let server_id = Uuid::parse_str(&msg.server_id)?;
+    let client_id = Uuid::parse_str(&msg.client_id)?;
+
+    let Some(server_entry) = state.server_entry(&server_id).await else {
+        send_error(&mut socket, "connect_ack", "server_not_registered").await?;
+        return Ok(());
+    };
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.set_audience(&[state.relay_host.as_str()]);
+    let claims = match decode::<RelayClaims>(&msg.relay_token, server_entry.decoding_key.as_ref(), &validation) {
+        Ok(data) => data.claims,
+        Err(_) => {
+            send_error(&mut socket, "connect_ack", "invalid_token").await?;
+            return Ok(());
+        }
+    };
+
+    let claims_server = match Uuid::parse_str(&claims.server_id) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            send_error(&mut socket, "connect_ack", "invalid_token").await?;
+            return Ok(());
+        }
+    };
+
+    if claims_server != server_id {
+        send_error(&mut socket, "connect_ack", "server_mismatch").await?;
+        return Ok(());
+    }
+
+    if !claims.permissions.iter().any(|p| p == "connect") {
+        send_error(&mut socket, "connect_ack", "permission_denied").await?;
+        return Ok(());
+    }
+
+    let tunnel_id = Uuid::new_v4();
+    let tunnel_entry = state.create_tunnel(tunnel_id, Instant::now()).await;
+
+    let expires_at = SystemTime::now()
+        .checked_add(state.handshake_timeout)
+        .and_then(|deadline| deadline.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs())
+        .unwrap_or(0);
+
+    if server_entry
+        .control_tx
+        .send(ServerCommand::OpenTunnel {
+            tunnel_id,
+            client_id,
+            preferred_protocol: "binary",
+            expires_at,
+        })
+        .await
+        .is_err()
+    {
+        send_error(&mut socket, "connect_ack", "server_unreachable").await?;
+        state.remove_tunnel(&tunnel_id).await;
+        return Ok(());
+    }
+
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "type": "connect_ack",
+                "status": "ok",
+                "tunnel_id": tunnel_id.to_string(),
+                "relay_host": state.relay_host,
+                "expires_at": expires_at,
+            })
+            .to_string(),
+        ))
+        .await?;
+
+    // ... await tunnel_ready and transition to forwarding ...
     Ok(())
 }
 ```
 
-#### 1.3 Authentication
+#### 1.3 Authentication & JWT Handling
 
-**File:** `relay/src/auth.rs`
-
-```rust
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use serde::Deserialize;
-
-pub struct TokenValidator {
-    // server_id -> PEM encoded Ed25519 public key
-    server_public_keys: Arc<RwLock<HashMap<Uuid, String>>>,
-}
-
-impl TokenValidator {
-    pub async fn upsert_public_key(&self, server_id: Uuid, pem: String) {
-        self.server_public_keys.write().await.insert(server_id, pem);
-    }
-
-    pub async fn validate_relay_token(
-        &self,
-        token: &str,
-        expected_server: Uuid,
-        expected_audience: &str,
-    ) -> Result<Claims, AuthError> {
-        let pem = self
-            .server_public_keys
-            .read()
-            .await
-            .get(&expected_server)
-            .cloned()
-            .ok_or(AuthError::UnknownServer)?;
-
-        let mut validation = Validation::new(Algorithm::EdDSA);
-        validation.set_audience(&[expected_audience]);
-        validation.set_issuer(&["handcontrol-server"]);
-
-        let decoded = decode::<Claims>(
-            token,
-            &DecodingKey::from_ed25519_pem(pem.as_bytes())
-                .map_err(|_| AuthError::InvalidKeyMaterial)?,
-            &validation,
-        )
-        .map_err(|_| AuthError::InvalidToken)?;
-
-        if decoded.claims.server_id != expected_server {
-            return Err(AuthError::ServerIdMismatch);
-        }
-
-        Ok(decoded.claims)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Claims {
-    pub iss: String,
-    pub sub: String,        // client_id
-    pub aud: String,
-    pub exp: u64,
-    pub iat: u64,
-    pub server_id: Uuid,
-    pub permissions: Vec<String>,
-}
-```
+- Registration now expects the server to send a base64 Ed25519 public key. The relay converts it to DER, caches a `DecodingKey`, and associates a control channel with the server ID.
+- During `/connect`, the relay validates JWTs with `decode::<RelayClaims>` and emits explicit error codes (`invalid_token`, `server_not_registered`, `permission_denied`, `server_unreachable`). The `connect_ack` response carries a server-generated tunnel id plus an expiration deadline.
+- Tunnel state is tracked via `TunnelHandle`, ensuring both client and server deliver `tunnel_ready` before frames are forwarded. Additional cleanup (removing tunnel state, notifying clients) is handled after completion.
 
 #### 1.4 Configuration
 
@@ -547,7 +626,7 @@ fn default_relay_reconnect_delay() -> u64 { 30 }
 
 **File:** `server/src/relay/client.rs` (NEW)
 
-Uses `tokio_tungstenite` for WebSocket transport and bridges binary frames back to the local gRPC listener without terminating TLS.
+Uses `tokio_tungstenite` for WebSocket transport and bridges binary frames back to the local gRPC listener without terminating TLS. The client caches multiple tunnels and reacts to `open_tunnel` commands sent over the control channel by the relay.
 
 ```rust
 pub struct RelayClient {
@@ -1134,6 +1213,13 @@ openssl pkey -in server-relay-key.pem -pubout -out server-relay-pubkey.pem
 - Base64-encoded
 - Shared between server and relay (out-of-band)
 - Used only for initial registration
+
+**Distribution Flow:**
+1. Administrator runs `handcontrol relay secret generate` on the relay host; command writes `/etc/handcontrol-relay/registration-secrets/<server_id>.b64`.
+2. The relay CLI prints a one-time copyable secret that is securely transferred to the target PC server (SSH, password manager entry, or QR during enrollment).
+3. Admin pastes the secret into `handcontrol.toml` on the PC server (`relay_auth_secret`), or for fresh setups embeds it in the server enrollment QR.
+4. On first `/register`, the server presents the secret. The relay marks it as “consumed” and rotates it to an internal HMAC key; subsequent reconnects use a signed timestamp challenge instead of the raw secret.
+5. For revocation, the relay admin deletes the secret file and issues a new one—clients must update the server config before reconnecting.
 
 **Generation:**
 ```bash

@@ -28,6 +28,39 @@ fn validate_server_config(config: &Config) -> Result<()> {
         bail!("Enrollment token TTL cannot be 0");
     }
 
+    if config.relay.enabled {
+        let relay_url = config
+            .relay
+            .relay_server_url
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty());
+
+        if relay_url.is_none() {
+            bail!("Relay enabled but relay_server_url is missing");
+        }
+
+        if config
+            .relay
+            .relay_auth_secret
+            .as_ref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            bail!("Relay enabled but relay_auth_secret is missing");
+        }
+
+        if config.relay.reconnect_delay_seconds == 0 {
+            bail!("relay.reconnect_delay_seconds must be greater than 0");
+        }
+
+        if let Some(max) = config.relay.max_relay_tunnels {
+            if max == 0 {
+                bail!("relay.max_relay_tunnels must be greater than 0 when specified");
+            }
+        }
+    }
+
     Ok(())
 }
 

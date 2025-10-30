@@ -213,3 +213,74 @@ message ConfigUpdateNotification {
   uint64 config_version = 1;       // New config version number
   int64 timestamp_ms = 2;          // Unix timestamp of this update
 }
+
+// Relay service (runs on relay server)
+service RelayService {
+  // Server registers to accept client connections
+  rpc RegisterServer(stream ServerRelayMessage) returns (stream RelayControlMessage);
+
+  // Client connects to registered server
+  rpc ConnectToServer(stream ClientRelayMessage) returns (stream ServerRelayMessage);
+}
+
+// Server -> Relay messages
+message ServerRelayMessage {
+  oneof message {
+    RegisterServerRequest register = 1;
+    bytes data = 2;              // Encrypted gRPC data from server
+    Ping ping = 3;
+    Pong pong = 4;
+  }
+}
+
+message RegisterServerRequest {
+  string server_id = 1;
+  string relay_secret = 2;       // Server's authentication secret
+  string server_version = 3;
+  repeated string capabilities = 4;
+}
+
+// Relay -> Server messages
+message RelayControlMessage {
+  oneof message {
+    RegisterServerResponse register_response = 1;
+    ClientConnectedNotification client_connected = 2;
+    bytes data = 3;              // Encrypted gRPC data from client
+    Ping ping = 4;
+    Pong pong = 5;
+  }
+}
+
+message RegisterServerResponse {
+  bool success = 1;
+  string error_message = 2;
+}
+
+message ClientConnectedNotification {
+  string client_id = 1;
+  string tunnel_id = 2;          // Unique ID for this tunnel
+}
+
+// Client -> Relay messages
+message ClientRelayMessage {
+  oneof message {
+    ConnectToServerRequest connect = 1;
+    bytes data = 2;              // Encrypted gRPC data from client
+    Ping ping = 3;
+    Pong pong = 4;
+  }
+}
+
+message ConnectToServerRequest {
+  string server_id = 1;
+  string relay_token = 2;        // JWT token issued by server
+}
+
+// Keep-alive messages
+message Ping {
+  int64 timestamp_ms = 1;
+}
+
+message Pong {
+  int64 timestamp_ms = 1;
+}

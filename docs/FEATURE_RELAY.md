@@ -52,7 +52,8 @@ Android (Mobile Network)  <--mTLS-->  Relay Server  <--mTLS-->  PC (Home Network
 3. **Flexible Deployment**: Self-hosted or cloud VPS
 4. **Hybrid Mode**: Server can act as relay for others (optional)
 5. **IPv6 Native**: Relay supports IPv4 and IPv6 dual-stack
-6. **JWT Authentication**: Server-issued tokens, relay validates
+6. **Firewall-Friendly Transport**: WebSocket tunnel over TLS 1.3 (port 443)
+7. **JWT Authentication**: Server-issued tokens, relay validates
 
 ---
 
@@ -117,14 +118,12 @@ Add optional relay infrastructure that:
 │         │           ┌─────────────────────┐               │         │
 │         │           │   Relay Server      │               │         │
 │         │           │   (Public IP)       │               │         │
-│         │           │   :50052            │               │         │
+│         │           │   :443 (wss)        │               │         │
 │         │           └──────────┬──────────┘               │         │
 │         │                      │                           │         │
-│         ├──────────────────────┤                           │         │
-│         │  gRPC Stream         │  gRPC Stream              │         │
-│         │  (mTLS)              │  (mTLS)                   │         │
+│         ├──────── TLS 1.3 WebSocket Tunnel ───────────────┤         │
 │         │                      │                           │         │
-│    [Encrypted Data]──────>[Relay Proxy]──────>[Encrypted Data]      │
+│    [mTLS Handshake + gRPC Data]──>[Binary Relay]──>[mTLS Handshake + gRPC Data] │
 │         │                      │                           │         │
 │         │  Relay cannot        │  Relay cannot             │         │
 │         │  decrypt (no keys)   │  decrypt (no keys)        │         │
@@ -167,8 +166,9 @@ Add optional relay infrastructure that:
 ```toml
 [relay]
 enabled = false
-relay_server_url = "https://relay.example.com:50052"
+relay_server_url = "https://relay.example.com"
 relay_auth_secret = "base64-encoded-secret"
+max_relay_tunnels = 10
 auto_connect = true
 include_in_enrollment = true
 ```
@@ -183,108 +183,108 @@ include_in_enrollment = true
 - Connection mode tracking
 - UI indicator for connection type
 
-### Relay Protocol Design
+### Relay Tunnel Design
 
 #### Connection Sequence
 
 ```
 Server Registration Flow:
-1. Server connects to relay
-2. Server sends RegisterRequest(server_id, relay_secret)
-3. Relay validates secret
-4. Relay keeps connection open (bidirectional stream)
-5. Server is now "registered" and can accept client connections
+1. Server opens WebSocket: wss://relay.example.com/register (TLS 1.3, port 443)
+2. Server sends Register message (JSON) containing server_id, relay_secret, server_version, public_key
+3. Relay validates relay_secret, stores server metadata + public key, responds with RegisterAck
+4. WebSocket stays open as a control channel (keep-alive via WebSocket ping/pong)
 
 Client Connection Flow:
 1. Client tries direct IPs (multi-IP, IPv6 first)
-2. If all fail and relay info available:
-   a. Client connects to relay
-   b. Client sends ConnectRequest(server_id, relay_token)
-   c. Relay validates JWT token
-   d. Relay finds registered server by server_id
-   e. Relay creates tunnel: client <-> relay <-> server
-3. All subsequent gRPC calls flow through relay tunnel
-4. End-to-end mTLS maintained
+2. If all direct attempts fail and relay info exists:
+   a. Client opens WebSocket: wss://relay.example.com/connect
+   b. Client sends Connect message (JSON) with server_id, relay_token
+   c. Relay validates relay_token using cached server public key
+   d. Relay allocates tunnel_id and returns `ConnectAck` to the client
+   e. Relay notifies the registered server over the control channel (`open_tunnel`)
+   f. Server opens WebSocket: wss://relay.example.com/tunnel/<tunnel_id>?role=server and sends `tunnel_ready`
+   g. Client sends `tunnel_ready` on the original /connect socket
+3. Relay switches both WebSockets into binary forwarding mode; all frames after TunnelReady are raw bytes from the original mTLS session between client and server
+4. End-to-end mTLS is preserved because the TLS handshake and encrypted HTTP/2 traffic flow untouched through the tunnel
 ```
 
-#### Proto Definitions
+#### WebSocket Message Types
 
-**File:** `proto/handcontrol.proto` (additions)
+All control messages are UTF-8 JSON frames with `type` as the discriminator. The WebSocket handshake uses the `Sec-WebSocket-Protocol: handcontrol-relay.v1` subprotocol.
 
-```protobuf
-// Relay service (runs on relay server)
-service RelayService {
-  // Server registers to accept client connections
-  rpc RegisterServer(stream ServerRelayMessage) returns (stream RelayControlMessage);
-
-  // Client connects to registered server
-  rpc ConnectToServer(stream ClientRelayMessage) returns (stream ServerRelayMessage);
+```json
+// Sent by server immediately after /register upgrade
+{
+  "type": "register",
+  "server_id": "<uuid>",
+  "relay_secret": "<base64>",
+  "server_version": "1.8.0",
+  "capabilities": ["relay.v1"],
+  "public_key": "<base64-ed25519-public-key>",
+  "max_tunnels": 10
 }
 
-// Server -> Relay messages
-message ServerRelayMessage {
-  oneof message {
-    RegisterServerRequest register = 1;
-    bytes data = 2;              // Encrypted gRPC data from server
-    Ping ping = 3;
-    Pong pong = 4;
-  }
+// Relay acknowledgement
+{
+  "type": "register_ack",
+  "status": "ok",
+  "retry_after_seconds": 0
 }
 
-message RegisterServerRequest {
-  string server_id = 1;
-  string relay_secret = 2;       // Server's authentication secret
-  string server_version = 3;
-  repeated string capabilities = 4;
+// Sent by client after /connect upgrade
+{
+  "type": "connect",
+  "server_id": "<uuid>",
+  "relay_token": "<jwt>",
+  "client_id": "<uuid>",
+  "client_version": "android-1.12.0"
 }
 
-// Relay -> Server messages
-message RelayControlMessage {
-  oneof message {
-    RegisterServerResponse register_response = 1;
-    ClientConnectedNotification client_connected = 2;
-    bytes data = 3;              // Encrypted gRPC data from client
-    Ping ping = 4;
-    Pong pong = 5;
-  }
+// Relay acknowledgement to client
+{
+  "type": "connect_ack",
+  "status": "ok",
+  "tunnel_id": "<uuid>",
+  "relay_host": "relay.example.com",
+  "expires_at": 1735689600
 }
 
-message RegisterServerResponse {
-  bool success = 1;
-  string error_message = 2;
+// Relay instructs registered server to open a tunnel
+{
+  "type": "open_tunnel",
+  "tunnel_id": "<uuid>",
+  "client_id": "<uuid>",
+  "preferred_protocol": "binary",
+  "expires_at": 1735689600
 }
 
-message ClientConnectedNotification {
-  string client_id = 1;
-  string tunnel_id = 2;          // Unique ID for this tunnel
+// Server acknowledges readiness and switches to binary mode
+{
+  "type": "tunnel_ready",
+  "tunnel_id": "<uuid>",
+  "role": "server"
 }
 
-// Client -> Relay messages
-message ClientRelayMessage {
-  oneof message {
-    ConnectToServerRequest connect = 1;
-    bytes data = 2;              // Encrypted gRPC data from client
-    Ping ping = 3;
-    Pong pong = 4;
-  }
-}
-
-message ConnectToServerRequest {
-  string server_id = 1;
-  string relay_token = 2;        // JWT token issued by server
-}
-
-// Relay -> Client messages (reuse ServerRelayMessage with different semantics)
-
-// Keep-alive messages
-message Ping {
-  int64 timestamp_ms = 1;
-}
-
-message Pong {
-  int64 timestamp_ms = 1;
+// Client mirrors readiness on the same socket
+{
+  "type": "tunnel_ready",
+  "tunnel_id": "<uuid>",
+  "role": "client"
 }
 ```
+
+Clients wait for `connect_ack` before emitting `tunnel_ready`. After both sides send `tunnel_ready`, the relay no longer emits JSON frames on that WebSocket. Binary frames are forwarded byte-for-byte between client and server. Each tunnel WebSocket carries exactly one bidirectional TLS session, so no additional multiplexing headers are required.
+
+#### Keep-alives and Error Handling
+
+- Control WebSockets rely on the native WebSocket ping/pong to detect dead connections (interval: 30 seconds, timeout: 15 seconds).
+- Tunnel WebSockets use application-level heartbeat frames (single-byte 0x00 payload every 20 seconds) while idle to keep NAT bindings alive.
+- If the relay cannot validate a token or secret it sends an error frame and closes the WebSocket with code `4401` (custom “unauthorized”).
+- Idle tunnels are closed after `idle_timeout_seconds` (default 600) with clean close code `1000`.
+
+#### Preserving End-to-End TLS
+
+Because the relay only sees opaque TLS bytes inside the WebSocket tunnel, it never terminates or inspects the mutual TLS session between Android and the PC server. Certificate validation and client authentication continue to happen exactly as they do on a direct connection. The relay simply copies binary frames in both directions.
 
 ### JWT Token Format
 
@@ -350,47 +350,68 @@ handcontrol/
 **File:** `relay/src/main.rs`
 
 ```rust
-use tonic::{transport::Server, Request, Response, Status};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
+
+use axum::{
+    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 use tokio::sync::RwLock;
+use tokio_stream::StreamExt;
 
 #[derive(Clone)]
 struct RelayState {
-    // Map: server_id -> ServerConnection
-    registered_servers: Arc<RwLock<HashMap<String, ServerConnection>>>,
-
-    // Map: tunnel_id -> Tunnel
-    active_tunnels: Arc<RwLock<HashMap<String, Tunnel>>>,
+    registered_servers: Arc<RwLock<HashMap<String, ServerControlSocket>>>,
 }
 
-struct ServerConnection {
+struct ServerControlSocket {
     server_id: String,
-    tx: mpsc::Sender<RelayControlMessage>,
+    websocket: WebSocket,
+    last_seen: Instant,
+    public_key: Arc<VerifyingKey>,
 }
 
-struct Tunnel {
-    tunnel_id: String,
-    server_id: String,
-    client_tx: mpsc::Sender<ServerRelayMessage>,
-    server_tx: mpsc::Sender<RelayControlMessage>,
+async fn register_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<RelayState>,
+) -> impl IntoResponse {
+    ws.protocols(["handcontrol-relay.v1"]).on_upgrade(|socket| async move {
+        if let Err(err) = handle_register_socket(socket, state).await {
+            tracing::warn!("register socket ended: {err:?}");
+        }
+    })
 }
 
-#[tonic::async_trait]
-impl RelayService for RelayServiceImpl {
-    async fn register_server(
-        &self,
-        request: Request<tonic::Streaming<ServerRelayMessage>>,
-    ) -> Result<Response<Self::RegisterServerStream>, Status> {
-        // Implementation
-    }
+async fn tunnel_handler(
+    ws: WebSocketUpgrade,
+    Path(tunnel_id): Path<Uuid>,
+    State(state): State<RelayState>,
+) -> impl IntoResponse {
+    ws.protocols(["handcontrol-relay.v1"]).on_upgrade(|socket| async move {
+        handle_tunnel_socket(socket, tunnel_id, state).await;
+    })
+}
 
-    async fn connect_to_server(
-        &self,
-        request: Request<tonic::Streaming<ClientRelayMessage>>,
-    ) -> Result<Response<Self::ConnectToServerStream>, Status> {
-        // Implementation
-    }
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let state = RelayState {
+        registered_servers: Arc::new(RwLock::new(HashMap::new())),
+    };
+
+    let app = Router::new()
+        .route("/register", get(register_handler))
+        .route("/connect", get(connect_handler))
+        .route("/tunnel/:tunnel_id", get(tunnel_handler))
+        .with_state(state);
+
+    axum::Server::bind(&relay_config.bind_addr())
+        .tls_config(relay_config.tls.clone())?
+        .serve(app.into_make_service())
+        .await?;
+
+    Ok(())
 }
 ```
 
@@ -399,30 +420,61 @@ impl RelayService for RelayServiceImpl {
 **File:** `relay/src/auth.rs`
 
 ```rust
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
+use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use serde::Deserialize;
 
 pub struct TokenValidator {
-    server_public_keys: HashMap<String, DecodingKey>,
+    // server_id -> PEM encoded Ed25519 public key
+    server_public_keys: Arc<RwLock<HashMap<Uuid, String>>>,
 }
 
 impl TokenValidator {
-    pub fn validate_relay_token(&self, token: &str) -> Result<Claims, AuthError> {
-        // 1. Decode JWT header to get server_id
-        // 2. Look up server's public key
-        // 3. Validate signature
-        // 4. Check expiry
-        // 5. Verify claims (aud, iss, etc.)
+    pub async fn upsert_public_key(&self, server_id: Uuid, pem: String) {
+        self.server_public_keys.write().await.insert(server_id, pem);
+    }
+
+    pub async fn validate_relay_token(
+        &self,
+        token: &str,
+        expected_server: Uuid,
+        expected_audience: &str,
+    ) -> Result<Claims, AuthError> {
+        let pem = self
+            .server_public_keys
+            .read()
+            .await
+            .get(&expected_server)
+            .cloned()
+            .ok_or(AuthError::UnknownServer)?;
+
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_audience(&[expected_audience]);
+        validation.set_issuer(&["handcontrol-server"]);
+
+        let decoded = decode::<Claims>(
+            token,
+            &DecodingKey::from_ed25519_pem(pem.as_bytes())
+                .map_err(|_| AuthError::InvalidKeyMaterial)?,
+            &validation,
+        )
+        .map_err(|_| AuthError::InvalidToken)?;
+
+        if decoded.claims.server_id != expected_server {
+            return Err(AuthError::ServerIdMismatch);
+        }
+
+        Ok(decoded.claims)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Claims {
     pub iss: String,
     pub sub: String,        // client_id
     pub aud: String,
     pub exp: u64,
     pub iat: u64,
-    pub server_id: String,
+    pub server_id: Uuid,
     pub permissions: Vec<String>,
 }
 ```
@@ -434,9 +486,11 @@ pub struct Claims {
 ```toml
 [relay]
 bind_address = "::"
-port = 50052
+port = 443
+public_hostname = "relay.example.com"
 tls_cert_path = "/etc/handcontrol-relay/cert.pem"
 tls_key_path = "/etc/handcontrol-relay/key.pem"
+websocket_subprotocol = "handcontrol-relay.v1"
 
 [auth]
 require_tokens = true
@@ -474,6 +528,7 @@ pub struct RelayConfig {
 
     pub relay_server_url: Option<String>,
     pub relay_auth_secret: Option<String>,
+    pub max_relay_tunnels: Option<u32>,
 
     #[serde(default = "default_true")]
     pub auto_connect: bool,
@@ -492,11 +547,15 @@ fn default_relay_reconnect_delay() -> u64 { 30 }
 
 **File:** `server/src/relay/client.rs` (NEW)
 
+Uses `tokio_tungstenite` for WebSocket transport and bridges binary frames back to the local gRPC listener without terminating TLS.
+
 ```rust
 pub struct RelayClient {
     config: RelayConfig,
     server_id: Uuid,
-    channel: Option<Channel>,
+    token_issuer: Arc<TokenIssuer>,
+    local_grpc_endpoint: SocketAddr,
+    control: Option<ControlChannel>,
     state: Arc<RwLock<RelayClientState>>,
 }
 
@@ -507,59 +566,76 @@ enum RelayClientState {
     Error(String),
 }
 
+struct ControlChannel {
+    sink: SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>,
+    stream: SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>,
+}
+
 impl RelayClient {
     pub async fn connect(&mut self) -> Result<()> {
-        let channel = create_channel(&self.config.relay_server_url?)?;
-        let mut client = RelayServiceClient::new(channel);
+        let url = format!("{}/register", self.config.relay_server_url()?);
+        let (ws, _) = connect_async(&url).await?;
+        let (mut sink, mut stream) = ws.split();
 
-        let (tx, rx) = mpsc::channel(32);
+        let register = RegisterMessage {
+            server_id: self.server_id,
+            relay_secret: self.config.relay_auth_secret.clone()?,
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+            capabilities: vec!["relay.v1".into()],
+            public_key: self.token_issuer.public_key_base64(),
+            max_tunnels: self.config.max_relay_tunnels.unwrap_or(10),
+        };
+        sink.send(Message::text(serde_json::to_string(&register)?))
+            .await?;
 
-        // Start bidirectional stream
-        let stream = client.register_server(ReceiverStream::new(rx)).await?;
-
-        // Send initial registration
-        tx.send(ServerRelayMessage {
-            message: Some(server_relay_message::Message::Register(
-                RegisterServerRequest {
-                    server_id: self.server_id.to_string(),
-                    relay_secret: self.config.relay_auth_secret.clone()?,
-                    server_version: env!("CARGO_PKG_VERSION").to_string(),
-                    capabilities: vec!["v1".to_string()],
+        match stream.next().await {
+            Some(Ok(Message::Text(payload))) => {
+                let ack: RegisterAck = serde_json::from_str(&payload)?;
+                if ack.status != "ok" {
+                    return Err(anyhow!("Relay registration failed: {}", ack.status));
                 }
-            ))
-        }).await?;
+            }
+            other => return Err(anyhow!("Unexpected register response: {other:?}")),
+        }
 
-        // Handle incoming messages
-        self.handle_relay_messages(stream, tx).await
+        self.control = Some(ControlChannel { sink, stream });
+        *self.state.write().await = RelayClientState::Connected;
+
+        tokio::spawn(self.listen_for_control_messages());
+        Ok(())
     }
 
-    async fn handle_relay_messages(
-        &mut self,
-        mut stream: Streaming<RelayControlMessage>,
-        tx: mpsc::Sender<ServerRelayMessage>,
-    ) -> Result<()> {
-        while let Some(msg) = stream.message().await? {
-            match msg.message {
-                Some(relay_control_message::Message::RegisterResponse(resp)) => {
-                    if resp.success {
-                        tracing::info!("Successfully registered with relay server");
-                        *self.state.write().await = RelayClientState::Connected;
-                    } else {
-                        tracing::error!("Relay registration failed: {}", resp.error_message);
-                        return Err(anyhow!("Registration failed"));
+    async fn listen_for_control_messages(&mut self) {
+        let Some(control) = &mut self.control else { return };
+        while let Some(Ok(Message::Text(payload))) = control.stream.next().await {
+            match serde_json::from_str::<ControlEnvelope>(&payload) {
+                Ok(ControlEnvelope::OpenTunnel { tunnel_id, client_id, .. }) => {
+                    tracing::info!("Relay requested tunnel {tunnel_id} for client {client_id}");
+                    if let Err(err) = self.spawn_tunnel_task(tunnel_id).await {
+                        tracing::error!("Failed to open relay tunnel: {err:?}");
                     }
                 }
-                Some(relay_control_message::Message::ClientConnected(notif)) => {
-                    tracing::info!("Client connected via relay: {}", notif.client_id);
-                    // Handle client connection through tunnel
+                Ok(ControlEnvelope::Ping { .. }) => {
+                    let _ = control.sink.send(Message::Text(r#"{"type":"pong"}"#.into())).await;
                 }
-                Some(relay_control_message::Message::Data(data)) => {
-                    // Forward decrypted gRPC data to local gRPC server
-                }
-                _ => {}
+                Err(err) => tracing::warn!("Invalid control message: {err:?}"),
             }
         }
-        Ok(())
+    }
+
+    async fn spawn_tunnel_task(&self, tunnel_id: Uuid) -> Result<()> {
+        let url = format!("{}/tunnel/{}?role=server", self.config.relay_server_url()?, tunnel_id);
+        let (ws, _) = connect_async(&url).await?;
+        let (mut sink, mut stream) = ws.split();
+
+        sink.send(Message::text(json!({
+            "type": "tunnel_ready",
+            "tunnel_id": tunnel_id
+        }).to_string()))
+        .await?;
+
+        // Bridge WebSocket frames to the existing gRPC listener; TLS terminates at the local server.
+        pump_tls_between_websocket(stream, sink, self.local_grpc_endpoint.clone()).await
     }
 }
 ```
@@ -569,8 +645,11 @@ impl RelayClient {
 **File:** `server/src/relay/tokens.rs` (NEW)
 
 ```rust
-use jsonwebtoken::{encode, EncodingKey, Header, Algorithm};
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{
+    pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding},
+    SigningKey, VerifyingKey,
+};
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 pub struct TokenIssuer {
     signing_key: SigningKey,
@@ -610,18 +689,24 @@ impl TokenIssuer {
         let token = encode(
             &Header::new(Algorithm::EdDSA),
             &claims,
-            &EncodingKey::from_ed25519_der(&self.signing_key.to_bytes()),
+            &EncodingKey::from_ed25519_pem(
+                self.signing_key
+                    .to_pkcs8_pem(LineEnding::LF)?
+                    .as_bytes(),
+            )?,
         )?;
 
         Ok(token)
     }
 
-    pub fn get_public_key_pem(&self) -> String {
-        // Export verifying key for relay server
-        pem::encode(&pem::Pem {
-            tag: "PUBLIC KEY".to_string(),
-            contents: self.verifying_key.to_bytes().to_vec(),
-        })
+    pub fn public_key_pem(&self) -> String {
+        self.verifying_key
+            .to_public_key_pem(LineEnding::LF)
+            .expect("verifying key to pem")
+    }
+
+    pub fn public_key_base64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(self.verifying_key.to_bytes())
     }
 }
 ```
@@ -689,7 +774,8 @@ data class EnrolledServer(
 
 ```kotlin
 class RelayConnectionStrategy(
-    private val channelFactory: MtlsGrpcChannelFactory
+    private val channelFactory: MtlsGrpcChannelFactory,
+    private val tunnelFactory: RelayTunnelFactory,
 ) : ConnectionStrategy {
 
     override suspend fun connect(attempt: ConnectionAttempt): Result<ManagedChannel> {
@@ -700,87 +786,69 @@ class RelayConnectionStrategy(
     }
 
     private suspend fun connectViaRelay(attempt: ConnectionAttempt.Relay): Result<ManagedChannel> = withContext(Dispatchers.IO) {
-        try {
-            // 1. Create connection to relay server
-            val relayChannel = channelFactory.createChannel(
-                host = extractHost(attempt.relayUrl),
-                port = extractPort(attempt.relayUrl),
-                tlsConfig = attempt.tlsConfig
+        runCatching {
+            val tunnel = tunnelFactory.openTunnel(
+                RelayTunnelRequest(
+                    relayUrl = attempt.relayUrl,
+                    serverId = attempt.serverId,
+                    relayToken = attempt.relayToken,
+                    tlsConfig = attempt.tlsConfig,
+                )
             )
 
-            val relayClient = RelayServiceClient(relayChannel)
-
-            // 2. Create bidirectional stream
-            val (requestChannel, responseFlow) = relayClient.connectToServer()
-
-            // 3. Send connect request with token
-            requestChannel.send(ClientRelayMessage.newBuilder()
-                .setConnect(ConnectToServerRequest.newBuilder()
-                    .setServerId(attempt.serverId)
-                    .setRelayToken(attempt.relayToken)
-                    .build())
-                .build())
-
-            // 4. Wait for connection confirmation
-            val firstResponse = withTimeout(5000) {
-                responseFlow.first()
-            }
-
-            // Validate connection established
-            // ... validation logic ...
-
-            // 5. Create tunneling channel that wraps relay stream
-            val tunnelingChannel = TunnelingChannel(
-                relayChannel = relayChannel,
-                requestChannel = requestChannel,
-                responseFlow = responseFlow
+            val channel = channelFactory.createChannelOverTunnel(
+                authority = attempt.authority,
+                tunnel = tunnel,
             )
 
-            Result.success(tunnelingChannel)
-        } catch (e: Exception) {
-            Timber.e(e, "Relay connection failed")
-            Result.failure(e)
-        }
+            channel
+        }.onFailure { Timber.e(it, "Relay connection failed") }
     }
 }
 ```
 
-#### 3.3 Tunneling Channel Implementation
+#### 3.3 Relay Tunnel Factory
 
-**File:** `app/src/main/kotlin/com/handcontrol/core/network/TunnelingChannel.kt` (NEW)
+**File:** `app/src/main/kotlin/com/handcontrol/core/network/RelayTunnelFactory.kt` (NEW)
 
 ```kotlin
-/**
- * A ManagedChannel that tunnels gRPC calls through a relay server.
- *
- * This wraps the relay bidirectional stream and makes it transparent
- * to the rest of the application - it looks like a regular gRPC channel.
- */
-class TunnelingChannel(
-    private val relayChannel: ManagedChannel,
-    private val requestChannel: SendChannel<ClientRelayMessage>,
-    private val responseFlow: Flow<ServerRelayMessage>
-) : ManagedChannel() {
+class RelayTunnelFactory(
+    private val okHttpClient: OkHttpClient,
+    private val json: Json,
+    private val dispatcher: CoroutineDispatcher = Dispatchers.IO,
+) {
 
-    override fun <RequestT, ResponseT> newCall(
-        methodDescriptor: MethodDescriptor<RequestT, ResponseT>,
-        callOptions: CallOptions
-    ): ClientCall<RequestT, ResponseT> {
-        return TunnelingClientCall(
-            methodDescriptor = methodDescriptor,
-            requestChannel = requestChannel,
-            responseFlow = responseFlow
+    suspend fun openTunnel(request: RelayTunnelRequest): RelayTunnel = withContext(dispatcher) {
+        val connectUrl = request.relayUrl.toHttpUrl().newBuilder()
+            .addPathSegment("connect")
+            .build()
+
+        val listener = RelayWebSocketListener(json)
+        val webSocket = okHttpClient.newWebSocket(
+            Request.Builder()
+                .url(connectUrl)
+                .header("Sec-WebSocket-Protocol", "handcontrol-relay.v1")
+                .build(),
+            listener,
+        )
+
+        val connectMessage = ConnectMessage(
+            serverId = request.serverId,
+            relayToken = request.relayToken,
+            clientId = request.clientId,
+            clientVersion = BuildConfig.VERSION_NAME,
+        )
+        webSocket.send(json.encodeToString(connectMessage))
+
+        val tunnelInfo = listener.awaitTunnelReady()
+        RelayTunnel(
+            websocket = webSocket,
+            output = listener.binarySink,
+            input = listener.binarySource,
+            tunnelId = tunnelInfo.tunnelId,
+            authority = request.authority,
         )
     }
-
-    // Delegate lifecycle methods to relay channel
-    override fun shutdown(): ManagedChannel = relayChannel.shutdown()
-    override fun isShutdown(): Boolean = relayChannel.isShutdown
-    override fun isTerminated(): Boolean = relayChannel.isTerminated
-    override fun shutdownNow(): ManagedChannel = relayChannel.shutdownNow()
-    override fun awaitTermination(timeout: Long, unit: TimeUnit): Boolean =
-        relayChannel.awaitTermination(timeout, unit)
-    override fun authority(): String = relayChannel.authority()
 }
 ```
 
@@ -834,7 +902,7 @@ fun ConnectionStatusIndicator(
 Relay server binds to `::` by default (dual-stack):
 
 ```rust
-let addr = "[::]:50052".parse()?;
+let addr = "[::]:443".parse()?;
 let socket = bind_tcp_listener(addr)?;
 ```
 
@@ -843,8 +911,8 @@ let socket = bind_tcp_listener(addr)?;
 Support IPv6 literal addresses in relay URLs:
 
 ```
-https://[2001:db8::1]:50052
-https://relay.example.com:50052  (resolves to IPv4 or IPv6)
+https://[2001:db8::1]
+https://relay.example.com        (resolves to IPv4 or IPv6)
 ```
 
 #### 4.3 Connection Preference
@@ -943,7 +1011,7 @@ curl -sSL https://get.handcontrol.dev/relay | bash
 
 # Or manual:
 docker run -d \
-  -p 50052:50052 \
+  -p 443:443 \
   -v /etc/handcontrol-relay:/config \
   handcontrol/relay:latest
 ```
@@ -972,7 +1040,7 @@ systemctl enable --now handcontrol-relay
 - Can run on existing hardware
 
 **Cons:**
-- Requires port forwarding (50052)
+- Requires port forwarding (443)
 - Residential IP may be blocked by some networks
 - Depends on home internet uptime
 
@@ -1006,7 +1074,7 @@ max_clients = 10
 
 1. **Relay Cannot Decrypt Traffic**
    - End-to-end mTLS preserved
-   - Relay only sees encrypted bytes
+   - Relay only sees encrypted bytes forwarded inside WebSocket frames
    - No certificate trust delegation
 
 2. **Unauthorized Relay Access**
@@ -1050,12 +1118,12 @@ openssl pkey -in server-relay-key.pem -pubout -out server-relay-pubkey.pem
 
 **Storage:**
 - Private key: `~/.config/handcontrol/relay-key.pem` (600 permissions)
-- Public key: Shared with relay server (registration or config)
+- Public key: Automatically delivered to relay during `/register` handshake; mirrored on disk for auditing
 
 **Rotation:**
 1. Generate new keypair
-2. Register new public key with relay
-3. Update server config
+2. Update server config to point at new private key
+3. Reconnect `/register` control WebSocket so the relay stores the new `public_key`
 4. Issue new tokens to clients (gradual rollout)
 5. Decommission old key after all clients updated
 
@@ -1136,6 +1204,7 @@ openssl rand -base64 32
    - Verify relay info in QR code
    - Block direct connection
    - Verify relay connection succeeds
+   - Confirm WebSocket negotiates `Sec-WebSocket-Protocol: handcontrol-relay.v1`
    - Execute command via relay
 
 2. **Token Management**

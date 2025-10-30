@@ -149,6 +149,8 @@ mod tests {
             label_on: None,
             label_off: None,
             step: None,
+            default_value_command: None,
+            default_value_pattern: None,
         }
     }
 
@@ -165,6 +167,8 @@ mod tests {
             label_on: None,
             label_off: None,
             step: None,
+            default_value_command: None,
+            default_value_pattern: None,
         }
     }
 
@@ -181,6 +185,8 @@ mod tests {
             label_on: None,
             label_off: None,
             step: None,
+            default_value_command: None,
+            default_value_pattern: None,
         }
     }
 
@@ -197,6 +203,8 @@ mod tests {
             label_on: None,
             label_off: None,
             step: None,
+            default_value_command: None,
+            default_value_pattern: None,
         }
     }
 
@@ -340,7 +348,11 @@ mod tests {
                 label_on: None,
                 label_off: None,
                 step: None,
+                default_value_command: None,
+                default_value_pattern: None,
             }],
+            requires_confirmation: false,
+            show_output: true,
         };
 
         let params = HashMap::new();
@@ -360,6 +372,8 @@ mod tests {
             timeout_seconds: 30,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: false,
+            show_output: true,
         };
 
         let mut params = HashMap::new();

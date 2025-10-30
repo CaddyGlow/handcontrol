@@ -169,6 +169,8 @@ mod tests {
             timeout_seconds: timeout,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: false,
+            show_output: true,
         }
     }
 

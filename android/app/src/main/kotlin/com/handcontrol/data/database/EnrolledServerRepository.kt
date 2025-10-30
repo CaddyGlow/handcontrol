@@ -49,6 +49,10 @@ class EnrolledServerRepository @Inject constructor(
         return enrolledServerDao.getServerById(serverId)
     }
 
+    fun observeServerById(serverId: String): Flow<EnrolledServerEntity?> {
+        return enrolledServerDao.observeServerById(serverId)
+    }
+
     suspend fun getServerFingerprint(serverId: String): String? {
         return enrolledServerDao.getServerFingerprint(serverId)
     }

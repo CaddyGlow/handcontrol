@@ -131,11 +131,21 @@ async fn handle_enroll_command() -> Result<()> {
         )
     })?;
 
-    let target = format!("https://{}:{}", host, config.server.port);
+    // Format host for URI (IPv6 addresses need square brackets)
+    let uri_host = if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V6(_) => format!("[{}]", host),
+            IpAddr::V4(_) => host.clone(),
+        }
+    } else {
+        host.clone()
+    };
+
+    let target = format!("https://{}:{}", uri_host, config.server.port);
     let endpoint = Endpoint::from_shared(target.clone())
         .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
 
-    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+    let domain_name = if host.parse::<IpAddr>().is_ok() {
         "localhost".to_string()
     } else {
         host.clone()
@@ -219,11 +229,21 @@ async fn handle_approve_command(request_id: &str) -> Result<()> {
         )
     })?;
 
-    let target = format!("https://{}:{}", host, config.server.port);
+    // Format host for URI (IPv6 addresses need square brackets)
+    let uri_host = if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V6(_) => format!("[{}]", host),
+            IpAddr::V4(_) => host.clone(),
+        }
+    } else {
+        host.clone()
+    };
+
+    let target = format!("https://{}:{}", uri_host, config.server.port);
     let endpoint = Endpoint::from_shared(target.clone())
         .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
 
-    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+    let domain_name = if host.parse::<IpAddr>().is_ok() {
         "localhost".to_string()
     } else {
         host.clone()
@@ -301,11 +321,21 @@ async fn handle_list_pending_command() -> Result<()> {
         )
     })?;
 
-    let target = format!("https://{}:{}", host, config.server.port);
+    // Format host for URI (IPv6 addresses need square brackets)
+    let uri_host = if let Ok(ip) = host.parse::<IpAddr>() {
+        match ip {
+            IpAddr::V6(_) => format!("[{}]", host),
+            IpAddr::V4(_) => host.clone(),
+        }
+    } else {
+        host.clone()
+    };
+
+    let target = format!("https://{}:{}", uri_host, config.server.port);
     let endpoint = Endpoint::from_shared(target.clone())
         .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
 
-    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+    let domain_name = if host.parse::<IpAddr>().is_ok() {
         "localhost".to_string()
     } else {
         host.clone()
@@ -336,7 +366,7 @@ async fn handle_list_pending_command() -> Result<()> {
     }
 
     // Format output for easy parsing and fzf
-    // Format: request_id | device_name | device_model | pin | expires_in_seconds
+    // Format: request_id | device_name | device_model | pin | expires_in_seconds | ip_address
     for req in response.requests {
         let model = if req.device_model.is_empty() {
             "Unknown".to_string()
@@ -344,13 +374,20 @@ async fn handle_list_pending_command() -> Result<()> {
             req.device_model
         };
 
+        let ip = if req.ip_address.is_empty() {
+            "unknown".to_string()
+        } else {
+            req.ip_address
+        };
+
         println!(
-            "{}\t{}\t{}\t{}\t{}s",
+            "{}\t{}\t{}\t{}\t{}s\t{}",
             req.request_id,
             req.device_name,
             model,
             req.verification_code,
-            req.seconds_remaining
+            req.seconds_remaining,
+            ip
         );
     }
 

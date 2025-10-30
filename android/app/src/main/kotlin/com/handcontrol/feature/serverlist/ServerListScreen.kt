@@ -19,6 +19,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -57,6 +58,7 @@ fun ServerListScreen(
     onNavigateBack: () -> Unit,
     onNavigateToServerDiscovery: () -> Unit,
     onNavigateToServer: (String, Int) -> Unit,
+    onNavigateToServerDetails: (String) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ServerListViewModel = hiltViewModel()
 ) {
@@ -136,6 +138,9 @@ fun ServerListScreen(
                             },
                             onDelete = {
                                 serverToDelete = server
+                            },
+                            onViewDetails = {
+                                onNavigateToServerDetails(server.serverId)
                             }
                         )
                     }
@@ -176,6 +181,7 @@ private fun ServerCard(
     server: EnrolledServerEntity,
     onClick: () -> Unit,
     onDelete: () -> Unit,
+    onViewDetails: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -248,6 +254,14 @@ private fun ServerCard(
                 )
             }
 
+            IconButton(onClick = onViewDetails) {
+                Icon(
+                    imageVector = Icons.Filled.Info,
+                    contentDescription = "View server details",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+
             IconButton(onClick = onDelete) {
                 Icon(
                     imageVector = Icons.Filled.Delete,
@@ -313,7 +327,8 @@ private fun ServerListPreview() {
         ServerListScreen(
             onNavigateBack = {},
             onNavigateToServerDiscovery = {},
-            onNavigateToServer = { _, _ -> }
+            onNavigateToServer = { _, _ -> },
+            onNavigateToServerDetails = {}
         )
     }
 }

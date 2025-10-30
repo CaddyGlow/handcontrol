@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv6Addr, UdpSocket};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 
 /// IPv6 address scope classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,12 +188,37 @@ pub fn get_all_local_ips_with_options(options: &NetworkOptions) -> Vec<String> {
             .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
     });
 
+    // Reorder to: first IPv6, then IPv4, then rest
+    // This provides optimal fallback: try best IPv6, then best IPv4, then others
+    let mut ipv6_addrs: Vec<IpAddr> = addresses
+        .iter()
+        .filter(|(ip, _)| ip.is_ipv6())
+        .map(|(ip, _)| *ip)
+        .collect();
+    let mut ipv4_addrs: Vec<IpAddr> = addresses
+        .iter()
+        .filter(|(ip, _)| ip.is_ipv4())
+        .map(|(ip, _)| *ip)
+        .collect();
+
+    // Build final list: [best IPv6, best IPv4, remaining IPv6, remaining IPv4]
+    let mut ordered = Vec::new();
+    if let Some(ipv6) = ipv6_addrs.first() {
+        ordered.push(*ipv6);
+        ipv6_addrs.remove(0);
+    }
+    if let Some(ipv4) = ipv4_addrs.first() {
+        ordered.push(*ipv4);
+        ipv4_addrs.remove(0);
+    }
+    ordered.extend(ipv6_addrs);
+    ordered.extend(ipv4_addrs);
+
     // Apply max addresses limit
-    let addresses: Vec<IpAddr> = addresses.into_iter().map(|(ip, _)| ip).collect();
     let addresses = if let Some(max) = options.max_addresses {
-        addresses.into_iter().take(max).collect()
+        ordered.into_iter().take(max).collect()
     } else {
-        addresses
+        ordered
     };
 
     // Convert to strings
@@ -273,6 +298,43 @@ fn should_filter_ip(ip: &IpAddr) -> bool {
             false
         }
     }
+}
+
+/// Extract client IP from gRPC request
+///
+/// Attempts to get the real client IP by checking:
+/// 1. X-Forwarded-For header (first IP in list)
+/// 2. X-Real-IP header
+/// 3. Fallback to direct peer address
+///
+/// Returns None if no valid IP can be extracted.
+pub fn extract_client_ip_from_headers(
+    headers: &tonic::metadata::MetadataMap,
+    peer_addr: Option<SocketAddr>,
+) -> Option<IpAddr> {
+    // Try X-Forwarded-For (may contain comma-separated list)
+    if let Some(forwarded) = headers.get("x-forwarded-for") {
+        if let Ok(value) = forwarded.to_str() {
+            // Take the first IP in the list (original client)
+            if let Some(first_ip) = value.split(',').next() {
+                if let Ok(ip) = first_ip.trim().parse::<IpAddr>() {
+                    return Some(ip);
+                }
+            }
+        }
+    }
+
+    // Try X-Real-IP
+    if let Some(real_ip) = headers.get("x-real-ip") {
+        if let Ok(value) = real_ip.to_str() {
+            if let Ok(ip) = value.parse::<IpAddr>() {
+                return Some(ip);
+            }
+        }
+    }
+
+    // Fallback to peer address
+    peer_addr.map(|addr| addr.ip())
 }
 
 #[cfg(test)]

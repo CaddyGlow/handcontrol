@@ -15,6 +15,9 @@ interface EnrolledServerDao {
     @Query("SELECT * FROM enrolled_servers WHERE serverId = :serverId")
     suspend fun getServerById(serverId: String): EnrolledServerEntity?
 
+    @Query("SELECT * FROM enrolled_servers WHERE serverId = :serverId")
+    fun observeServerById(serverId: String): Flow<EnrolledServerEntity?>
+
     @Query("SELECT * FROM enrolled_servers ORDER BY (last_connected IS NULL), last_connected DESC LIMIT 1")
     suspend fun getLastConnectedServer(): EnrolledServerEntity?
 

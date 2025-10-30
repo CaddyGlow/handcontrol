@@ -28,20 +28,36 @@ class MtlsGrpcChannelFactory @Inject constructor(
     private var lastServerCertificate: X509Certificate? = null
 
     override suspend fun createChannel(host: String, port: Int): ManagedChannel = withContext(Dispatchers.IO) {
-        Timber.i("Creating mTLS gRPC channel to $host:$port")
+        // Remove brackets from IPv6 addresses if present (forAddress handles raw IPv6)
+        val cleanHost = host.trimStart('[').trimEnd(']')
+        val isIpv6 = cleanHost.contains(':')
+
+        Timber.i("Creating mTLS gRPC channel to ${if (isIpv6) "[$cleanHost]" else cleanHost}:$port (IPv6: $isIpv6)")
 
         val clientCert = certificateManager.loadOrCreate()
         val trustManager = createCapturingTrustManager()
         val sslContext = createMtlsSslContext(clientCert.privateKeyAlias, trustManager)
 
-        val channel = OkHttpChannelBuilder
-            .forAddress(host, port)
+        val builder = OkHttpChannelBuilder
+            .forAddress(cleanHost, port)
             .sslSocketFactory(sslContext.socketFactory)
             .hostnameVerifier { _, _ -> true }
-            .build()
+            .keepAliveTime(30, TimeUnit.SECONDS)
+            .keepAliveTimeout(10, TimeUnit.SECONDS)
+            .keepAliveWithoutCalls(true)
+
+        // For IP addresses (both IPv4 and IPv6), we need to override authority with a dummy hostname
+        // because SNI (Server Name Indication) requires a hostname, not an IP address
+        val isIpAddress = isIpv6 || cleanHost.matches(Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$"))
+        if (isIpAddress) {
+            Timber.d("IP address detected, using overrideAuthority to bypass SNI hostname requirement")
+            builder.overrideAuthority("handcontrol.local:$port")
+        }
+
+        val channel = builder.build()
 
         activeChannels.add(channel)
-        Timber.d("gRPC channel created successfully")
+        Timber.d("gRPC channel created successfully for $cleanHost")
         channel
     }
 

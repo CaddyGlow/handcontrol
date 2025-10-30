@@ -2,12 +2,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use time::OffsetDateTime;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::security::certificates::ClientCertificate;
+
+/// Record of an IP connection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IpConnection {
+    pub ip_address: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub connected_at: OffsetDateTime,
+}
 
 /// Metadata for an authorized client
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,6 +28,15 @@ pub struct ClientMetadata {
     pub enrolled_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub last_seen: OffsetDateTime,
+    #[serde(default)]
+    pub ip_history: Vec<IpConnection>,
+}
+
+impl ClientMetadata {
+    /// Get the most recent IP address
+    pub fn last_ip(&self) -> Option<&str> {
+        self.ip_history.last().map(|conn| conn.ip_address.as_str())
+    }
 }
 
 /// Registry of all authorized clients
@@ -96,7 +114,7 @@ impl ClientStore {
     }
 
     /// Add a new authorized client
-    pub fn add_client(&mut self, cert: &ClientCertificate, device_name: String) -> Result<String> {
+    pub fn add_client(&mut self, cert: &ClientCertificate, device_name: String, ip: Option<IpAddr>) -> Result<String> {
         let client_id = Uuid::new_v4().to_string();
         let now = OffsetDateTime::now_utc();
 
@@ -109,6 +127,16 @@ impl ClientStore {
             )
         })?;
 
+        // Create IP history if IP provided
+        let ip_history = if let Some(ip) = ip {
+            vec![IpConnection {
+                ip_address: ip.to_string(),
+                connected_at: now,
+            }]
+        } else {
+            Vec::new()
+        };
+
         // Add to registry
         let metadata = ClientMetadata {
             id: client_id.clone(),
@@ -116,6 +144,7 @@ impl ClientStore {
             cert_fingerprint: cert.fingerprint_hex(),
             enrolled_at: now,
             last_seen: now,
+            ip_history,
         };
 
         self.registry.client.push(metadata);
@@ -169,8 +198,38 @@ impl ClientStore {
 
     /// Update last seen time for a client
     pub fn update_last_seen(&mut self, client_id: &str) -> Result<()> {
+        self.update_last_seen_with_ip(client_id, None)
+    }
+
+    /// Update last seen time and IP address for a client
+    pub fn update_last_seen_with_ip(&mut self, client_id: &str, ip: Option<IpAddr>) -> Result<()> {
         if let Some(client) = self.registry.client.iter_mut().find(|c| c.id == client_id) {
-            client.last_seen = OffsetDateTime::now_utc();
+            let now = OffsetDateTime::now_utc();
+            client.last_seen = now;
+
+            // Add IP to history if provided
+            if let Some(ip) = ip {
+                let ip_str = ip.to_string();
+
+                // Only add if it's different from the most recent IP or if history is empty
+                let should_add = client.ip_history.last()
+                    .map(|last| last.ip_address != ip_str)
+                    .unwrap_or(true);
+
+                if should_add {
+                    client.ip_history.push(IpConnection {
+                        ip_address: ip_str,
+                        connected_at: now,
+                    });
+
+                    // Keep only the last 100 connections to prevent unbounded growth
+                    const MAX_IP_HISTORY: usize = 100;
+                    if client.ip_history.len() > MAX_IP_HISTORY {
+                        client.ip_history.drain(0..client.ip_history.len() - MAX_IP_HISTORY);
+                    }
+                }
+            }
+
             self.save_registry()?;
             Ok(())
         } else {
@@ -235,7 +294,7 @@ mod tests {
 
         // Add client
         let client_id = store
-            .add_client(&client_cert, "Test Device".to_string())
+            .add_client(&client_cert, "Test Device".to_string(), None)
             .unwrap();
 
         // Get by ID
@@ -259,7 +318,7 @@ mod tests {
         let client_cert = ClientCertificate::from_der(cert.cert_der);
 
         let client_id = store
-            .add_client(&client_cert, "Test Device".to_string())
+            .add_client(&client_cert, "Test Device".to_string(), None)
             .unwrap();
         assert_eq!(store.list_clients().len(), 1);
 
@@ -277,7 +336,7 @@ mod tests {
         let client_cert = ClientCertificate::from_der(cert.cert_der);
 
         let client_id = store
-            .add_client(&client_cert, "Test Device".to_string())
+            .add_client(&client_cert, "Test Device".to_string(), None)
             .unwrap();
         let original_last_seen = store.get_client(&client_id).unwrap().last_seen;
 
@@ -301,7 +360,7 @@ mod tests {
         assert!(!store.is_authorized(&client_cert.fingerprint_hex()));
 
         store
-            .add_client(&client_cert, "Test Device".to_string())
+            .add_client(&client_cert, "Test Device".to_string(), None)
             .unwrap();
 
         assert!(store.is_authorized(&client_cert.fingerprint_hex()));
@@ -319,7 +378,7 @@ mod tests {
         let client_id = {
             let mut store = ClientStore::new(clients_dir.clone()).unwrap();
             store
-                .add_client(&client_cert, "Test Device".to_string())
+                .add_client(&client_cert, "Test Device".to_string(), None)
                 .unwrap()
         };
 

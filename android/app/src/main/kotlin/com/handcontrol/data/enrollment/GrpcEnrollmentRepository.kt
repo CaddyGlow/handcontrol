@@ -54,54 +54,85 @@ class GrpcEnrollmentRepository @Inject constructor(
     ): EnrollmentResult {
         require(hosts.isNotEmpty()) { "At least one host is required" }
 
-        // Try primary IP with short timeout
-        val primaryHost = hosts.first()
+        Timber.i("Enrolling with ${hosts.size} IP(s): ${hosts.take(3).joinToString()}")
+
+        // Strategy: IPv6 first -> IPv4 second -> remaining IPs in parallel
+        // Server orders IPs as: [best IPv6, best IPv4, other IPv6s, other IPv4s]
+
+        // 1. Try first IP (should be IPv6)
+        val firstHost = hosts[0]
         try {
-            Timber.d("Trying primary host: $primaryHost")
+            Timber.d("Trying primary IP (IPv6): $firstHost")
             return tryEnrollWithHost(
-                host = primaryHost,
+                host = firstHost,
                 port = port,
                 token = token,
                 deviceName = deviceName,
-                timeoutMs = 2000L
+                timeoutMs = 3000L
             )
         } catch (e: Exception) {
-            Timber.d(e, "Primary host $primaryHost failed: ${e.message}")
+            Timber.w(e, "Primary IP $firstHost failed: ${e.javaClass.simpleName}")
         }
 
-        // If primary fails, try remaining IPs in parallel
-        if (hosts.size == 1) {
-            return EnrollmentResult.Error("Failed to connect to $primaryHost")
+        // 2. Try second IP if available (should be IPv4)
+        if (hosts.size >= 2) {
+            val secondHost = hosts[1]
+            try {
+                Timber.d("Trying fallback IP (IPv4): $secondHost")
+                return tryEnrollWithHost(
+                    host = secondHost,
+                    port = port,
+                    token = token,
+                    deviceName = deviceName,
+                    timeoutMs = 3000L
+                )
+            } catch (e: Exception) {
+                Timber.w(e, "Fallback IP $secondHost failed: ${e.javaClass.simpleName}")
+            }
         }
 
-        val remainingHosts = hosts.drop(1)
-        Timber.d("Trying ${remainingHosts.size} alternative hosts in parallel")
+        // 3. Try remaining IPs in parallel if any
+        return if (hosts.size > 2) {
+            val remainingHosts = hosts.drop(2)
+            Timber.d("Trying ${remainingHosts.size} remaining IPs in parallel")
 
-        return coroutineScope {
-            val results = remainingHosts.map { host ->
-                async {
-                    try {
-                        Timber.d("Trying alternative host: $host")
-                        tryEnrollWithHost(
-                            host = host,
-                            port = port,
-                            token = token,
-                            deviceName = deviceName,
-                            timeoutMs = 5000L
-                        )
-                    } catch (e: Exception) {
-                        Timber.d(e, "Alternative host $host failed: ${e.message}")
-                        EnrollmentResult.Error("Failed to connect to $host: ${e.message}")
+            coroutineScope {
+                val results = remainingHosts.map { host ->
+                    async {
+                        try {
+                            Timber.d("Trying alternative IP: $host")
+                            tryEnrollWithHost(
+                                host = host,
+                                port = port,
+                                token = token,
+                                deviceName = deviceName,
+                                timeoutMs = 5000L
+                            )
+                        } catch (e: Exception) {
+                            Timber.w(e, "Alternative IP $host failed: ${e.javaClass.simpleName}")
+                            EnrollmentResult.Error("${e.javaClass.simpleName}: ${e.message}")
+                        }
                     }
                 }
-            }
 
-            // Return first successful result
-            try {
-                results.awaitFirstSuccess()
-            } catch (e: Exception) {
-                EnrollmentResult.Error("Failed to connect to any host: ${hosts.joinToString()}")
+                // Return first successful result
+                for (deferred in results) {
+                    val result = deferred.await()
+                    if (result is EnrollmentResult.Success) {
+                        // Cancel remaining tasks
+                        results.forEach { if (it != deferred) it.cancel() }
+                        return@coroutineScope result
+                    }
+                }
+
+                // All attempts failed
+                Timber.e("All ${hosts.size} enrollment attempts failed")
+                EnrollmentResult.Error("Failed to connect to any of ${hosts.size} IP addresses")
             }
+        } else {
+            // Only 1 or 2 IPs and both failed
+            Timber.e("All ${hosts.size} enrollment attempts failed")
+            EnrollmentResult.Error("Failed to connect to any of ${hosts.size} IP addresses")
         }
     }
 
@@ -114,9 +145,15 @@ class GrpcEnrollmentRepository @Inject constructor(
     ): EnrollmentResult {
         return withTimeout(timeoutMs) {
             try {
+                Timber.d("tryEnrollWithHost: Attempting connection to host=$host port=$port timeout=${timeoutMs}ms")
                 val certificate = certificateManager.loadOrCreate()
+                Timber.d("tryEnrollWithHost: Client certificate loaded")
+
                 val channel = channelFactory.createChannel(host, port)
+                Timber.d("tryEnrollWithHost: gRPC channel created")
+
                 val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+                Timber.d("tryEnrollWithHost: gRPC stub created, sending enrollment request")
 
                 val request = EnrollRequest.newBuilder()
                     .setEnrollmentToken(token)
@@ -124,7 +161,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                     .setDeviceName(deviceName)
                     .build()
 
+                Timber.d("tryEnrollWithHost: Calling enroll RPC...")
                 val response = stub.enroll(request)
+                Timber.d("tryEnrollWithHost: Enrollment RPC completed, success=${response.success}")
 
                 // Extract and pin server certificate for future connections (TOFU)
                 val serverCertDer = extractServerCertificate(channel)
@@ -166,31 +205,26 @@ class GrpcEnrollmentRepository @Inject constructor(
                     EnrollmentResult.Error(response.errorMessage)
                 }
             } catch (e: StatusException) {
-                Timber.e(e, "QR enrollment RPC failed for host=$host")
-                throw IOException("gRPC error: ${mapGrpcError(e.status)}", e)
+                val errorMsg = mapGrpcError(e.status)
+                Timber.e(e, "QR enrollment RPC failed for host=$host - Status: ${e.status.code} - $errorMsg")
+                throw IOException("gRPC ${e.status.code}: $errorMsg", e)
+            } catch (e: java.net.UnknownHostException) {
+                Timber.e(e, "DNS resolution failed for host=$host")
+                throw IOException("Cannot resolve host: $host", e)
+            } catch (e: java.net.ConnectException) {
+                Timber.e(e, "Connection refused for host=$host:$port")
+                throw IOException("Connection refused: $host:$port", e)
+            } catch (e: java.net.SocketTimeoutException) {
+                Timber.e(e, "Connection timeout for host=$host:$port")
+                throw IOException("Connection timeout: $host:$port", e)
+            } catch (e: javax.net.ssl.SSLException) {
+                Timber.e(e, "SSL/TLS handshake failed for host=$host")
+                throw IOException("SSL/TLS error: ${e.message}", e)
             } catch (e: Exception) {
-                Timber.e(e, "QR enrollment failed for host=$host")
-                throw IOException("Network error: ${e.message}", e)
+                Timber.e(e, "QR enrollment failed for host=$host - ${e.javaClass.simpleName}")
+                throw IOException("${e.javaClass.simpleName}: ${e.message}", e)
             }
         }
-    }
-
-    private suspend fun List<kotlinx.coroutines.Deferred<EnrollmentResult>>.awaitFirstSuccess(): EnrollmentResult {
-        val errors = mutableListOf<String>()
-
-        for (deferred in this) {
-            val result = deferred.await()
-            if (result is EnrollmentResult.Success) {
-                // Cancel remaining tasks
-                forEach { if (it != deferred) it.cancel() }
-                return result
-            }
-            if (result is EnrollmentResult.Error) {
-                errors.add(result.message)
-            }
-        }
-
-        throw IOException("All hosts failed: ${errors.joinToString(", ")}")
     }
 
     override suspend fun requestApproval(

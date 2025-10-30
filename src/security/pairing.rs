@@ -1,5 +1,6 @@
 use anyhow::Result;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -25,6 +26,7 @@ pub struct PairingRequest {
     pub expires_at: OffsetDateTime,
     pub status: PairingRequestStatus,
     pub client_id: Option<String>,
+    pub ip_address: Option<IpAddr>,
 }
 
 impl PairingRequest {
@@ -35,6 +37,7 @@ impl PairingRequest {
         client_certificate: Vec<u8>,
         verification_code: String,
         timeout_seconds: u64,
+        ip_address: Option<IpAddr>,
     ) -> Self {
         let now = OffsetDateTime::now_utc();
         let request_id = Uuid::new_v4().to_string();
@@ -49,6 +52,7 @@ impl PairingRequest {
             expires_at: now + Duration::seconds(timeout_seconds as i64),
             status: PairingRequestStatus::Pending,
             client_id: None,
+            ip_address,
         }
     }
 
@@ -86,6 +90,7 @@ impl PairingRequestManager {
         device_model: Option<String>,
         client_certificate: Vec<u8>,
         verification_code: String,
+        ip_address: Option<IpAddr>,
     ) -> Result<PairingRequest> {
         let request = PairingRequest::new(
             device_name,
@@ -93,6 +98,7 @@ impl PairingRequestManager {
             client_certificate,
             verification_code,
             self.timeout_seconds,
+            ip_address,
         );
 
         let request_id = request.request_id.clone();
@@ -207,6 +213,7 @@ mod tests {
             vec![1, 2, 3],
             "123-456".to_string(),
             60,
+            None,
         );
 
         assert!(!request.request_id.is_empty());
@@ -226,6 +233,7 @@ mod tests {
             vec![1, 2, 3],
             "123-456".to_string(),
             0, // Expires immediately
+            None,
         );
 
         thread::sleep(StdDuration::from_millis(10));
@@ -243,6 +251,7 @@ mod tests {
                 Some("Test Model".to_string()),
                 vec![1, 2, 3],
                 "123-456".to_string(),
+                None,
             )
             .unwrap();
 
@@ -260,6 +269,7 @@ mod tests {
                 None,
                 vec![1, 2, 3],
                 "123-456".to_string(),
+                None,
             )
             .unwrap();
 
@@ -278,6 +288,7 @@ mod tests {
                 None,
                 vec![1, 2, 3],
                 "123-456".to_string(),
+                None,
             )
             .unwrap();
 
@@ -300,6 +311,7 @@ mod tests {
                 None,
                 vec![1, 2, 3],
                 "123-456".to_string(),
+                None,
             )
             .unwrap();
 
@@ -319,6 +331,7 @@ mod tests {
                 None,
                 vec![1, 2, 3],
                 "123-456".to_string(),
+                None,
             )
             .unwrap();
 
@@ -338,10 +351,10 @@ mod tests {
 
         // Create multiple expired requests
         manager
-            .create_request("Device 1".to_string(), None, vec![1], "111-111".to_string())
+            .create_request("Device 1".to_string(), None, vec![1], "111-111".to_string(), None)
             .unwrap();
         manager
-            .create_request("Device 2".to_string(), None, vec![2], "222-222".to_string())
+            .create_request("Device 2".to_string(), None, vec![2], "222-222".to_string(), None)
             .unwrap();
 
         thread::sleep(StdDuration::from_millis(10));
@@ -349,7 +362,7 @@ mod tests {
         // Create a new request, which should trigger cleanup
         let manager2 = PairingRequestManager::new(60);
         manager2
-            .create_request("Device 3".to_string(), None, vec![3], "333-333".to_string())
+            .create_request("Device 3".to_string(), None, vec![3], "333-333".to_string(), None)
             .unwrap();
 
         // Only the new request should be pending

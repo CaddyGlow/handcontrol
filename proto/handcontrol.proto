@@ -113,6 +113,7 @@ message PendingPairingInfo {
   string verification_code = 4;
   int64 expires_at_unix = 5;  // Unix timestamp in seconds
   int32 seconds_remaining = 6;
+  string ip_address = 7;  // Client IP address
 }
 
 enum PairingStatus {

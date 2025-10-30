@@ -69,6 +69,18 @@ fun HandControlNavHost(
                 },
                 onNavigateToServer = { host, port ->
                     navController.navigate(Route.CommandList(host, port))
+                },
+                onNavigateToServerDetails = { serverId ->
+                    navController.navigate(Route.ServerDetails(serverId))
+                }
+            )
+        }
+
+        composable<Route.ServerDetails> { backStackEntry ->
+            val route = backStackEntry.toRoute<Route.ServerDetails>()
+            com.handcontrol.feature.serverdetails.ServerDetailsScreen(
+                onNavigateBack = {
+                    navController.popBackStack()
                 }
             )
         }

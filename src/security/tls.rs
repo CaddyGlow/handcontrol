@@ -271,7 +271,7 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .add_client(&client_cert, "Test Client".to_string())
+            .add_client(&client_cert, "Test Client".to_string(), None)
             .unwrap();
 
         let verifier = AuthorizedClientVerifier::new(store).unwrap();

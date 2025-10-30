@@ -79,9 +79,19 @@ impl RemoteControl for RemoteControlService {
         &self,
         request: Request<EnrollRequest>,
     ) -> Result<Response<EnrollResponse>, Status> {
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
         let req = request.into_inner();
 
-        info!("Enrollment request from device: {}", req.device_name);
+        info!(
+            "Enrollment request from device: {} (IP: {})",
+            req.device_name,
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Check if QR code enrollment is enabled
         let config = self.config.read().unwrap();
@@ -121,7 +131,7 @@ impl RemoteControl for RemoteControlService {
 
         // Store client certificate
         let mut store = self.client_store.lock().unwrap();
-        let client_id = match store.add_client(&client_cert, req.device_name.clone()) {
+        let client_id = match store.add_client(&client_cert, req.device_name.clone(), client_ip) {
             Ok(id) => id,
             Err(e) => {
                 warn!(
@@ -262,9 +272,19 @@ impl RemoteControl for RemoteControlService {
         &self,
         request: Request<RequestPairingRequest>,
     ) -> Result<Response<RequestPairingResponse>, Status> {
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
         let req = request.into_inner();
 
-        info!("Pairing request from device: {}", req.device_name);
+        info!(
+            "Pairing request from device: {} (IP: {})",
+            req.device_name,
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Read config once and use it throughout
         let config = self.config.read().unwrap();
@@ -334,6 +354,7 @@ impl RemoteControl for RemoteControlService {
             },
             req.client_certificate.clone(),
             server_verification_code.clone(),
+            client_ip,
         ) {
             Ok(request) => request,
             Err(e) => {
@@ -392,7 +413,19 @@ impl RemoteControl for RemoteControlService {
         &self,
         request: Request<CheckPairingStatusRequest>,
     ) -> Result<Response<CheckPairingStatusResponse>, Status> {
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
         let req = request.into_inner();
+
+        info!(
+            "CheckPairingStatus RPC called: request_id={} (IP: {})",
+            req.pairing_request_id,
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Get pairing request
         let pairing_request = match self.pairing_manager.get_request(&req.pairing_request_id) {
@@ -468,10 +501,17 @@ impl RemoteControl for RemoteControlService {
         &self,
         request: Request<ApprovePairingRequest>,
     ) -> Result<Response<ApprovePairingResponse>, Status> {
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
         let req = request.into_inner();
         info!(
-            "ApprovePairing RPC called for request_id={}",
-            req.pairing_request_id
+            "ApprovePairing RPC called for request_id={} (IP: {})",
+            req.pairing_request_id,
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
         );
 
         let result = {
@@ -530,6 +570,7 @@ impl RemoteControl for RemoteControlService {
                     verification_code: req.verification_code,
                     expires_at_unix: req.expires_at.unix_timestamp(),
                     seconds_remaining: seconds_remaining as i32,
+                    ip_address: req.ip_address.map(|ip| ip.to_string()).unwrap_or_default(),
                 }
             })
             .collect();
@@ -541,9 +582,18 @@ impl RemoteControl for RemoteControlService {
 
     async fn get_server_info(
         &self,
-        _request: Request<ServerInfoRequest>,
+        request: Request<ServerInfoRequest>,
     ) -> Result<Response<ServerInfoResponse>, Status> {
-        info!("GetServerInfo RPC called");
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
+        info!(
+            "GetServerInfo RPC called (IP: {})",
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Get hostname
         let hostname = hostname::get()
@@ -569,9 +619,18 @@ impl RemoteControl for RemoteControlService {
 
     async fn list_commands(
         &self,
-        _request: Request<ListCommandsRequest>,
+        request: Request<ListCommandsRequest>,
     ) -> Result<Response<ListCommandsResponse>, Status> {
-        info!("ListCommands RPC called");
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
+        info!(
+            "ListCommands RPC called (IP: {})",
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Read config once and use it throughout
         let config = self.config.read().unwrap();
@@ -636,9 +695,19 @@ impl RemoteControl for RemoteControlService {
         &self,
         request: Request<ExecuteCommandRequest>,
     ) -> Result<Response<Self::ExecuteCommandStream>, Status> {
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
         let req = request.into_inner();
 
-        info!("ExecuteCommand RPC called: command_id={}", req.command_id);
+        info!(
+            "ExecuteCommand RPC called: command_id={} (IP: {})",
+            req.command_id,
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Read config and find command
         let config = self.config.read().unwrap();
@@ -767,9 +836,18 @@ impl RemoteControl for RemoteControlService {
 
     async fn get_config_version(
         &self,
-        _request: Request<GetConfigVersionRequest>,
+        request: Request<GetConfigVersionRequest>,
     ) -> Result<Response<GetConfigVersionResponse>, Status> {
-        info!("GetConfigVersion RPC called");
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
+        info!(
+            "GetConfigVersion RPC called (IP: {})",
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         let config_version = self.config_version.load(Ordering::SeqCst);
         let last_updated_ms = self.last_config_update.load(Ordering::SeqCst) as i64;
@@ -787,9 +865,18 @@ impl RemoteControl for RemoteControlService {
 
     async fn watch_config_updates(
         &self,
-        _request: Request<WatchConfigUpdatesRequest>,
+        request: Request<WatchConfigUpdatesRequest>,
     ) -> Result<Response<Self::WatchConfigUpdatesStream>, Status> {
-        info!("WatchConfigUpdates RPC called - starting config update stream");
+        // Extract client IP
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
+        info!(
+            "WatchConfigUpdates RPC called - starting config update stream (IP: {})",
+            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+        );
 
         // Subscribe to config updates
         let mut rx = self.config_broadcaster.subscribe();

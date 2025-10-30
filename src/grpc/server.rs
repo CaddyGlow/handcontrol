@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -12,15 +13,16 @@ use uuid::Uuid;
 use super::proto::remote_control_server::{RemoteControl, RemoteControlServer};
 use super::proto::{
     ApprovePairingRequest, ApprovePairingResponse, CheckPairingStatusRequest,
-    CheckPairingStatusResponse, EnrollRequest, EnrollResponse, ExecuteCommandRequest,
-    ExecuteCommandResponse, GenerateEnrollmentQrRequest, GenerateEnrollmentQrResponse,
+    CheckPairingStatusResponse, ConfigUpdateNotification, EnrollRequest, EnrollResponse,
+    ExecuteCommandRequest, ExecuteCommandResponse, GenerateEnrollmentQrRequest,
+    GenerateEnrollmentQrResponse, GetConfigVersionRequest, GetConfigVersionResponse,
     ListCommandsRequest, ListCommandsResponse, ListPendingPairingsRequest,
     ListPendingPairingsResponse, PendingPairingInfo, RequestPairingRequest,
-    RequestPairingResponse, ServerInfoRequest, ServerInfoResponse,
+    RequestPairingResponse, ServerInfoRequest, ServerInfoResponse, WatchConfigUpdatesRequest,
 };
 
 use crate::cli::approve::approve_pairing_request;
-use crate::config::Config;
+use crate::config::{Config, ConfigBroadcaster};
 use crate::notifications::NotificationManager;
 use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
@@ -30,24 +32,30 @@ use crate::storage::clients::ClientStore;
 
 /// gRPC service implementation
 pub struct RemoteControlService {
-    config: Arc<Config>,
+    config: Arc<RwLock<Config>>,
     server_cert: Arc<ServerCertificate>,
     server_id: Uuid,
     client_store: Arc<Mutex<ClientStore>>,
     enrollment_manager: EnrollmentTokenManager,
     pairing_manager: PairingRequestManager,
     notification_manager: NotificationManager,
+    config_version: Arc<AtomicU64>,
+    config_broadcaster: Arc<ConfigBroadcaster>,
+    last_config_update: Arc<AtomicU64>,
 }
 
 impl RemoteControlService {
     pub fn new(
-        config: Arc<Config>,
+        config: Arc<RwLock<Config>>,
         server_cert: Arc<ServerCertificate>,
         server_id: Uuid,
         client_store: Arc<Mutex<ClientStore>>,
         enrollment_manager: EnrollmentTokenManager,
         pairing_manager: PairingRequestManager,
         notification_manager: NotificationManager,
+        config_version: Arc<AtomicU64>,
+        config_broadcaster: Arc<ConfigBroadcaster>,
+        last_config_update: Arc<AtomicU64>,
     ) -> Self {
         Self {
             config,
@@ -57,6 +65,9 @@ impl RemoteControlService {
             enrollment_manager,
             pairing_manager,
             notification_manager,
+            config_version,
+            config_broadcaster,
+            last_config_update,
         }
     }
 }
@@ -72,7 +83,8 @@ impl RemoteControl for RemoteControlService {
         info!("Enrollment request from device: {}", req.device_name);
 
         // Check if QR code enrollment is enabled
-        if !self.config.security.enrollment.qr_code_enabled {
+        let config = self.config.read().unwrap();
+        if !config.security.enrollment.qr_code_enabled {
             warn!("QR code enrollment is disabled");
             return Ok(Response::new(EnrollResponse {
                 success: false,
@@ -140,8 +152,11 @@ impl RemoteControl for RemoteControlService {
     ) -> Result<Response<GenerateEnrollmentQrResponse>, Status> {
         info!("GenerateEnrollmentQR RPC called");
 
+        // Read config once and use it throughout
+        let config = self.config.read().unwrap();
+
         // Check if QR code enrollment is enabled
-        if !self.config.security.enrollment.qr_code_enabled {
+        if !config.security.enrollment.qr_code_enabled {
             warn!("QR code enrollment is disabled");
             return Ok(Response::new(GenerateEnrollmentQrResponse {
                 success: false,
@@ -176,20 +191,20 @@ impl RemoteControl for RemoteControlService {
         };
 
         // Determine server IP for clients to connect to
-        let server_ip = if self.config.server.bind_address == "0.0.0.0"
-            || self.config.server.bind_address == "::"
+        let server_ip = if config.server.bind_address == "0.0.0.0"
+            || config.server.bind_address == "::"
         {
             // Server is bound to all interfaces, try to get a local IP
             get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
         } else {
-            self.config.server.bind_address.clone()
+            config.server.bind_address.clone()
         };
-        let server_port = self.config.server.port as i32;
+        let server_port = config.server.port as i32;
 
         // Create QR payload
         let payload = crate::utils::qr::EnrollmentQrPayload::new(
             server_ip.clone(),
-            self.config.server.port,
+            config.server.port,
             self.server_cert.fingerprint_display(),
             token.token.clone(),
             self.server_id,
@@ -213,7 +228,7 @@ impl RemoteControl for RemoteControlService {
             }
         };
 
-        info!("Generated enrollment token, expires in {} seconds", self.config.security.enrollment_token_ttl);
+        info!("Generated enrollment token, expires in {} seconds", config.security.enrollment_token_ttl);
 
         Ok(Response::new(GenerateEnrollmentQrResponse {
             success: true,
@@ -223,7 +238,7 @@ impl RemoteControl for RemoteControlService {
             server_port,
             server_cert_fingerprint: self.server_cert.fingerprint_display(),
             server_id: self.server_id.to_string(),
-            ttl_seconds: self.config.security.enrollment_token_ttl as i32,
+            ttl_seconds: config.security.enrollment_token_ttl as i32,
             error_message: String::new(),
         }))
     }
@@ -236,8 +251,11 @@ impl RemoteControl for RemoteControlService {
 
         info!("Pairing request from device: {}", req.device_name);
 
+        // Read config once and use it throughout
+        let config = self.config.read().unwrap();
+
         // Check if approval enrollment is enabled
-        if !self.config.security.enrollment.approval_enabled {
+        if !config.security.enrollment.approval_enabled {
             warn!("Approval mode enrollment is disabled");
             return Ok(Response::new(RequestPairingResponse {
                 pending: false,
@@ -321,7 +339,7 @@ impl RemoteControl for RemoteControlService {
         );
 
         // Show OS notification if available
-        if self.config.security.enrollment.approval_notification {
+        if config.security.enrollment.approval_notification {
             match self.notification_manager.show_pairing_notification(
                 &req.device_name,
                 &server_verification_code,
@@ -347,7 +365,7 @@ impl RemoteControl for RemoteControlService {
         Ok(Response::new(RequestPairingResponse {
             pending: true,
             pairing_request_id: pairing_request.request_id,
-            timeout_seconds: self.config.security.enrollment.approval_timeout_seconds as i32,
+            timeout_seconds: config.security.enrollment.approval_timeout_seconds as i32,
             verification_code: server_verification_code,
             server_cert_fingerprint: self.server_cert.fingerprint.to_vec(),
             error_message: String::new(),
@@ -540,9 +558,12 @@ impl RemoteControl for RemoteControlService {
     ) -> Result<Response<ListCommandsResponse>, Status> {
         info!("ListCommands RPC called");
 
+        // Read config once and use it throughout
+        let config = self.config.read().unwrap();
+        let config_version = self.config_version.load(Ordering::SeqCst);
+
         // Convert config commands to protobuf format
-        let commands: Vec<super::proto::Command> = self
-            .config
+        let commands: Vec<super::proto::Command> = config
             .command
             .iter()
             .map(|cmd| {
@@ -585,9 +606,12 @@ impl RemoteControl for RemoteControlService {
             })
             .collect();
 
-        info!("Returning {} commands", commands.len());
+        info!("Returning {} commands (config version {})", commands.len(), config_version);
 
-        Ok(Response::new(ListCommandsResponse { commands }))
+        Ok(Response::new(ListCommandsResponse {
+            commands,
+            config_version,
+        }))
     }
 
     type ExecuteCommandStream =
@@ -601,9 +625,9 @@ impl RemoteControl for RemoteControlService {
 
         info!("ExecuteCommand RPC called: command_id={}", req.command_id);
 
-        // Find command in config
-        let command = self
-            .config
+        // Read config and find command
+        let config = self.config.read().unwrap();
+        let command = config
             .command
             .iter()
             .find(|cmd| cmd.id == req.command_id)
@@ -723,6 +747,71 @@ impl RemoteControl for RemoteControlService {
         });
 
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        Ok(Response::new(stream))
+    }
+
+    async fn get_config_version(
+        &self,
+        _request: Request<GetConfigVersionRequest>,
+    ) -> Result<Response<GetConfigVersionResponse>, Status> {
+        info!("GetConfigVersion RPC called");
+
+        let config_version = self.config_version.load(Ordering::SeqCst);
+        let last_updated_ms = self.last_config_update.load(Ordering::SeqCst) as i64;
+
+        info!("Returning config version {} (last updated: {}ms)", config_version, last_updated_ms);
+
+        Ok(Response::new(GetConfigVersionResponse {
+            config_version,
+            last_updated_ms,
+        }))
+    }
+
+    type WatchConfigUpdatesStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ConfigUpdateNotification, Status>>;
+
+    async fn watch_config_updates(
+        &self,
+        _request: Request<WatchConfigUpdatesRequest>,
+    ) -> Result<Response<Self::WatchConfigUpdatesStream>, Status> {
+        info!("WatchConfigUpdates RPC called - starting config update stream");
+
+        // Subscribe to config updates
+        let mut rx = self.config_broadcaster.subscribe();
+
+        // Create channel for streaming updates
+        let (tx, stream_rx) = tokio::sync::mpsc::channel(32);
+
+        // Spawn task to forward broadcast messages to gRPC stream
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(notification) => {
+                        let proto_notification = ConfigUpdateNotification {
+                            config_version: notification.version,
+                            timestamp_ms: notification.timestamp_ms,
+                        };
+
+                        if tx.send(Ok(proto_notification)).await.is_err() {
+                            // Client disconnected
+                            info!("Config update stream client disconnected");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        warn!("Config update stream lagged, skipped {} messages", skipped);
+                        // Continue receiving
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // Broadcaster closed
+                        info!("Config broadcaster closed");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(stream_rx);
         Ok(Response::new(stream))
     }
 }

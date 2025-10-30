@@ -35,6 +35,8 @@ webpki-roots = "1.0.3"
 qr2term = "0.3.3"
 shell-escape = "0.1.5"
 socket2 = "0.5.7"
+notify = { version = "7.0.0", default-features = false, features = ["macos_kqueue"] }
+async-stream = "0.3"
 
 # Platform-specific notification support
 [target.'cfg(target_os = "linux")'.dependencies]

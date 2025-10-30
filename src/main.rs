@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use handcontrol::config::{default_config_path, load_config, validate_config};
+use handcontrol::config::{default_config_path, load_config, validate_config, ConfigBroadcaster, ConfigWatcher};
 use handcontrol::grpc::proto::{
     ApprovePairingRequest, GenerateEnrollmentQrRequest, ListPendingPairingsRequest,
 };
 use handcontrol::grpc::proto::remote_control_client::RemoteControlClient;
+use std::sync::atomic::AtomicU64;
 use handcontrol::grpc::server::{RemoteControlService, start_server};
 use handcontrol::mdns::service::MdnsService;
 use handcontrol::notifications::NotificationManager;
@@ -17,7 +18,7 @@ use handcontrol::storage;
 use handcontrol::utils::logging;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tracing::info;
 
@@ -454,16 +455,47 @@ async fn start_handcontrol_server() -> Result<()> {
     let bind_address = config.server.bind_address.clone();
     let cert_fingerprint = server_cert.fingerprint_display();
 
+    // Create config version tracking
+    let config_version = Arc::new(AtomicU64::new(1));
+    let config_broadcaster = Arc::new(ConfigBroadcaster::new(100));
+    let last_config_update = Arc::new(AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+    ));
+
+    // Wrap config in RwLock for hot-reload support
+    let config_arc = Arc::new(RwLock::new(config));
+
+    // Start config watcher task
+    info!("Starting config file watcher...");
+    let watcher = ConfigWatcher::new(
+        config_path.clone(),
+        config_arc.clone(),
+        config_version.clone(),
+        config_broadcaster.clone(),
+        last_config_update.clone(),
+    );
+    tokio::spawn(async move {
+        if let Err(e) = watcher.start().await {
+            tracing::error!("Config watcher failed: {}", e);
+        }
+    });
+
     // Create gRPC service
     info!("Creating gRPC service...");
     let service = RemoteControlService::new(
-        Arc::new(config),
+        config_arc,
         Arc::new(server_cert),
         server_id,
         client_store,
         enrollment_manager,
         pairing_manager,
         notification_manager,
+        config_version,
+        config_broadcaster,
+        last_config_update,
     );
 
     // Parse bind address

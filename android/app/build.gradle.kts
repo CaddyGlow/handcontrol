@@ -63,6 +63,15 @@ android {
         abortOnError = false
         checkReleaseBuilds = false
     }
+
+    sourceSets {
+        getByName("main") {
+            proto {
+                // Use shared proto file from parent project
+                srcDir("${project.rootDir}/../proto")
+            }
+        }
+    }
 }
 
 dependencies {

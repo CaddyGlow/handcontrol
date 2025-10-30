@@ -2,6 +2,10 @@ syntax = "proto3";
 
 package handcontrol.v1;
 
+option java_multiple_files = true;
+option java_package = "com.handcontrol.grpc";
+option java_outer_classname = "HandControlProto";
+
 // Main service
 service RemoteControl {
   // Enrollment: QR code mode (token-based)
@@ -22,6 +26,10 @@ service RemoteControl {
 
   // Execute a command with streaming output
   rpc ExecuteCommand(ExecuteCommandRequest) returns (stream ExecuteCommandResponse);
+
+  // Config hot-reload APIs
+  rpc GetConfigVersion(GetConfigVersionRequest) returns (GetConfigVersionResponse);
+  rpc WatchConfigUpdates(WatchConfigUpdatesRequest) returns (stream ConfigUpdateNotification);
 }
 
 // Enrollment (QR code mode)
@@ -127,6 +135,7 @@ message ListCommandsRequest {}
 
 message ListCommandsResponse {
   repeated Command commands = 1;
+  uint64 config_version = 2;  // Version of config used for this list
 }
 
 message Command {
@@ -177,4 +186,19 @@ message ExecuteCommandResponse {
 
   // Metadata
   optional int64 timestamp_ms = 5;
+}
+
+// Config hot-reload messages
+message GetConfigVersionRequest {}
+
+message GetConfigVersionResponse {
+  uint64 config_version = 1;       // Current config version number
+  int64 last_updated_ms = 2;       // Unix timestamp of last config reload
+}
+
+message WatchConfigUpdatesRequest {}
+
+message ConfigUpdateNotification {
+  uint64 config_version = 1;       // New config version number
+  int64 timestamp_ms = 2;          // Unix timestamp of this update
 }

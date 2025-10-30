@@ -3,9 +3,6 @@ name = "handcontrol-relay"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-relay-integration = []
-
 [lib]
 name = "handcontrol_relay"
 path = "src/lib.rs"

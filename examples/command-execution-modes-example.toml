@@ -1,0 +1,242 @@
+# HandControl Example Configuration
+# Demonstrates command execution modes features:
+# - Immediate execution (button-like behavior)
+# - Confirmation dialogs for dangerous commands
+# - Silent execution (show_output = false)
+# - Dynamic parameter defaults
+
+[server]
+port = 50051
+bind_address = "::"
+mdns_service_name = "handcontrol"
+mdns_instance_name = "Example Server"
+
+[security]
+# cert_path = "~/.config/handcontrol/server.crt"
+# key_path = "~/.config/handcontrol/server.key"
+# authorized_clients_dir = "~/.config/handcontrol/clients"
+enrollment_token_ttl = 300
+
+[security.enrollment]
+qr_code_enabled = true
+approval_enabled = true
+approval_timeout_seconds = 60
+approval_notification = true
+
+# Example 1: Simple safe command - immediate execution with output
+[[command]]
+id = "system-info"
+name = "System Info"
+description = "Display detailed system information"
+icon = "info"
+tags = ["system", "safe"]
+shell = "uname -a && cat /etc/os-release"
+# requires_confirmation defaults to false
+# show_output defaults to true
+# One-tap execution, shows output screen
+
+# Example 2: Dangerous command - requires confirmation before execution
+[[command]]
+id = "system-shutdown"
+name = "Shutdown System"
+description = "Immediately shut down the computer"
+icon = "power_settings_new"
+tags = ["system", "power", "dangerous"]
+shell = "shutdown -h now"
+requires_confirmation = true  # User must confirm before execution
+show_output = true
+# Flow: tap → confirmation dialog → execute → show output
+
+# Example 3: Silent command with dynamic defaults - set volume
+[[command]]
+id = "set-volume"
+name = "Set Volume"
+description = "Adjust system volume (0-100%)"
+icon = "volume_up"
+tags = ["media", "audio"]
+shell = "pactl set-sink-volume @DEFAULT_SINK@ {level}%"
+requires_confirmation = false
+show_output = false  # Just shows toast notification, no output screen
+timeout_seconds = 5
+
+[[command.parameters]]
+name = "level"
+type = "slider"
+description = "Volume level"
+min = 0
+max = 100
+default = "50"  # Static fallback
+default_value_command = "pactl get-sink-volume @DEFAULT_SINK@ | grep -oP '\\d+%' | head -1 | tr -d '%'"
+default_value_pattern = "^(\\d+)$"
+# Flow: tap → opens param screen → fetches current volume → user adjusts → execute → toast
+
+# Example 4: Silent command without parameters - play/pause media
+[[command]]
+id = "media-play-pause"
+name = "Play/Pause"
+description = "Toggle media playback"
+icon = "play_arrow"
+tags = ["media", "quick"]
+shell = "playerctl play-pause"
+requires_confirmation = false
+show_output = false
+timeout_seconds = 2
+# Flow: tap → executes immediately → shows toast → stays on command list
+
+# Example 5: Toggle with dynamic state - mute audio
+[[command]]
+id = "toggle-mute"
+name = "Toggle Mute"
+description = "Mute or unmute system audio"
+icon = "volume_off"
+tags = ["audio", "quick"]
+shell = "pactl set-sink-mute @DEFAULT_SINK@ {state}"
+requires_confirmation = false
+show_output = false
+timeout_seconds = 5
+
+[[command.parameters]]
+name = "state"
+type = "toggle"
+description = "Mute state"
+label_on = "Muted"
+label_off = "Unmuted"
+default = "0"
+default_value_command = "pactl get-sink-mute @DEFAULT_SINK@ | grep -oP 'yes|no' | sed 's/yes/1/;s/no/0/'"
+default_value_pattern = "^([01])$"
+
+# Example 6: Brightness control with dynamic default
+[[command]]
+id = "set-brightness"
+name = "Set Brightness"
+description = "Adjust screen brightness (0-100%)"
+icon = "brightness_6"
+tags = ["display", "quick"]
+shell = "brightnessctl set {brightness}%"
+show_output = false
+timeout_seconds = 3
+
+[[command.parameters]]
+name = "brightness"
+type = "slider"
+min = 0
+max = 100
+default = "50"
+default_value_command = "brightnessctl get -P"
+default_value_pattern = "^(\\d+)$"
+
+# Example 7: Dangerous command with parameters - delete logs
+[[command]]
+id = "delete-logs"
+name = "Delete System Logs"
+description = "Permanently delete system logs (requires confirmation)"
+icon = "delete_forever"
+tags = ["system", "maintenance", "dangerous"]
+shell = "rm -rf /var/log/{log_type}/*"
+requires_confirmation = true  # Shows confirmation even though it has parameters
+show_output = true
+timeout_seconds = 10
+
+[[command.parameters]]
+name = "log_type"
+type = "dropdown"
+description = "Which logs to delete"
+options = ["application", "system", "security"]
+default = "application"
+
+# Example 8: Long-running task with output
+[[command]]
+id = "system-update"
+name = "System Update"
+description = "Update system packages (requires confirmation)"
+icon = "update"
+tags = ["system", "maintenance"]
+shell = "apt update && apt upgrade -y"
+requires_confirmation = true
+show_output = true
+timeout_seconds = 600
+
+# Example 9: Command with text validation
+[[command]]
+id = "kill-process"
+name = "Kill Process"
+description = "Terminate a process by PID"
+icon = "close"
+tags = ["system", "process"]
+shell = "kill -{signal} {pid}"
+requires_confirmation = true
+show_output = true
+
+[[command.parameters]]
+name = "pid"
+type = "text"
+description = "Process ID"
+validation = "^\\d+$"
+
+[[command.parameters]]
+name = "signal"
+type = "dropdown"
+description = "Signal to send"
+options = ["15", "9", "1"]
+default = "15"
+
+# Example 10: WiFi network with dropdown and dynamic default
+[[command]]
+id = "connect-wifi"
+name = "Connect to WiFi"
+description = "Connect to a WiFi network"
+icon = "wifi"
+tags = ["network"]
+shell = "nmcli device wifi connect {ssid}"
+show_output = true
+
+[[command.parameters]]
+name = "ssid"
+type = "dropdown"
+description = "Network name"
+options = ["Home", "Office", "Guest"]
+default = "Home"
+default_value_command = "nmcli -t -f active,ssid dev wifi | grep '^yes' | cut -d: -f2"
+default_value_pattern = "^(.+)$"
+
+# Example 11: Safe command with multiple parameters and mixed defaults
+[[command]]
+id = "take-screenshot"
+name = "Take Screenshot"
+description = "Capture a screenshot"
+icon = "camera"
+tags = ["media", "utility"]
+shell = "scrot -q {quality} ~/Pictures/screenshot-{filename}.png"
+show_output = false
+
+[[command.parameters]]
+name = "quality"
+type = "slider"
+description = "Image quality"
+min = 1
+max = 100
+default = "90"
+
+[[command.parameters]]
+name = "filename"
+type = "text"
+description = "Filename (without extension)"
+validation = "^[a-zA-Z0-9_-]+$"
+default = "screenshot"
+
+# Example 12: Restart service (dangerous but necessary)
+[[command]]
+id = "restart-service"
+name = "Restart Service"
+description = "Restart a systemd service"
+icon = "refresh"
+tags = ["system", "services"]
+shell = "systemctl restart {service}"
+requires_confirmation = true
+show_output = true
+
+[[command.parameters]]
+name = "service"
+type = "dropdown"
+description = "Service name"
+options = ["nginx", "apache2", "docker", "postgresql"]

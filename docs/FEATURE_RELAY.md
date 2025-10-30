@@ -1035,7 +1035,7 @@ async fn test_token_validation() {
 }
 ```
 
-> **Tip:** End-to-end relay scenarios are gated behind the `relay-integration` cargo feature. Run `cargo test -p handcontrol-relay --features relay-integration` to exercise the register → connect → tunnel happy path and timeout failure case locally. CI can continue to execute the default unit tests (no network sockets) without enabling this feature.
+> **Tip:** End-to-end relay scenarios are included in the standard test suite. Run `cargo test -p handcontrol-relay` to exercise the register → connect → tunnel happy path and timeout failure case locally.
 
 **Android Tests:**
 ```kotlin

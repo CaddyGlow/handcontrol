@@ -135,29 +135,43 @@ fun QrScannerScreen(
                 }
 
                 uiState is EnrollmentUiState.AlreadyEnrolled -> {
-                    // Navigate handled by parent
+                    AlreadyEnrolledView(
+                        serverName = (uiState as EnrollmentUiState.AlreadyEnrolled).serverName,
+                        onBack = onNavigateBack
+                    )
                 }
 
                 else -> {
                     CameraPreviewView(
                         onQrCodeDetected = { qrData ->
                             try {
-                                // Parse QR code JSON per PRD specification:
-                                // {"ip":"192.168.1.100","port":50051,"cert_fingerprint":"SHA256:abc123",
-                                //  "enrollment_token":"uuid","server_id":"uuid"}
+                                // Parse QR code JSON per Multi-IP specification:
+                                // {"ips":["192.168.1.100","10.0.0.1"],"port":50051,
+                                //  "cert_fingerprint":"SHA256:abc123","enrollment_token":"uuid","server_id":"uuid"}
                                 val json = org.json.JSONObject(qrData)
-                                val host = json.getString("ip")
+
+                                // Parse IPs array
+                                val ipsArray = json.getJSONArray("ips")
+                                val ips = mutableListOf<String>()
+                                for (i in 0 until ipsArray.length()) {
+                                    ips.add(ipsArray.getString(i))
+                                }
+
+                                if (ips.isEmpty()) {
+                                    throw IllegalArgumentException("QR code contains no valid IP addresses")
+                                }
+
                                 val port = json.getInt("port")
                                 val token = json.getString("enrollment_token")
                                 val fingerprint = json.optString("cert_fingerprint", null)
                                 val serverId = json.optString("server_id", null)
 
-                                Timber.i("QR code scanned: ip=$host, port=$port, server_id=$serverId")
+                                Timber.i("QR code scanned: ips=$ips, port=$port, server_id=$serverId")
 
                                 // TODO: Validate cert_fingerprint matches server certificate
                                 // TODO: Store server_id for verification code generation
 
-                                viewModel.enrollWithQrCode(host, port, token)
+                                viewModel.enrollWithQrCode(ips, port, token)
                             } catch (e: Exception) {
                                 Timber.e(e, "Failed to parse QR code")
                                 viewModel.clearError()
@@ -422,6 +436,55 @@ private fun ErrorView(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Cancel")
+        }
+    }
+}
+
+@Composable
+private fun AlreadyEnrolledView(
+    serverName: String,
+    onBack: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = Icons.Default.Warning,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(80.dp)
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text(
+            text = "Server Already Enrolled",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = "You have already enrolled with \"$serverName\". You can find it in your server list.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(48.dp))
+
+        Button(
+            onClick = onBack,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Go Back")
         }
     }
 }

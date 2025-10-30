@@ -22,9 +22,13 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import io.grpc.ManagedChannel
 import io.grpc.Status
 import io.grpc.StatusException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.withTimeout
 import timber.log.Timber
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -43,70 +47,150 @@ class GrpcEnrollmentRepository @Inject constructor(
     private val CLIENT_ID_KEY = stringPreferencesKey("client_id")
 
     override suspend fun enrollWithToken(
-        host: String,
+        hosts: List<String>,
         port: Int,
         token: String,
         deviceName: String
     ): EnrollmentResult {
-        return try {
-            val certificate = certificateManager.loadOrCreate()
-            val channel = channelFactory.createChannel(host, port)
-            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+        require(hosts.isNotEmpty()) { "At least one host is required" }
 
-            val request = EnrollRequest.newBuilder()
-                .setEnrollmentToken(token)
-                .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
-                .setDeviceName(deviceName)
-                .build()
+        // Try primary IP with short timeout
+        val primaryHost = hosts.first()
+        try {
+            Timber.d("Trying primary host: $primaryHost")
+            return tryEnrollWithHost(
+                host = primaryHost,
+                port = port,
+                token = token,
+                deviceName = deviceName,
+                timeoutMs = 2000L
+            )
+        } catch (e: Exception) {
+            Timber.d(e, "Primary host $primaryHost failed: ${e.message}")
+        }
 
-            val response = stub.enroll(request)
+        // If primary fails, try remaining IPs in parallel
+        if (hosts.size == 1) {
+            return EnrollmentResult.Error("Failed to connect to $primaryHost")
+        }
 
-            // Extract and pin server certificate for future connections (TOFU)
-            val serverCertDer = extractServerCertificate(channel)
-            val fingerprint = if (serverCertDer != null) {
-                val fp = VerificationCodeGenerator.computeFingerprint(serverCertDer)
-                certificateManager.pinServerFingerprint(fp)
-                Timber.i("Server certificate pinned: $fp")
-                fp
-            } else {
-                Timber.w("Could not extract server certificate for pinning")
-                ""
+        val remainingHosts = hosts.drop(1)
+        Timber.d("Trying ${remainingHosts.size} alternative hosts in parallel")
+
+        return coroutineScope {
+            val results = remainingHosts.map { host ->
+                async {
+                    try {
+                        Timber.d("Trying alternative host: $host")
+                        tryEnrollWithHost(
+                            host = host,
+                            port = port,
+                            token = token,
+                            deviceName = deviceName,
+                            timeoutMs = 5000L
+                        )
+                    } catch (e: Exception) {
+                        Timber.d(e, "Alternative host $host failed: ${e.message}")
+                        EnrollmentResult.Error("Failed to connect to $host: ${e.message}")
+                    }
+                }
             }
 
-            if (response.success) {
-                // Fetch server info and save to database
-                try {
-                    val serverInfo = getServerInfo(channel)
-                    enrolledServerRepository.saveServer(
-                        serverId = serverInfo.serverId,
-                        serverHost = host,
-                        serverPort = port,
-                        clientId = response.clientId,
-                        serverName = serverInfo.hostname,
-                        certFingerprint = fingerprint
-                    )
-                    Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
-                } catch (e: Exception) {
-                    Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+            // Return first successful result
+            try {
+                results.awaitFirstSuccess()
+            } catch (e: Exception) {
+                EnrollmentResult.Error("Failed to connect to any host: ${hosts.joinToString()}")
+            }
+        }
+    }
+
+    private suspend fun tryEnrollWithHost(
+        host: String,
+        port: Int,
+        token: String,
+        deviceName: String,
+        timeoutMs: Long
+    ): EnrollmentResult {
+        return withTimeout(timeoutMs) {
+            try {
+                val certificate = certificateManager.loadOrCreate()
+                val channel = channelFactory.createChannel(host, port)
+                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+
+                val request = EnrollRequest.newBuilder()
+                    .setEnrollmentToken(token)
+                    .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
+                    .setDeviceName(deviceName)
+                    .build()
+
+                val response = stub.enroll(request)
+
+                // Extract and pin server certificate for future connections (TOFU)
+                val serverCertDer = extractServerCertificate(channel)
+                val fingerprint = if (serverCertDer != null) {
+                    val fp = VerificationCodeGenerator.computeFingerprint(serverCertDer)
+                    certificateManager.pinServerFingerprint(fp)
+                    Timber.i("Server certificate pinned: $fp")
+                    fp
+                } else {
+                    Timber.w("Could not extract server certificate for pinning")
+                    ""
                 }
 
-                saveClientId(response.clientId)
-                Timber.i("QR enrollment successful: clientId=${response.clientId}")
+                if (response.success) {
+                    // Fetch server info and save to database
+                    try {
+                        val serverInfo = getServerInfo(channel)
+                        enrolledServerRepository.saveServer(
+                            serverId = serverInfo.serverId,
+                            serverHost = host,
+                            serverPort = port,
+                            clientId = response.clientId,
+                            serverName = serverInfo.hostname,
+                            certFingerprint = fingerprint
+                        )
+                        Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
+                    } catch (e: Exception) {
+                        Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+                    }
 
-                channelFactory.shutdownChannel(channel)
-                EnrollmentResult.Success(response.clientId)
-            } else {
-                channelFactory.shutdownChannel(channel)
-                Timber.w("QR enrollment failed: ${response.errorMessage}")
-                EnrollmentResult.Error(response.errorMessage)
+                    saveClientId(response.clientId)
+                    Timber.i("QR enrollment successful: clientId=${response.clientId} via host=$host")
+
+                    channelFactory.shutdownChannel(channel)
+                    EnrollmentResult.Success(response.clientId)
+                } else {
+                    channelFactory.shutdownChannel(channel)
+                    Timber.w("QR enrollment failed: ${response.errorMessage}")
+                    EnrollmentResult.Error(response.errorMessage)
+                }
+            } catch (e: StatusException) {
+                Timber.e(e, "QR enrollment RPC failed for host=$host")
+                throw IOException("gRPC error: ${mapGrpcError(e.status)}", e)
+            } catch (e: Exception) {
+                Timber.e(e, "QR enrollment failed for host=$host")
+                throw IOException("Network error: ${e.message}", e)
             }
-        } catch (e: StatusException) {
-            Timber.e(e, "QR enrollment RPC failed")
-            EnrollmentResult.Error(mapGrpcError(e.status))
-        } catch (e: Exception) {
-            Timber.e(e, "QR enrollment failed")
-            EnrollmentResult.Error("Network error: ${e.message}")
         }
+    }
+
+    private suspend fun List<kotlinx.coroutines.Deferred<EnrollmentResult>>.awaitFirstSuccess(): EnrollmentResult {
+        val errors = mutableListOf<String>()
+
+        for (deferred in this) {
+            val result = deferred.await()
+            if (result is EnrollmentResult.Success) {
+                // Cancel remaining tasks
+                forEach { if (it != deferred) it.cancel() }
+                return result
+            }
+            if (result is EnrollmentResult.Error) {
+                errors.add(result.message)
+            }
+        }
+
+        throw IOException("All hosts failed: ${errors.joinToString(", ")}")
     }
 
     override suspend fun requestApproval(

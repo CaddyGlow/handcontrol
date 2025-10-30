@@ -68,20 +68,6 @@ fun WelcomeScreen(
                 )
             }
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            OutlinedButton(
-                onClick = onNavigateToServerList,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-            ) {
-                Text(
-                    text = "View Enrolled Servers",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-
             Spacer(modifier = Modifier.height(24.dp))
 
             Text(

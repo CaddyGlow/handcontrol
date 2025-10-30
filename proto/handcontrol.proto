@@ -50,13 +50,16 @@ message GenerateEnrollmentQRRequest {}
 message GenerateEnrollmentQRResponse {
   bool success = 1;
   string qr_payload = 2;  // JSON payload for QR code
-  string enrollment_token = 3;
-  string server_ip = 4;
-  int32 server_port = 5;
-  string server_cert_fingerprint = 6;
-  string server_id = 7;
+  repeated string server_ips = 3;  // Changed from single server_ip (Breaking change)
+  int32 server_port = 4;           // Renumbered from 5
+  string server_cert_fingerprint = 5;
+  string server_id = 6;
+  string enrollment_token = 7;     // Moved from 3
   int32 ttl_seconds = 8;
   string error_message = 9;
+
+  // Reserved for future relay support (optional)
+  optional RelayInfo relay_info = 10;
 }
 
 // Enrollment (Approval mode with verification code)
@@ -118,6 +121,13 @@ enum PairingStatus {
   PAIRING_STATUS_APPROVED = 2;
   PAIRING_STATUS_REJECTED = 3;
   PAIRING_STATUS_TIMEOUT = 4;
+}
+
+// Relay information (future use, not yet implemented)
+message RelayInfo {
+  string relay_url = 1;           // Relay server URL
+  string relay_token = 2;          // JWT token for relay authentication
+  bool relay_required = 3;        // If true, skip direct connection attempts
 }
 
 // Server info

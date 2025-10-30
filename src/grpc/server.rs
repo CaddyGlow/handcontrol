@@ -28,6 +28,7 @@ use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
 use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
 use crate::security::verification::generate_verification_code;
+use crate::utils::network::get_all_local_ips;
 use crate::storage::clients::ClientStore;
 
 /// gRPC service implementation
@@ -161,13 +162,14 @@ impl RemoteControl for RemoteControlService {
             return Ok(Response::new(GenerateEnrollmentQrResponse {
                 success: false,
                 qr_payload: String::new(),
-                enrollment_token: String::new(),
-                server_ip: String::new(),
+                server_ips: vec![],
                 server_port: 0,
                 server_cert_fingerprint: String::new(),
                 server_id: String::new(),
+                enrollment_token: String::new(),
                 ttl_seconds: 0,
                 error_message: "QR code enrollment is disabled on this server".to_string(),
+                relay_info: None,
             }));
         }
 
@@ -179,31 +181,37 @@ impl RemoteControl for RemoteControlService {
                 return Ok(Response::new(GenerateEnrollmentQrResponse {
                     success: false,
                     qr_payload: String::new(),
-                    enrollment_token: String::new(),
-                    server_ip: String::new(),
+                    server_ips: vec![],
                     server_port: 0,
                     server_cert_fingerprint: String::new(),
                     server_id: String::new(),
+                    enrollment_token: String::new(),
                     ttl_seconds: 0,
                     error_message: format!("Failed to generate enrollment token: {}", e),
+                    relay_info: None,
                 }));
             }
         };
 
-        // Determine server IP for clients to connect to
-        let server_ip = if config.server.bind_address == "0.0.0.0"
+        // Determine server IPs for clients to connect to
+        let server_ips = if config.server.bind_address == "0.0.0.0"
             || config.server.bind_address == "::"
         {
-            // Server is bound to all interfaces, try to get a local IP
-            get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+            // Server is bound to all interfaces, get all usable local IPs
+            let ips = get_all_local_ips();
+            if ips.is_empty() {
+                vec!["127.0.0.1".to_string()]
+            } else {
+                ips
+            }
         } else {
-            config.server.bind_address.clone()
+            vec![config.server.bind_address.clone()]
         };
         let server_port = config.server.port as i32;
 
         // Create QR payload
         let payload = crate::utils::qr::EnrollmentQrPayload::new(
-            server_ip.clone(),
+            server_ips.clone(),
             config.server.port,
             self.server_cert.fingerprint_display(),
             token.token.clone(),
@@ -217,13 +225,14 @@ impl RemoteControl for RemoteControlService {
                 return Ok(Response::new(GenerateEnrollmentQrResponse {
                     success: false,
                     qr_payload: String::new(),
-                    enrollment_token: String::new(),
-                    server_ip: String::new(),
+                    server_ips: vec![],
                     server_port: 0,
                     server_cert_fingerprint: String::new(),
                     server_id: String::new(),
+                    enrollment_token: String::new(),
                     ttl_seconds: 0,
                     error_message: format!("Failed to serialize QR payload: {}", e),
+                    relay_info: None,
                 }));
             }
         };
@@ -233,13 +242,14 @@ impl RemoteControl for RemoteControlService {
         Ok(Response::new(GenerateEnrollmentQrResponse {
             success: true,
             qr_payload,
-            enrollment_token: token.token,
-            server_ip,
+            server_ips,
             server_port,
             server_cert_fingerprint: self.server_cert.fingerprint_display(),
             server_id: self.server_id.to_string(),
+            enrollment_token: token.token,
             ttl_seconds: config.security.enrollment_token_ttl as i32,
             error_message: String::new(),
+            relay_info: None,  // Future relay support
         }))
     }
 
@@ -695,9 +705,9 @@ impl RemoteControl for RemoteControlService {
                     },
                 };
 
-                // Send output to stream (blocking send in callback)
-                if let Err(e) = tx_clone.blocking_send(Ok(response)) {
-                    // Client disconnected
+                // Send output to stream (non-blocking send in callback)
+                if let Err(e) = tx_clone.try_send(Ok(response)) {
+                    // Client disconnected or channel full
                     warn!("Failed to send output to stream: {}", e);
                 }
             })
@@ -887,17 +897,4 @@ fn bind_tcp_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
         .context("Failed to set TCP socket to non-blocking mode")?;
 
     Ok(socket.into())
-}
-
-/// Get local IP address (best effort)
-fn get_local_ip() -> Option<String> {
-    use std::net::UdpSocket;
-
-    // Try to connect to a public DNS server to determine local IP
-    // This doesn't actually send any data
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.connect("8.8.8.8:80").ok()?;
-    let local_addr = socket.local_addr().ok()?;
-
-    Some(local_addr.ip().to_string())
 }

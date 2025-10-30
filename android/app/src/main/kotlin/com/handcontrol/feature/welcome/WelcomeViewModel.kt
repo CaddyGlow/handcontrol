@@ -24,6 +24,14 @@ class WelcomeViewModel @Inject constructor(
                 initialValue = null
             )
 
+    val enrolledServers: StateFlow<List<EnrolledServerEntity>> =
+        enrolledServerRepository.allServers
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5000),
+                initialValue = emptyList()
+            )
+
     fun onServerConnected(serverId: String) {
         viewModelScope.launch {
             enrolledServerRepository.updateLastConnected(serverId)

@@ -6,7 +6,7 @@ use uuid::Uuid;
 /// QR code payload for enrollment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentQrPayload {
-    pub ip: String,
+    pub ips: Vec<String>,  // Changed from single ip (Breaking change)
     pub port: u16,
     pub cert_fingerprint: String,
     pub enrollment_token: String,
@@ -16,14 +16,14 @@ pub struct EnrollmentQrPayload {
 impl EnrollmentQrPayload {
     /// Create new QR payload
     pub fn new(
-        ip: String,
+        ips: Vec<String>,
         port: u16,
         cert_fingerprint: String,
         enrollment_token: String,
         server_id: Uuid,
     ) -> Self {
         Self {
-            ip,
+            ips,
             port,
             cert_fingerprint,
             enrollment_token,
@@ -45,8 +45,19 @@ impl EnrollmentQrPayload {
 
         print_qr(&json).context("Failed to generate QR code")?;
 
-        println!("\nServer: {}", self.ip);
-        println!("Port: {}", self.port);
+        // Display primary and alternative IPs
+        if let Some(primary) = self.ips.first() {
+            println!("\nPrimary Server: {}", primary);
+        }
+
+        if self.ips.len() > 1 {
+            println!("Alternative IPs:");
+            for ip in &self.ips[1..] {
+                println!("  - {}", ip);
+            }
+        }
+
+        println!("\nPort: {}", self.port);
         println!("Server ID: {}", self.server_id);
         println!("Token expires in 5 minutes");
         println!("\n======================================\n");
@@ -63,14 +74,14 @@ mod tests {
     fn test_qr_payload_creation() {
         let server_id = Uuid::new_v4();
         let payload = EnrollmentQrPayload::new(
-            "192.168.1.100".to_string(),
+            vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
         );
 
-        assert_eq!(payload.ip, "192.168.1.100");
+        assert_eq!(payload.ips, vec!["192.168.1.100", "10.0.0.1"]);
         assert_eq!(payload.port, 50051);
         assert_eq!(payload.cert_fingerprint, "SHA256:abc123");
         assert_eq!(payload.enrollment_token, "token-uuid");
@@ -81,7 +92,7 @@ mod tests {
     fn test_qr_payload_json_serialization() {
         let server_id = Uuid::new_v4();
         let payload = EnrollmentQrPayload::new(
-            "192.168.1.100".to_string(),
+            vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
@@ -91,7 +102,7 @@ mod tests {
         let json = payload.to_json().unwrap();
 
         // Verify JSON contains all fields
-        assert!(json.contains("\"ip\":\"192.168.1.100\""));
+        assert!(json.contains("\"ips\":[\"192.168.1.100\",\"10.0.0.1\"]"));
         assert!(json.contains("\"port\":50051"));
         assert!(json.contains("\"cert_fingerprint\":\"SHA256:abc123\""));
         assert!(json.contains("\"enrollment_token\":\"token-uuid\""));
@@ -102,7 +113,7 @@ mod tests {
     fn test_qr_payload_json_roundtrip() {
         let server_id = Uuid::new_v4();
         let payload = EnrollmentQrPayload::new(
-            "192.168.1.100".to_string(),
+            vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
@@ -112,7 +123,7 @@ mod tests {
         let json = payload.to_json().unwrap();
         let deserialized: EnrollmentQrPayload = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(deserialized.ip, payload.ip);
+        assert_eq!(deserialized.ips, payload.ips);
         assert_eq!(deserialized.port, payload.port);
         assert_eq!(deserialized.cert_fingerprint, payload.cert_fingerprint);
         assert_eq!(deserialized.enrollment_token, payload.enrollment_token);

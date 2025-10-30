@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.handcontrol.core.discovery.DiscoveredServer
 import com.handcontrol.core.discovery.NsdDiscoveryManager
+import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,13 +15,15 @@ import javax.inject.Inject
 
 data class ServerDiscoveryUiState(
     val servers: List<DiscoveredServer> = emptyList(),
+    val enrolledServerIds: Set<String> = emptySet(),
     val isDiscovering: Boolean = false,
     val error: String? = null
 )
 
 @HiltViewModel
 class ServerDiscoveryViewModel @Inject constructor(
-    private val nsdManager: NsdDiscoveryManager
+    private val nsdManager: NsdDiscoveryManager,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(ServerDiscoveryUiState())
@@ -28,6 +31,7 @@ class ServerDiscoveryViewModel @Inject constructor(
 
     init {
         observeServers()
+        observeEnrolledServers()
     }
 
     private fun observeServers() {
@@ -35,6 +39,16 @@ class ServerDiscoveryViewModel @Inject constructor(
             nsdManager.servers.collect { servers ->
                 _uiState.value = _uiState.value.copy(
                     servers = servers
+                )
+            }
+        }
+    }
+
+    private fun observeEnrolledServers() {
+        viewModelScope.launch {
+            enrolledServerRepository.allServers.collect { servers ->
+                _uiState.value = _uiState.value.copy(
+                    enrolledServerIds = servers.map { it.serverId }.toSet()
                 )
             }
         }

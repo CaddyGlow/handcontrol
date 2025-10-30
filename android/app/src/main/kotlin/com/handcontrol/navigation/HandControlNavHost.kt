@@ -23,13 +23,18 @@ fun HandControlNavHost(
     navController: NavHostController = rememberNavController(),
     welcomeViewModel: WelcomeViewModel = hiltViewModel()
 ) {
-    val lastConnectedServer by welcomeViewModel.lastConnectedServer
+    val enrolledServers by welcomeViewModel.enrolledServers
         .collectAsStateWithLifecycle()
 
-    var hasAutoNavigated by remember { mutableStateOf(false) }
+    val startDestination = if (enrolledServers.isEmpty()) {
+        Route.Welcome
+    } else {
+        Route.ServerList
+    }
+
     NavHost(
         navController = navController,
-        startDestination = Route.Welcome,
+        startDestination = startDestination,
         modifier = modifier
     ) {
         composable<Route.Welcome> {
@@ -132,17 +137,5 @@ fun HandControlNavHost(
                 }
             )
         }
-    }
-
-    LaunchedEffect(lastConnectedServer?.serverId) {
-        if (hasAutoNavigated) return@LaunchedEffect
-        val server = lastConnectedServer ?: return@LaunchedEffect
-
-        navController.navigate(
-            Route.CommandList(server.serverHost, server.serverPort)
-        ) {
-            popUpTo(Route.Welcome) { inclusive = false }
-        }
-        hasAutoNavigated = true
     }
 }

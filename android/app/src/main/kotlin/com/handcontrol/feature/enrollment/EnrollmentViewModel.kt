@@ -38,11 +38,16 @@ class EnrollmentViewModel @Inject constructor(
     private val _uiState = MutableStateFlow<EnrollmentUiState>(EnrollmentUiState.Idle)
     val uiState: StateFlow<EnrollmentUiState> = _uiState.asStateFlow()
 
-    fun enrollWithQrCode(host: String, port: Int, token: String) {
+    fun enrollWithQrCode(hosts: List<String>, port: Int, token: String) {
         viewModelScope.launch {
             try {
-                // Check if server is already enrolled
-                val existingServer = enrolledServerRepository.getServerByHostAndPort(host, port)
+                // Check if server is already enrolled (check first host)
+                val primaryHost = hosts.firstOrNull() ?: run {
+                    _uiState.value = EnrollmentUiState.Error("No valid IP addresses provided")
+                    return@launch
+                }
+
+                val existingServer = enrolledServerRepository.getServerByHostAndPort(primaryHost, port)
                 if (existingServer != null) {
                     Timber.i("Server already enrolled: ${existingServer.serverName}")
                     _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName)
@@ -50,10 +55,10 @@ class EnrollmentViewModel @Inject constructor(
                 }
 
                 _uiState.value = EnrollmentUiState.QrEnrolling(token)
-                Timber.i("Enrolling with QR code")
+                Timber.i("Enrolling with QR code using ${hosts.size} IP addresses")
 
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
-                val result = enrollmentRepository.enrollWithToken(host, port, token, deviceName)
+                val result = enrollmentRepository.enrollWithToken(hosts, port, token, deviceName)
 
                 when (result) {
                     is EnrollmentResult.Success -> {

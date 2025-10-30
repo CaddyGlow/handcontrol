@@ -10,7 +10,7 @@ sealed interface EnrollmentResult {
 
 interface EnrollmentRepository {
     suspend fun enrollWithToken(
-        host: String,
+        hosts: List<String>,
         port: Int,
         token: String,
         deviceName: String

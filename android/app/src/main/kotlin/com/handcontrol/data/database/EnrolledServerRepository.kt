@@ -22,15 +22,17 @@ class EnrolledServerRepository @Inject constructor(
         serverName: String,
         certFingerprint: String
     ) {
+        // Convert single host to list for backward compatibility
         val server = EnrolledServerEntity(
             serverId = serverId,
-            serverHost = serverHost,
+            ips = listOf(serverHost),
             serverPort = serverPort,
             clientId = clientId,
             serverName = serverName,
             certFingerprint = certFingerprint,
             enrolledAt = System.currentTimeMillis(),
-            lastConnected = System.currentTimeMillis()
+            lastConnected = System.currentTimeMillis(),
+            serverHost = serverHost  // Keep for migration compatibility
         )
         enrolledServerDao.insertServer(server)
     }

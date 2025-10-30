@@ -100,6 +100,7 @@ fun ServerDiscoveryScreen(
                 else -> {
                     ServerListView(
                         servers = uiState.servers,
+                        enrolledServerIds = uiState.enrolledServerIds,
                         onServerSelected = { server ->
                             onNavigateToApprovalEnrollment(server.host, server.port, server.serverId)
                         },
@@ -134,6 +135,7 @@ private fun DiscoveringView(modifier: Modifier = Modifier) {
 @Composable
 private fun ServerListView(
     servers: List<DiscoveredServer>,
+    enrolledServerIds: Set<String>,
     onServerSelected: (DiscoveredServer) -> Unit,
     onScanQr: () -> Unit,
     modifier: Modifier = Modifier
@@ -151,9 +153,15 @@ private fun ServerListView(
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(servers, key = { "${it.host}:${it.port}" }) { server ->
+                val isEnrolled = server.serverId in enrolledServerIds
                 ServerCard(
                     server = server,
-                    onClick = { onServerSelected(server) }
+                    isEnrolled = isEnrolled,
+                    onClick = {
+                        if (!isEnrolled) {
+                            onServerSelected(server)
+                        }
+                    }
                 )
             }
         }
@@ -178,15 +186,20 @@ private fun ServerListView(
 @Composable
 private fun ServerCard(
     server: DiscoveredServer,
+    isEnrolled: Boolean = false,
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
         modifier = modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick),
+            .clickable(onClick = onClick, enabled = !isEnrolled),
         colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
+            containerColor = if (isEnrolled) {
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+            } else {
+                MaterialTheme.colorScheme.surfaceVariant
+            }
         )
     ) {
         Row(
@@ -198,7 +211,11 @@ private fun ServerCard(
             Icon(
                 imageVector = Icons.Default.Computer,
                 contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
+                tint = if (isEnrolled) {
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+                } else {
+                    MaterialTheme.colorScheme.primary
+                },
                 modifier = Modifier.size(40.dp)
             )
 
@@ -216,6 +233,21 @@ private fun ServerCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+            }
+
+            if (isEnrolled) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer
+                    )
+                ) {
+                    Text(
+                        text = "Enrolled",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
             }
         }
     }
@@ -333,9 +365,10 @@ private fun ServerListPreview() {
     HandControlTheme {
         ServerListView(
             servers = listOf(
-                DiscoveredServer("desktop-pc", "192.168.1.100", 8443, "SHA256:abcd1234", null, null),
-                DiscoveredServer("laptop", "192.168.1.101", 8443, "SHA256:efgh5678", null, null)
+                DiscoveredServer("desktop-pc", "192.168.1.100", 8443, "SHA256:abcd1234", "server-1", null),
+                DiscoveredServer("laptop", "192.168.1.101", 8443, "SHA256:efgh5678", "server-2", null)
             ),
+            enrolledServerIds = setOf("server-1"),
             onServerSelected = {},
             onScanQr = {}
         )

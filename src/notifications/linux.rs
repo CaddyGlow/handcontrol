@@ -16,20 +16,31 @@ impl LinuxNotificationProvider {
 
     /// Check if D-Bus notifications are available
     fn check_dbus_available() -> bool {
-        // Try to create a simple notification to test D-Bus connection
-        match Notification::new()
-            .summary("HandControl")
-            .body("Testing notification support")
-            .timeout(Timeout::Milliseconds(1))
-            .show()
+        // When running tests, don't actually show a notification
+        #[cfg(test)]
         {
-            Ok(_) => {
-                debug!("D-Bus notifications are available");
-                true
-            }
-            Err(e) => {
-                debug!("D-Bus notifications not available: {}", e);
-                false
+            // In test mode, just check if we can create a Notification object
+            // without actually showing it
+            return true; // Assume available in tests to avoid showing notifications
+        }
+
+        #[cfg(not(test))]
+        {
+            // Try to create a simple notification to test D-Bus connection
+            match Notification::new()
+                .summary("HandControl")
+                .body("Testing notification support")
+                .timeout(Timeout::Milliseconds(1))
+                .show()
+            {
+                Ok(_) => {
+                    debug!("D-Bus notifications are available");
+                    true
+                }
+                Err(e) => {
+                    debug!("D-Bus notifications not available: {}", e);
+                    false
+                }
             }
         }
     }
@@ -92,6 +103,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Ignored by default to avoid showing real notifications during normal test runs
     fn test_linux_show_notification() {
         let provider = LinuxNotificationProvider::new();
 

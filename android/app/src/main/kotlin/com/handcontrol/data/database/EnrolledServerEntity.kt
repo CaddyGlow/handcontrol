@@ -5,6 +5,12 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+enum class ConnectionMode {
+    DIRECT,      // Connected via direct IP
+    RELAY,       // Connected via relay server
+    UNKNOWN      // Unknown/not yet connected
+}
+
 @Entity(
     tableName = "enrolled_servers",
     indices = [
@@ -16,7 +22,9 @@ data class EnrolledServerEntity(
     @PrimaryKey
     val serverId: String,
 
-    val serverHost: String,
+    // Multi-IP support (new field)
+    val ips: List<String>,
+
     val serverPort: Int,
     val clientId: String,
     val serverName: String,
@@ -26,5 +34,15 @@ data class EnrolledServerEntity(
     val enrolledAt: Long,
 
     @ColumnInfo(name = "last_connected")
-    val lastConnected: Long?
+    val lastConnected: Long?,
+
+    // Relay support fields (optional, for future use)
+    val relayEnabled: Boolean = false,
+    val relayUrl: String? = null,
+    val relayToken: String? = null,
+    val lastConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN,
+
+    // Deprecated but kept for migration compatibility
+    @Deprecated("Use ips instead")
+    val serverHost: String? = null
 )

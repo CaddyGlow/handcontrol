@@ -35,7 +35,6 @@
         cargoToml = lib.importTOML ./Cargo.toml;
         crateName = cargoToml.package.name;
         crateVersion = cargoToml.package.version;
-        nativeBuildInputs = with pkgs; [ pkg-config ];
 
         projectDescription = "HandControl secure remote control server";
 
@@ -98,6 +97,25 @@
               maintainers = [ ];
             };
           };
+
+        androidEmulator = pkgs.androidenv.emulateApp {
+          name = "Emulator";
+          platformVersion = "34";
+          systemImageType = "google_apis_playstore";
+          abiVersion = "x86_64";
+          configOptions = {
+            # https://android.googlesource.com/platform/external/qemu/+/refs/heads/master/android/avd/hardware-properties.ini
+            "hw.ramSize" = "4096";
+            "hw.lcd.width" = "1170";
+            "hw.lcd.height" = "2532";
+            "hw.lcd.density" = "460";
+            "hw.keyboard" = "yes";
+          };
+        };
+        nativeBuildInputs = with pkgs; [
+          pkg-config
+          androidEmulator
+        ];
 
       in
       {

@@ -130,7 +130,9 @@ fun ServerListScreen(
                             server = server,
                             onClick = {
                                 viewModel.connectToServer(server.serverId)
-                                onNavigateToServer(server.serverHost, server.serverPort)
+                                // Use first IP from the list or fallback to deprecated serverHost
+                                val host = server.ips.firstOrNull() ?: server.serverHost ?: ""
+                                onNavigateToServer(host, server.serverPort)
                             },
                             onDelete = {
                                 serverToDelete = server
@@ -225,7 +227,7 @@ private fun ServerCard(
                 Spacer(modifier = Modifier.height(4.dp))
 
                 Text(
-                    text = "${server.serverHost}:${server.serverPort}",
+                    text = "${server.ips.firstOrNull() ?: server.serverHost ?: "unknown"}:${server.serverPort}",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

@@ -16,6 +16,7 @@ use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
 use handcontrol::storage;
 use handcontrol::utils::logging;
+use handcontrol::utils::network::get_all_local_ips;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, RwLock};
@@ -195,10 +196,15 @@ async fn handle_approve_command(request_id: &str) -> Result<()> {
     let config = load_config(&config_path).context("Failed to load configuration")?;
 
     let host = match config.server.bind_address.as_str() {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        other => other,
-    }
-    .to_string();
+        "0.0.0.0" | "::" => {
+            // Use primary IP from network enumeration
+            let ips = get_all_local_ips();
+            ips.first()
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        }
+        other => other.to_string(),
+    };
 
     let cert_path = if let Some(path) = config.security.cert_path.as_ref() {
         std::path::PathBuf::from(path)
@@ -272,10 +278,15 @@ async fn handle_list_pending_command() -> Result<()> {
     let config = load_config(&config_path).context("Failed to load configuration")?;
 
     let host = match config.server.bind_address.as_str() {
-        "0.0.0.0" | "::" => "127.0.0.1",
-        other => other,
-    }
-    .to_string();
+        "0.0.0.0" | "::" => {
+            // Use primary IP from network enumeration
+            let ips = get_all_local_ips();
+            ips.first()
+                .cloned()
+                .unwrap_or_else(|| "127.0.0.1".to_string())
+        }
+        other => other.to_string(),
+    };
 
     let cert_path = if let Some(path) = config.security.cert_path.as_ref() {
         std::path::PathBuf::from(path)

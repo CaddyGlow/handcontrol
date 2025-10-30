@@ -9,6 +9,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub security: SecurityConfig,
     #[serde(default)]
+    pub network: NetworkConfig,
+    #[serde(default)]
     pub command: Vec<CommandConfig>,
 }
 
@@ -44,6 +46,46 @@ pub struct EnrollmentConfig {
     pub approval_timeout_seconds: u64,
     #[serde(default = "default_true")]
     pub approval_notification: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NetworkConfig {
+    /// Prefer IPv6 addresses in listings
+    #[serde(default = "default_true")]
+    pub prefer_ipv6: bool,
+
+    /// Include link-local IPv6 addresses (fe80::/10)
+    #[serde(default)]
+    pub include_link_local: bool,
+
+    /// Include ULA IPv6 addresses (fc00::/7)
+    #[serde(default = "default_true")]
+    pub include_ula: bool,
+
+    /// Prefer stable over temporary IPv6 addresses
+    #[serde(default = "default_true")]
+    pub prefer_stable_addresses: bool,
+
+    /// Interface prefixes to exclude from enumeration
+    #[serde(default = "default_excluded_interfaces")]
+    pub excluded_interface_prefixes: Vec<String>,
+
+    /// Maximum number of IP addresses to advertise
+    #[serde(default = "default_max_addresses")]
+    pub max_advertised_addresses: usize,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            prefer_ipv6: true,
+            include_link_local: false,
+            include_ula: true,
+            prefer_stable_addresses: true,
+            excluded_interface_prefixes: default_excluded_interfaces(),
+            max_advertised_addresses: default_max_addresses(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -107,6 +149,21 @@ fn default_approval_timeout() -> u64 {
 
 fn default_command_timeout() -> u64 {
     30 // 30 seconds
+}
+
+fn default_max_addresses() -> usize {
+    5
+}
+
+fn default_excluded_interfaces() -> Vec<String> {
+    vec![
+        "docker".to_string(),
+        "veth".to_string(),
+        "br-".to_string(),
+        "virbr".to_string(),
+        "tun".to_string(),
+        "tap".to_string(),
+    ]
 }
 
 /// Load configuration from a TOML file

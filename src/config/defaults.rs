@@ -1,5 +1,6 @@
 use super::parser::{
-    CommandConfig, Config, EnrollmentConfig, ParameterConfig, SecurityConfig, ServerConfig,
+    CommandConfig, Config, EnrollmentConfig, NetworkConfig, ParameterConfig, SecurityConfig,
+    ServerConfig,
 };
 use anyhow::Result;
 use std::collections::HashMap;
@@ -27,6 +28,7 @@ pub fn generate_default_config() -> Result<Config> {
                 approval_notification: true,
             },
         },
+        network: NetworkConfig::default(),
         command: commands,
     })
 }

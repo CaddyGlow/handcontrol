@@ -28,7 +28,7 @@ use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
 use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
 use crate::security::verification::generate_verification_code;
-use crate::utils::network::get_all_local_ips;
+// Network utilities (using qualified paths to avoid unused import warnings)
 use crate::storage::clients::ClientStore;
 
 /// gRPC service implementation
@@ -197,8 +197,13 @@ impl RemoteControl for RemoteControlService {
         let server_ips = if config.server.bind_address == "0.0.0.0"
             || config.server.bind_address == "::"
         {
-            // Server is bound to all interfaces, get all usable local IPs
-            let ips = get_all_local_ips();
+            // Server is bound to all interfaces, get all usable local IPs with network config
+            let network_options = crate::utils::network::NetworkOptions {
+                include_link_local_ipv6: config.network.include_link_local,
+                prefer_stable_addresses: config.network.prefer_stable_addresses,
+                max_addresses: Some(config.network.max_advertised_addresses),
+            };
+            let ips = crate::utils::network::get_all_local_ips_with_options(&network_options);
             if ips.is_empty() {
                 vec!["127.0.0.1".to_string()]
             } else {

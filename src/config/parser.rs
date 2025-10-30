@@ -86,7 +86,7 @@ fn default_port() -> u16 {
 }
 
 fn default_bind_address() -> String {
-    "0.0.0.0".to_string()
+    "::".to_string()
 }
 
 fn default_mdns_service_name() -> String {
@@ -126,8 +126,8 @@ pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Config> {
 
 /// Load configuration from a TOML string (for testing)
 pub fn load_config_from_str(content: &str) -> Result<Config> {
-    let mut config: Config = toml::from_str(content)
-        .context("Failed to parse config from string")?;
+    let mut config: Config =
+        toml::from_str(content).context("Failed to parse config from string")?;
 
     expand_paths(&mut config)?;
 
@@ -182,7 +182,7 @@ mod tests {
 
         let config = load_config_from_str(toml).unwrap();
         assert_eq!(config.server.port, 50051);
-        assert_eq!(config.server.bind_address, "0.0.0.0");
+        assert_eq!(config.server.bind_address, "::");
         assert_eq!(config.security.enrollment_token_ttl, 300);
     }
 

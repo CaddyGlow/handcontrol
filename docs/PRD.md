@@ -585,6 +585,8 @@ service RemoteControl {
   // Enrollment: Approval mode (interactive)
   rpc RequestPairing(RequestPairingRequest) returns (RequestPairingResponse);
   rpc CheckPairingStatus(CheckPairingStatusRequest) returns (CheckPairingStatusResponse);
+  rpc ApprovePairing(ApprovePairingRequest) returns (ApprovePairingResponse);
+  rpc ListPendingPairings(ListPendingPairingsRequest) returns (ListPendingPairingsResponse);
 
   // Get server information
   rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
@@ -642,6 +644,33 @@ enum PairingStatus {
   PAIRING_STATUS_APPROVED = 2;
   PAIRING_STATUS_REJECTED = 3;
   PAIRING_STATUS_TIMEOUT = 4;
+}
+
+// Programmatic pairing approval (CLI/automation)
+message ApprovePairingRequest {
+  string pairing_request_id = 1;
+}
+
+message ApprovePairingResponse {
+  bool success = 1;
+  string client_id = 2;
+  string error_message = 3;
+}
+
+// List pending pairing requests
+message ListPendingPairingsRequest {}
+
+message ListPendingPairingsResponse {
+  repeated PendingPairingInfo pending_pairings = 1;
+}
+
+message PendingPairingInfo {
+  string request_id = 1;
+  string device_name = 2;
+  string device_model = 3;
+  string verification_code = 4;
+  int64 expires_at_unix = 5;
+  int32 seconds_remaining = 6;
 }
 
 // Server info
@@ -712,15 +741,436 @@ message ExecuteCommandResponse {
 }
 ```
 
+---
+
+### API Reference
+
+This section provides detailed documentation for each RPC method in the RemoteControl service.
+
+#### Authentication Requirements
+
+| Method | Authentication | Description |
+|--------|---------------|-------------|
+| `Enroll` | TLS-only | Available during enrollment before mTLS is established |
+| `RequestPairing` | TLS-only | Available during enrollment before mTLS is established |
+| `CheckPairingStatus` | TLS-only | Available during enrollment before mTLS is established |
+| `ApprovePairing` | **mTLS required** | Server-side operation requiring authenticated access |
+| `ListPendingPairings` | **mTLS required** | Server-side operation requiring authenticated access |
+| `GetServerInfo` | TLS-only | Public server information, no authentication required |
+| `ListCommands` | **mTLS required** | Requires authenticated client certificate |
+| `ExecuteCommand` | **mTLS required** | Requires authenticated client certificate |
+
+**Note:** Methods marked "TLS-only" are available over standard TLS connections (typically during the enrollment phase). Methods marked "mTLS required" require the client to present a valid certificate that exists in the server's authorized clients list.
+
+---
+
+#### Enrollment Methods
+
+##### Enroll (QR Code Enrollment)
+
+**Purpose:** Token-based enrollment using a QR code scanned by the Android client.
+
+**Use Case:** Quick pairing when the user has physical access to the PC and can scan a QR code displayed on screen.
+
+**Authentication:** TLS-only (no mTLS required)
+
+**Request:** `EnrollRequest`
+- `enrollment_token` (string): One-time UUID token from QR code (expires after use or 5 minutes)
+- `client_certificate` (bytes): Full X.509 certificate in DER encoding (ECDSA P-256, self-signed)
+- `device_name` (string): User-friendly device name (e.g., "My Pixel 7")
+
+**Response:** `EnrollResponse`
+- `success` (bool): True if enrollment succeeded
+- `client_id` (string): UUID assigned by server to this client
+- `error_message` (string): Error description if success is false
+
+**Behavior:**
+1. Server validates enrollment token exists and has not expired
+2. Server parses and validates client certificate (must be valid X.509 DER format)
+3. Server stores full client certificate in `~/.config/handcontrol/authorized_clients/`
+4. Server invalidates the enrollment token (one-time use)
+5. Server assigns a new client UUID and returns it to the client
+6. Client can now use mTLS with this certificate for all subsequent connections
+
+**Error Scenarios:**
+- `PERMISSION_DENIED`: Enrollment token invalid, expired, or already consumed
+- `PERMISSION_DENIED`: QR code enrollment disabled in server config
+- `INVALID_ARGUMENT`: Invalid certificate format or device_name empty
+- `INTERNAL`: Server error storing certificate
+
+**Implementation:** `src/grpc/server.rs:65-134`
+
+---
+
+##### RequestPairing (Approval Mode - Initiate)
+
+**Purpose:** Initiate interactive pairing with verification code to prevent MITM attacks.
+
+**Use Case:** User-friendly pairing via mDNS discovery when camera/QR scanning is not available or when pairing multiple devices.
+
+**Authentication:** TLS-only (no mTLS required)
+
+**Request:** `RequestPairingRequest`
+- `device_name` (string): User-friendly device name (e.g., "My Pixel 7")
+- `device_model` (string, optional): Device model (e.g., "Google Pixel 7")
+- `client_certificate` (bytes): Full X.509 certificate in DER encoding (ECDSA P-256, self-signed)
+- `verification_code` (string): 6-digit code computed by client (format: "XXX-XXX")
+
+**Response:** `RequestPairingResponse`
+- `pending` (bool): True if request created successfully, false if verification failed
+- `pairing_request_id` (string): UUID to poll status with `CheckPairingStatus`
+- `timeout_seconds` (int32): How long request remains valid (default 60 seconds)
+- `verification_code` (string): Server's computed verification code (must match client's)
+- `server_cert_fingerprint` (bytes): SHA256 fingerprint of server certificate
+- `error_message` (string): Error description if pending is false
+
+**Behavior:**
+1. Server validates approval mode enrollment is enabled in config
+2. Server validates client certificate is present and valid
+3. **CRITICAL SECURITY:** Server computes verification code using same algorithm as client:
+   ```
+   client_fp = SHA256(client_certificate_DER)
+   server_fp = SHA256(server_certificate_DER)
+   code = first_6_digits(SHA256(client_fp || server_fp || server_id))
+   ```
+4. Server compares client's verification code with its own computed code
+5. **If codes match:** Proceed to create pairing request and show notification
+6. **If codes DON'T match:** Return error immediately (possible MITM attack)
+7. Server creates pairing request with timeout (stored in memory)
+8. Server shows OS notification with device name and verification code
+9. Server returns pending=true with pairing_request_id for status polling
+
+**Client Validation (Android):**
+- Client must verify `pending = true`
+- Client must recompute verification code and verify it matches server's response
+- Client must verify `server_cert_fingerprint` matches the TLS certificate fingerprint
+- Only after these checks pass should client display the verification code UI
+
+**User Action Required:**
+- User must visually compare verification codes on phone and PC
+- User clicks [Accept] or [Reject] in PC notification
+- Android client polls status using `CheckPairingStatus`
+
+**Error Scenarios:**
+- `PERMISSION_DENIED`: Approval mode enrollment disabled in server config
+- `PERMISSION_DENIED`: Verification code mismatch (possible MITM attack)
+- `INVALID_ARGUMENT`: Invalid certificate format or device_name empty
+- `INTERNAL`: Server error creating pairing request or showing notification
+
+**Security Properties:**
+- Verification code cryptographically binds to actual certificates exchanged
+- Out-of-band verification (user visually compares codes)
+- Prevents MITM from enrolling by swapping certificates
+
+**Implementation:** `src/grpc/server.rs:136-249`
+
+---
+
+##### CheckPairingStatus (Approval Mode - Poll)
+
+**Purpose:** Poll the status of a pairing request during approval mode enrollment.
+
+**Use Case:** Android client polls this method every 2 seconds while waiting for user approval on the PC.
+
+**Authentication:** TLS-only (no mTLS required)
+
+**Request:** `CheckPairingStatusRequest`
+- `pairing_request_id` (string): UUID returned from `RequestPairing`
+
+**Response:** `CheckPairingStatusResponse`
+- `status` (PairingStatus enum): Current status of the pairing request
+- `client_id` (string): UUID assigned by server (only present if status is APPROVED)
+- `error_message` (string): Error description if applicable
+
+**PairingStatus Values:**
+- `PAIRING_STATUS_UNSPECIFIED (0)`: Invalid/unknown status
+- `PAIRING_STATUS_PENDING (1)`: Waiting for user response
+- `PAIRING_STATUS_APPROVED (2)`: User accepted pairing
+- `PAIRING_STATUS_REJECTED (3)`: User rejected pairing
+- `PAIRING_STATUS_TIMEOUT (4)`: Request expired (default 60 seconds)
+
+**Behavior:**
+1. Server looks up pairing request by ID
+2. Server checks if request has expired (current time > expires_at)
+3. Returns current status based on user action or timeout
+4. If status is APPROVED, includes the assigned client_id
+
+**Client Behavior:**
+- Poll every 2 seconds with exponential backoff recommended
+- Stop polling after receiving APPROVED, REJECTED, or TIMEOUT
+- Maximum polling duration should match timeout_seconds from `RequestPairing`
+
+**Error Scenarios:**
+- `NOT_FOUND`: Pairing request ID doesn't exist or was already cleaned up
+- `INTERNAL`: Server error retrieving pairing request
+
+**Implementation:** `src/grpc/server.rs:251-325`
+
+---
+
+##### ApprovePairing (Approval Mode - Server-side Approval)
+
+**Purpose:** Programmatically approve a pairing request (for CLI tools or automation).
+
+**Use Case:** Server-side CLI command `handcontrol approve <request_id>` to approve pairing without clicking notification.
+
+**Authentication:** **mTLS required** (must be an already-authorized client or server admin)
+
+**Request:** `ApprovePairingRequest`
+- `pairing_request_id` (string): UUID of the pending pairing request to approve
+
+**Response:** `ApprovePairingResponse`
+- `success` (bool): True if pairing approved successfully
+- `client_id` (string): UUID assigned to the newly enrolled client
+- `error_message` (string): Error description if success is false
+
+**Behavior:**
+1. Server retrieves pairing request by ID
+2. Server validates request is still pending (not already approved/rejected/expired)
+3. Server stores client certificate from request in authorized_clients
+4. Server updates pairing request status to APPROVED
+5. Server assigns new client UUID and returns it
+
+**Error Scenarios:**
+- `NOT_FOUND`: Pairing request ID doesn't exist
+- `FAILED_PRECONDITION`: Request already approved, rejected, or expired
+- `INTERNAL`: Server error storing certificate
+
+**CLI Usage:**
+```bash
+# List pending requests
+handcontrol list-pending
+
+# Approve a specific request
+handcontrol approve <request_id>
+```
+
+**Implementation:** `src/grpc/server.rs:327-370`
+
+---
+
+##### ListPendingPairings (Approval Mode - Management)
+
+**Purpose:** List all pending pairing requests for management and visibility.
+
+**Use Case:** CLI tool or future GUI to show all devices waiting for approval.
+
+**Authentication:** **mTLS required** (must be an already-authorized client or server admin)
+
+**Request:** `ListPendingPairingsRequest` (empty)
+
+**Response:** `ListPendingPairingsResponse`
+- `pending_pairings` (repeated PendingPairingInfo): List of all pending requests
+
+**PendingPairingInfo Fields:**
+- `request_id` (string): UUID of the pairing request
+- `device_name` (string): Name of device requesting pairing
+- `device_model` (string): Model of device (may be empty)
+- `verification_code` (string): 6-digit verification code for this request
+- `expires_at_unix` (int64): Unix timestamp when request expires
+- `seconds_remaining` (int32): Seconds until timeout
+
+**Behavior:**
+1. Server retrieves all pairing requests with PENDING status
+2. Server filters out expired requests
+3. Server calculates seconds_remaining for each request
+4. Returns list sorted by creation time (oldest first)
+
+**Error Scenarios:**
+- `INTERNAL`: Server error retrieving pairing requests
+
+**CLI Usage:**
+```bash
+# List all pending pairing requests
+handcontrol list-pending
+```
+
+**Note:** This method is only in the server proto file, not yet in Android proto (see implementation gap).
+
+**Implementation:** `src/grpc/server.rs:372-400`
+
+---
+
+#### Discovery Methods
+
+##### GetServerInfo (Server Discovery)
+
+**Purpose:** Get server metadata and identification information.
+
+**Use Case:** Clients can verify server identity and display server information in the UI.
+
+**Authentication:** TLS-only (no mTLS required, public information)
+
+**Request:** `ServerInfoRequest` (empty)
+
+**Response:** `ServerInfoResponse`
+- `server_id` (string): Unique UUID for this server instance
+- `hostname` (string): System hostname (e.g., "work-laptop")
+- `version` (string): Server version (e.g., "0.1.0")
+- `os` (string): Operating system (e.g., "linux", "windows", "macos")
+
+**Behavior:**
+1. Server returns its UUID (persistent across restarts, stored in config)
+2. Server returns system hostname (via `hostname` crate)
+3. Server returns version from CARGO_PKG_VERSION
+4. Server returns OS from std::env::consts::OS
+
+**Use Cases:**
+- Android displays server name before enrollment
+- Verify connecting to correct server
+- Debug/support information
+
+**Error Scenarios:**
+- Generally does not fail (returns system defaults if needed)
+
+**Implementation:** `src/grpc/server.rs:402-428`
+
+---
+
+#### Command Methods
+
+##### ListCommands (Command Discovery)
+
+**Purpose:** Get list of available commands configured on the server.
+
+**Use Case:** Android client fetches command list after enrollment to populate the UI.
+
+**Authentication:** **mTLS required** (must be enrolled client)
+
+**Request:** `ListCommandsRequest` (empty)
+
+**Response:** `ListCommandsResponse`
+- `commands` (repeated Command): List of all configured commands
+
+**Command Fields:**
+- `id` (string): Unique command identifier (e.g., "lock-screen")
+- `name` (string): Display name (e.g., "Lock Screen")
+- `description` (string): Human-readable description
+- `icon` (string): Icon identifier (optional)
+- `tags` (repeated string): Tags for filtering (e.g., ["media", "audio"])
+- `parameters` (repeated Parameter): Command parameters (if any)
+
+**Parameter Fields:**
+- `name` (string): Parameter name used in shell command substitution
+- `type` (ParameterType): Type of UI control (SLIDER, TEXT, TOGGLE, DROPDOWN)
+- `description` (string): Help text for parameter
+- `min`, `max` (int32, optional): For SLIDER type
+- `default_value` (string, optional): Default value
+- `options` (repeated string): For DROPDOWN type
+- `validation` (string, optional): Regex validation for TEXT type
+- `label_on`, `label_off` (string, optional): For TOGGLE type
+
+**Behavior:**
+1. Server reads commands from TOML configuration file
+2. Server transforms config format to protobuf Command messages
+3. Server maps parameter types (slider, text, toggle, dropdown)
+4. Returns all commands with full metadata
+
+**Error Scenarios:**
+- `UNAUTHENTICATED`: Client certificate not in authorized list
+- `INTERNAL`: Server error reading or parsing config file
+
+**Caching Recommendation:**
+- Clients should cache command list
+- Re-fetch on connection or periodically (e.g., every 5 minutes)
+- Server config changes require client to re-fetch
+
+**Implementation:** `src/grpc/server.rs:430-484`
+
+---
+
+##### ExecuteCommand (Command Execution - Streaming)
+
+**Purpose:** Execute a configured command with real-time streaming output.
+
+**Use Case:** User taps a command in Android app, optionally provides parameters, and receives streaming output.
+
+**Authentication:** **mTLS required** (must be enrolled client)
+
+**Request:** `ExecuteCommandRequest`
+- `command_id` (string): ID of command to execute (must exist in config)
+- `parameters` (map<string, string>): Parameter name/value pairs
+
+**Response:** `stream ExecuteCommandResponse` (server-streaming)
+- `stdout` (string): Chunk of stdout output
+- `stderr` (string): Chunk of stderr output
+- `exit_code` (int32): Final exit code (sent as last message)
+- `error` (string): Error message if command fails to start
+- `timestamp_ms` (int64, optional): Unix timestamp in milliseconds
+
+**Behavior:**
+1. Server validates command_id exists in config
+2. Server validates all required parameters are present
+3. Server validates parameter values against schema:
+   - Numeric ranges (min/max for sliders)
+   - Regex validation (for text inputs)
+   - Allowed options (for dropdowns)
+4. Server substitutes parameters into shell command with proper escaping
+5. Server spawns process:
+   - Linux/macOS: `/bin/sh -c "command"`
+   - Windows: `cmd.exe /C "command"`
+6. Server streams stdout/stderr chunks as they arrive (non-blocking)
+7. Server enforces timeout (from config, terminates process if exceeded)
+8. Server sends final exit_code as last message
+9. Stream closes after exit_code is sent
+
+**Parameter Substitution:**
+```
+Shell command: "amixer set Master {volume}%"
+Parameters: {"volume": "50"}
+Result: "amixer set Master 50%"
+```
+
+**Security:**
+- All parameter values are shell-escaped to prevent injection
+- Commands run as the server process user (not root)
+- Timeout prevents infinite execution
+
+**Error Scenarios:**
+- `UNAUTHENTICATED`: Client certificate not in authorized list
+- `NOT_FOUND`: Command ID doesn't exist in config
+- `INVALID_ARGUMENT`: Missing required parameters or invalid values
+- `DEADLINE_EXCEEDED`: Command execution exceeded timeout
+- `INTERNAL`: Server error spawning process
+
+**Streaming Pattern:**
+```
+Response 1: {stdout: "Starting process...\n", timestamp_ms: 1234567890}
+Response 2: {stdout: "Processing...\n", timestamp_ms: 1234567891}
+Response 3: {stderr: "Warning: deprecated\n", timestamp_ms: 1234567892}
+Response 4: {exit_code: 0, timestamp_ms: 1234567893}
+```
+
+**Client Behavior:**
+- Display stdout/stderr in real-time (optional)
+- Wait for exit_code to determine success/failure
+- Handle timeout gracefully (show "Command timed out" message)
+
+**Implementation:** `src/grpc/server.rs:489-620`
+
+---
+
 ### Error Handling
 
 **gRPC Status Codes:**
-- `UNAUTHENTICATED`: Invalid or missing client certificate
-- `PERMISSION_DENIED`: Enrollment token invalid/expired
-- `NOT_FOUND`: Command ID doesn't exist
-- `INVALID_ARGUMENT`: Invalid parameters
-- `DEADLINE_EXCEEDED`: Command timeout
-- `INTERNAL`: Server error
+- `UNAUTHENTICATED`: Invalid or missing client certificate (mTLS failure)
+- `PERMISSION_DENIED`: Enrollment token invalid/expired, enrollment mode disabled, or verification code mismatch
+- `NOT_FOUND`: Command ID or pairing request ID doesn't exist
+- `INVALID_ARGUMENT`: Invalid parameters, certificate format, or missing required fields
+- `FAILED_PRECONDITION`: Operation not allowed in current state (e.g., approving expired pairing)
+- `DEADLINE_EXCEEDED`: Command execution timeout
+- `INTERNAL`: Server error (filesystem, parsing, process spawning)
+
+**Error Response Pattern:**
+Most methods include an `error_message` field in the response. This provides human-readable error details that can be displayed to the user or logged for debugging.
+
+**Client Error Handling:**
+- `UNAUTHENTICATED`: Show "Device unauthorized, please re-enroll"
+- `PERMISSION_DENIED`: Show specific error message from response
+- `NOT_FOUND`: Show "Command not found, please refresh"
+- `INVALID_ARGUMENT`: Show validation error to user
+- `DEADLINE_EXCEEDED`: Show "Command timed out"
+- `INTERNAL`: Show "Server error, please try again"
 
 ---
 

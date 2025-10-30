@@ -17,7 +17,6 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
-import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
 @Singleton
@@ -32,11 +31,13 @@ class MtlsGrpcChannelFactory @Inject constructor(
         Timber.i("Creating mTLS gRPC channel to $host:$port")
 
         val clientCert = certificateManager.loadOrCreate()
-        val sslContext = createMtlsSslContext(clientCert.privateKeyAlias)
+        val trustManager = createCapturingTrustManager()
+        val sslContext = createMtlsSslContext(clientCert.privateKeyAlias, trustManager)
 
         val channel = OkHttpChannelBuilder
             .forAddress(host, port)
             .sslSocketFactory(sslContext.socketFactory)
+            .hostnameVerifier { _, _ -> true }
             .build()
 
         activeChannels.add(channel)
@@ -71,7 +72,10 @@ class MtlsGrpcChannelFactory @Inject constructor(
         return lastServerCertificate
     }
 
-    private suspend fun createMtlsSslContext(clientKeyAlias: String): SSLContext {
+    private suspend fun createMtlsSslContext(
+        clientKeyAlias: String,
+        trustManager: X509TrustManager
+    ): SSLContext {
         val clientCert = certificateManager.loadOrCreate()
 
         // Load Android Keystore
@@ -84,9 +88,6 @@ class MtlsGrpcChannelFactory @Inject constructor(
             KeyManagerFactory.getDefaultAlgorithm()
         )
         keyManagerFactory.init(androidKeyStore, null)
-
-        // Create trust manager that captures server certificate
-        val trustManager = createCapturingTrustManager()
 
         // Create SSL context
         val sslContext = SSLContext.getInstance("TLS")

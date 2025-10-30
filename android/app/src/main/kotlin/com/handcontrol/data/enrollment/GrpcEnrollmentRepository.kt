@@ -33,7 +33,7 @@ private val Context.enrollmentDataStore: DataStore<Preferences> by preferencesDa
 class GrpcEnrollmentRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val certificateManager: ClientCertificateManager,
-    private val channelFactory: com.handcontrol.core.network.GrpcChannelFactory
+    private val channelFactory: com.handcontrol.core.network.MtlsGrpcChannelFactory
 ) : EnrollmentRepository {
 
     private val CLIENT_ID_KEY = stringPreferencesKey("client_id")
@@ -56,6 +56,16 @@ class GrpcEnrollmentRepository @Inject constructor(
                 .build()
 
             val response = stub.enroll(request)
+
+            // Extract and pin server certificate for future connections (TOFU)
+            val serverCertDer = extractServerCertificate(channel)
+            if (serverCertDer != null) {
+                val fingerprint = VerificationCodeGenerator.computeFingerprint(serverCertDer)
+                certificateManager.pinServerFingerprint(fingerprint)
+                Timber.i("Server certificate pinned: $fingerprint")
+            } else {
+                Timber.w("Could not extract server certificate for pinning")
+            }
 
             channelFactory.shutdownChannel(channel)
 
@@ -88,17 +98,39 @@ class GrpcEnrollmentRepository @Inject constructor(
             val channel = channelFactory.createChannel(host, port)
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
+            // Make a test RPC to trigger TLS handshake and capture server certificate
+            var resolvedServerId: String? = serverId
+            try {
+                val serverInfo =
+                    stub.getServerInfo(com.handcontrol.grpc.ServerInfoRequest.getDefaultInstance())
+                Timber.d(
+                    "Server info retrieved: serverId=%s hostname=%s version=%s",
+                    serverInfo.serverId,
+                    serverInfo.hostname,
+                    serverInfo.version
+                )
+                resolvedServerId = serverInfo.serverId.takeIf { it.isNotBlank() } ?: resolvedServerId
+            } catch (e: Exception) {
+                Timber.w("GetServerInfo request failed: ${e.message}")
+            }
+
+            if (resolvedServerId.isNullOrBlank()) {
+                Timber.e("Server ID unavailable; cannot compute verification code")
+                return EnrollmentResult.Error("Server did not provide an ID for pairing")
+            }
+
             val serverCertDer = extractServerCertificate(channel)
             if (serverCertDer == null) {
                 return EnrollmentResult.Error("Failed to extract server certificate")
             }
 
-            val effectiveServerId = serverId ?: "unknown"
+            val effectiveServerId = resolvedServerId
             val verificationCode = VerificationCodeGenerator.generate(
                 certificate.certificateDer,
                 serverCertDer,
                 effectiveServerId
             )
+            Timber.d("Computed verification code=%s serverId=%s", verificationCode, effectiveServerId)
 
             val request = RequestPairingRequest.newBuilder()
                 .setDeviceName(deviceName)
@@ -115,18 +147,34 @@ class GrpcEnrollmentRepository @Inject constructor(
             }
 
             if (response.verificationCode != verificationCode) {
-                Timber.e("Verification code mismatch - possible MITM attack!")
+                Timber.e(
+                    "Verification code mismatch - possible MITM attack! expected=%s actual=%s",
+                    verificationCode,
+                    response.verificationCode
+                )
                 return EnrollmentResult.Error("Security verification failed")
             }
 
             val serverFingerprint = VerificationCodeGenerator.computeFingerprint(serverCertDer)
-            val responseFingerprint = "SHA256:" + response.serverCertFingerprint.toByteArray()
-                .joinToString("") { "%02x".format(it) }
+            val responseFingerprint = if (!response.serverCertFingerprint.isEmpty) {
+                "SHA256:" + response.serverCertFingerprint.toByteArray()
+                    .joinToString("") { "%02x".format(it) }
+            } else {
+                ""
+            }
 
-            if (serverFingerprint != responseFingerprint) {
-                Timber.e("Server cert fingerprint mismatch - possible MITM attack!")
+            if (responseFingerprint.isNotEmpty() && serverFingerprint != responseFingerprint) {
+                Timber.e(
+                    "Server cert fingerprint mismatch - possible MITM attack! expected=%s actual=%s",
+                    serverFingerprint,
+                    responseFingerprint
+                )
                 return EnrollmentResult.Error("Security verification failed")
             }
+
+            // Pin server certificate for future connections (TOFU)
+            certificateManager.pinServerFingerprint(serverFingerprint)
+            Timber.i("Server certificate pinned: $serverFingerprint")
 
             if (response.pending) {
                 Timber.i("Approval pairing pending: requestId=${response.pairingRequestId}")
@@ -214,8 +262,17 @@ class GrpcEnrollmentRepository @Inject constructor(
         }
     }
 
-    private fun extractServerCertificate(channel: ManagedChannel): ByteArray? {
-        return null
+    private suspend fun extractServerCertificate(channel: ManagedChannel): ByteArray? {
+        // Get the server certificate captured during TLS handshake
+        val serverCert = channelFactory.getLastServerCertificate()
+
+        if (serverCert == null) {
+            Timber.w("No server certificate captured during TLS handshake")
+            return null
+        }
+
+        Timber.d("Server certificate extracted: ${serverCert.subjectX500Principal}")
+        return serverCert.encoded
     }
 
     private fun mapGrpcError(status: Status): String {

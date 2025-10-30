@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_handcontrol._tcp.local.";
 const TXT_RECORD_VERSION: &str = "1.0";
+const DEFAULT_HOST_LABEL: &str = "handcontrol";
 
 /// mDNS service manager for HandControl server
 ///
@@ -54,31 +55,36 @@ impl MdnsService {
         info!("Starting mDNS service...");
 
         // Create the mDNS daemon
-        let daemon = ServiceDaemon::new()
-            .context("Failed to create mDNS service daemon")?;
+        let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
 
         // Prepare TXT records
         let mut properties = HashMap::new();
         properties.insert("version".to_string(), TXT_RECORD_VERSION.to_string());
         properties.insert("server_id".to_string(), self.server_id.to_string());
-        properties.insert("cert_fingerprint".to_string(), self.cert_fingerprint.clone());
+        properties.insert(
+            "cert_fingerprint".to_string(),
+            self.cert_fingerprint.clone(),
+        );
 
         debug!(
             "mDNS TXT records: version={}, server_id={}, cert_fingerprint={}",
             TXT_RECORD_VERSION, self.server_id, self.cert_fingerprint
         );
 
+        let host_name = derive_host_name();
+
         // Create service info
         // Note: mdns-sd will automatically determine the host's IP addresses
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             &self.instance_name,
-            &format!("{}.local.", self.instance_name), // hostname
+            &host_name,
             (), // Use default IP (all interfaces)
             self.port,
             Some(properties),
         )
         .context("Failed to create mDNS service info")?;
+        let service_info = service_info.enable_addr_auto();
 
         // Register the service
         daemon
@@ -104,7 +110,8 @@ impl MdnsService {
 
         if let Some(daemon) = daemon_guard.take() {
             // Shutdown the daemon (this automatically unregisters all services)
-            daemon.shutdown()
+            daemon
+                .shutdown()
                 .context("Failed to shutdown mDNS daemon")?;
 
             info!("mDNS service stopped");
@@ -134,7 +141,8 @@ impl MdnsService {
 
         // Stop existing service
         if self.is_running() {
-            self.stop().context("Failed to stop existing mDNS service")?;
+            self.stop()
+                .context("Failed to stop existing mDNS service")?;
         }
 
         // Update parameters
@@ -144,7 +152,8 @@ impl MdnsService {
         self.cert_fingerprint = cert_fingerprint;
 
         // Restart with new parameters
-        self.start().context("Failed to restart mDNS service with new parameters")?;
+        self.start()
+            .context("Failed to restart mDNS service with new parameters")?;
 
         Ok(())
     }
@@ -159,6 +168,44 @@ impl Drop for MdnsService {
             }
         }
     }
+}
+
+fn derive_host_name() -> String {
+    let label = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .map(|raw| sanitize_host_label(&raw))
+        .filter(|label| !label.is_empty())
+        .unwrap_or_else(|| DEFAULT_HOST_LABEL.to_string());
+
+    format!("{}.local.", label)
+}
+
+fn sanitize_host_label(input: &str) -> String {
+    let mut label: String = input
+        .chars()
+        .map(|c| match c {
+            c if c.is_ascii_alphanumeric() => c.to_ascii_lowercase(),
+            '-' => '-',
+            '_' => '-',
+            c if c.is_whitespace() => '-',
+            _ => '\0',
+        })
+        .filter(|c| *c != '\0')
+        .collect();
+
+    while label.starts_with('-') {
+        label.remove(0);
+    }
+    while label.ends_with('-') {
+        label.pop();
+    }
+
+    if label.len() > 63 {
+        label.truncate(63);
+    }
+
+    label
 }
 
 #[cfg(test)]
@@ -225,5 +272,17 @@ mod tests {
     fn test_service_type_constant() {
         // Service type must match PRD specification
         assert_eq!(SERVICE_TYPE, "_handcontrol._tcp.local.");
+    }
+
+    #[test]
+    fn test_sanitize_host_label() {
+        assert_eq!(sanitize_host_label("My Computer"), "my-computer");
+        assert_eq!(sanitize_host_label("HandControl"), "handcontrol");
+        assert_eq!(
+            sanitize_host_label("  --Invalid Hostname!! "),
+            "invalid-hostname"
+        );
+        let long_input = "a".repeat(80);
+        assert_eq!(sanitize_host_label(&long_input), "a".repeat(63));
     }
 }

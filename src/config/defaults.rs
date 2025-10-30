@@ -11,7 +11,7 @@ pub fn generate_default_config() -> Result<Config> {
     Ok(Config {
         server: ServerConfig {
             port: 50051,
-            bind_address: "0.0.0.0".to_string(),
+            bind_address: "::".to_string(),
             mdns_service_name: "handcontrol".to_string(),
             mdns_instance_name: None,
         },

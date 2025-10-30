@@ -12,8 +12,12 @@ pub fn config_dir() -> Result<PathBuf> {
 
     // Create directory if it doesn't exist
     if !config_dir.exists() {
-        fs::create_dir_all(&config_dir)
-            .with_context(|| format!("Failed to create config directory: {}", config_dir.display()))?;
+        fs::create_dir_all(&config_dir).with_context(|| {
+            format!(
+                "Failed to create config directory: {}",
+                config_dir.display()
+            )
+        })?;
     }
 
     Ok(config_dir)
@@ -51,8 +55,12 @@ pub fn authorized_clients_dir() -> Result<PathBuf> {
 
     // Create directory if it doesn't exist
     if !dir.exists() {
-        fs::create_dir_all(&dir)
-            .with_context(|| format!("Failed to create authorized_clients directory: {}", dir.display()))?;
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "Failed to create authorized_clients directory: {}",
+                dir.display()
+            )
+        })?;
     }
 
     Ok(dir)

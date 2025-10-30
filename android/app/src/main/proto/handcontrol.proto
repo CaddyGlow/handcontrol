@@ -14,6 +14,8 @@ service RemoteControl {
   // Enrollment: Approval mode (interactive)
   rpc RequestPairing(RequestPairingRequest) returns (RequestPairingResponse);
   rpc CheckPairingStatus(CheckPairingStatusRequest) returns (CheckPairingStatusResponse);
+  rpc ApprovePairing(ApprovePairingRequest) returns (ApprovePairingResponse);
+  rpc ListPendingPairings(ListPendingPairingsRequest) returns (ListPendingPairingsResponse);
 
   // Get server information
   rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
@@ -65,12 +67,38 @@ message CheckPairingStatusResponse {
   string error_message = 3;
 }
 
+message ApprovePairingRequest {
+  string pairing_request_id = 1;
+}
+
+message ApprovePairingResponse {
+  bool success = 1;
+  string client_id = 2;
+  string error_message = 3;
+}
+
 enum PairingStatus {
   PAIRING_STATUS_UNSPECIFIED = 0;
   PAIRING_STATUS_PENDING = 1;
   PAIRING_STATUS_APPROVED = 2;
   PAIRING_STATUS_REJECTED = 3;
   PAIRING_STATUS_TIMEOUT = 4;
+}
+
+// List pending pairing requests
+message ListPendingPairingsRequest {}
+
+message ListPendingPairingsResponse {
+  repeated PendingPairingInfo pending_pairings = 1;
+}
+
+message PendingPairingInfo {
+  string request_id = 1;
+  string device_name = 2;
+  string device_model = 3;
+  string verification_code = 4;
+  int64 expires_at_unix = 5;
+  int32 seconds_remaining = 6;
 }
 
 // Server info

@@ -111,7 +111,10 @@ impl PairingRequestManager {
         let mut requests = self.requests.lock().unwrap();
 
         // Check if expired and update status if needed
-        let is_expired = requests.get(request_id).map(|r| r.is_expired()).unwrap_or(false);
+        let is_expired = requests
+            .get(request_id)
+            .map(|r| r.is_expired())
+            .unwrap_or(false);
         if is_expired {
             if let Some(req) = requests.get_mut(request_id) {
                 req.status = PairingRequestStatus::Timeout;
@@ -163,13 +166,30 @@ impl PairingRequestManager {
 
     /// Remove expired requests
     fn cleanup_expired_requests(&self, requests: &mut HashMap<String, PairingRequest>) {
-        requests.retain(|_, request| !request.is_expired() || request.status != PairingRequestStatus::Pending);
+        requests.retain(|_, request| {
+            !request.is_expired() || request.status != PairingRequestStatus::Pending
+        });
     }
 
     /// Get number of pending requests
     pub fn pending_count(&self) -> usize {
         let requests = self.requests.lock().unwrap();
         requests.values().filter(|r| r.is_pending()).count()
+    }
+
+    /// List all pending pairing requests
+    pub fn list_pending(&self) -> Vec<PairingRequest> {
+        let mut requests = self.requests.lock().unwrap();
+
+        // Clean up expired requests first
+        self.cleanup_expired_requests(&mut requests);
+
+        // Return only pending requests
+        requests
+            .values()
+            .filter(|r| r.is_pending())
+            .cloned()
+            .collect()
     }
 }
 
@@ -317,14 +337,20 @@ mod tests {
         let manager = PairingRequestManager::new(0); // Expires immediately
 
         // Create multiple expired requests
-        manager.create_request("Device 1".to_string(), None, vec![1], "111-111".to_string()).unwrap();
-        manager.create_request("Device 2".to_string(), None, vec![2], "222-222".to_string()).unwrap();
+        manager
+            .create_request("Device 1".to_string(), None, vec![1], "111-111".to_string())
+            .unwrap();
+        manager
+            .create_request("Device 2".to_string(), None, vec![2], "222-222".to_string())
+            .unwrap();
 
         thread::sleep(StdDuration::from_millis(10));
 
         // Create a new request, which should trigger cleanup
         let manager2 = PairingRequestManager::new(60);
-        manager2.create_request("Device 3".to_string(), None, vec![3], "333-333".to_string()).unwrap();
+        manager2
+            .create_request("Device 3".to_string(), None, vec![3], "333-333".to_string())
+            .unwrap();
 
         // Only the new request should be pending
         assert_eq!(manager2.pending_count(), 1);

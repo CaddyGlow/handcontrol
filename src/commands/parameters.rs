@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use regex::Regex;
 use std::collections::HashMap;
 
@@ -18,10 +18,7 @@ pub fn validate_parameters(
         } else if let Some(default) = &param_def.default {
             default.clone()
         } else {
-            return Err(anyhow!(
-                "Missing required parameter: {}",
-                param_def.name
-            ));
+            return Err(anyhow!("Missing required parameter: {}", param_def.name));
         };
 
         // Validate parameter based on type
@@ -34,10 +31,7 @@ pub fn validate_parameters(
     // Check for unknown parameters
     for param_name in provided_params.keys() {
         if !command.parameters.iter().any(|p| p.name == *param_name) {
-            return Err(anyhow!(
-                "Unknown parameter: {}",
-                param_name
-            ));
+            return Err(anyhow!("Unknown parameter: {}", param_name));
         }
     }
 
@@ -49,26 +43,18 @@ fn validate_parameter_value(param_def: &ParameterConfig, value: &str) -> Result<
     match param_def.param_type.as_str() {
         "slider" => {
             // Parse as integer
-            let num: i32 = value
-                .parse()
-                .context("Slider value must be an integer")?;
+            let num: i32 = value.parse().context("Slider value must be an integer")?;
 
             // Check min/max bounds
             if let Some(min) = param_def.min {
                 if num < min {
-                    return Err(anyhow!(
-                        "Value {} is below minimum {}",
-                        num, min
-                    ));
+                    return Err(anyhow!("Value {} is below minimum {}", num, min));
                 }
             }
 
             if let Some(max) = param_def.max {
                 if num > max {
-                    return Err(anyhow!(
-                        "Value {} is above maximum {}",
-                        num, max
-                    ));
+                    return Err(anyhow!("Value {} is above maximum {}", num, max));
                 }
             }
 
@@ -98,8 +84,7 @@ fn validate_parameter_value(param_def: &ParameterConfig, value: &str) -> Result<
         "text" => {
             // Check regex validation if provided
             if let Some(validation_regex) = &param_def.validation {
-                let regex = Regex::new(validation_regex)
-                    .context("Invalid validation regex")?;
+                let regex = Regex::new(validation_regex).context("Invalid validation regex")?;
 
                 if !regex.is_match(value) {
                     return Err(anyhow!(
@@ -111,10 +96,7 @@ fn validate_parameter_value(param_def: &ParameterConfig, value: &str) -> Result<
             }
             Ok(())
         }
-        _ => Err(anyhow!(
-            "Unknown parameter type: {}",
-            param_def.param_type
-        )),
+        _ => Err(anyhow!("Unknown parameter type: {}", param_def.param_type)),
     }
 }
 
@@ -126,8 +108,7 @@ pub fn substitute_parameters(
     let mut result = shell_template.to_string();
 
     // Find all {parameter_name} placeholders
-    let re = Regex::new(r"\{([a-zA-Z0-9_-]+)\}")
-        .context("Failed to compile parameter regex")?;
+    let re = Regex::new(r"\{([a-zA-Z0-9_-]+)\}").context("Failed to compile parameter regex")?;
 
     // Track which parameters were used
     let mut used_params = HashMap::new();
@@ -347,21 +328,19 @@ mod tests {
             tags: vec![],
             timeout_seconds: 30,
             env: HashMap::new(),
-            parameters: vec![
-                ParameterConfig {
-                    name: "msg".to_string(),
-                    param_type: "text".to_string(),
-                    description: None,
-                    min: None,
-                    max: None,
-                    default: Some("default_message".to_string()),
-                    options: vec![],
-                    validation: None,
-                    label_on: None,
-                    label_off: None,
-                    step: None,
-                },
-            ],
+            parameters: vec![ParameterConfig {
+                name: "msg".to_string(),
+                param_type: "text".to_string(),
+                description: None,
+                min: None,
+                max: None,
+                default: Some("default_message".to_string()),
+                options: vec![],
+                validation: None,
+                label_on: None,
+                label_off: None,
+                step: None,
+            }],
         };
 
         let params = HashMap::new();

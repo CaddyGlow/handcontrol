@@ -1,8 +1,8 @@
 use anyhow::Result;
 use tracing::info;
 
-use crate::security::pairing::PairingRequestManager;
 use crate::security::certificates::ClientCertificate;
+use crate::security::pairing::PairingRequestManager;
 use crate::storage::clients::ClientStore;
 
 /// Handle manual approval of pending pairing requests

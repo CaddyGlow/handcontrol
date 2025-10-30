@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use handcontrol::cli::enroll::handle_qr_enrollment;
 use handcontrol::config::{default_config_path, load_config, validate_config};
-use handcontrol::grpc::server::{start_server, RemoteControlService};
+use handcontrol::grpc::proto::{
+    ApprovePairingRequest, GenerateEnrollmentQrRequest, ListPendingPairingsRequest,
+};
+use handcontrol::grpc::proto::remote_control_client::RemoteControlClient;
+use handcontrol::grpc::server::{RemoteControlService, start_server};
 use handcontrol::mdns::service::MdnsService;
 use handcontrol::notifications::NotificationManager;
 use handcontrol::security::certificates::ensure_server_certificate;
@@ -12,8 +15,9 @@ use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
 use handcontrol::utils::logging;
 use std::fs;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tracing::info;
 use uuid::Uuid;
 
@@ -88,9 +92,8 @@ async fn main() -> Result<()> {
 async fn handle_enroll_command() -> Result<()> {
     info!("Starting enrollment command...");
 
-    // Load configuration (needed for cert paths and settings)
-    let config_path = default_config_path()
-        .context("Failed to determine config path")?;
+    // Load configuration
+    let config_path = default_config_path().context("Failed to determine config path")?;
 
     if !config_path.exists() {
         anyhow::bail!(
@@ -99,40 +102,87 @@ async fn handle_enroll_command() -> Result<()> {
         );
     }
 
-    let config = load_config(&config_path)
-        .context("Failed to load configuration")?;
+    let config = load_config(&config_path).context("Failed to load configuration")?;
 
     // Check if QR enrollment is enabled
     if !config.security.enrollment.qr_code_enabled {
         anyhow::bail!("QR code enrollment is disabled in configuration");
     }
 
-    // Load server certificate
-    let cert_path = config.security.cert_path
-        .as_ref()
-        .map(|p| std::path::PathBuf::from(p))
-        .unwrap_or_else(|| paths::server_cert_path().unwrap());
-    let key_path = config.security.key_path
-        .as_ref()
-        .map(|p| std::path::PathBuf::from(p))
-        .unwrap_or_else(|| paths::server_key_path().unwrap());
+    // Connect to running server via gRPC
+    let host = match config.server.bind_address.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+    .to_string();
 
-    let server_cert = ensure_server_certificate(&cert_path, &key_path)
-        .context("Failed to load server certificate")?;
+    let cert_path = if let Some(path) = config.security.cert_path.as_ref() {
+        std::path::PathBuf::from(path)
+    } else {
+        paths::server_cert_path().context("Failed to determine server certificate path")?
+    };
 
-    // Generate server ID
-    let server_id = Uuid::new_v4();
+    let server_cert = fs::read(&cert_path).with_context(|| {
+        format!(
+            "Failed to read server certificate from {}",
+            cert_path.display()
+        )
+    })?;
 
-    // Create enrollment token manager
-    let enrollment_manager = EnrollmentTokenManager::new(config.security.enrollment_token_ttl);
+    let target = format!("https://{}:{}", host, config.server.port);
+    let endpoint = Endpoint::from_shared(target.clone())
+        .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
 
-    // Parse bind address
-    let addr: SocketAddr = format!("{}:{}", config.server.bind_address, config.server.port)
-        .parse()
-        .context("Failed to parse bind address")?;
+    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+        "localhost".to_string()
+    } else {
+        host.clone()
+    };
 
-    // Handle QR enrollment
-    handle_qr_enrollment(&server_cert, server_id, addr, &enrollment_manager).await?;
+    let tls_config = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(server_cert))
+        .domain_name(domain_name);
+
+    let channel = endpoint
+        .tls_config(tls_config)
+        .context("Failed to configure TLS for CLI client")?
+        .connect()
+        .await
+        .context("Failed to connect to HandControl server. Is the server running?")?;
+
+    let mut client = RemoteControlClient::new(channel);
+
+    // Call GenerateEnrollmentQR RPC
+    let response = client
+        .generate_enrollment_qr(GenerateEnrollmentQrRequest {})
+        .await
+        .context("GenerateEnrollmentQR RPC failed")?
+        .into_inner();
+
+    if !response.success {
+        anyhow::bail!(
+            "Server failed to generate enrollment QR: {}",
+            response.error_message
+        );
+    }
+
+    // Parse QR payload and display it
+    let payload: handcontrol::utils::qr::EnrollmentQrPayload =
+        serde_json::from_str(&response.qr_payload)
+            .context("Failed to parse QR payload from server")?;
+
+    // Display QR code
+    payload.display_qr()?;
+
+    info!("Waiting for enrollment... (Press Ctrl+C to cancel)");
+
+    // Wait for TTL or Ctrl+C
+    tokio::time::sleep(tokio::time::Duration::from_secs(
+        response.ttl_seconds as u64,
+    ))
+    .await;
+
+    info!("Enrollment session expired");
 
     Ok(())
 }
@@ -140,17 +190,68 @@ async fn handle_enroll_command() -> Result<()> {
 async fn handle_approve_command(request_id: &str) -> Result<()> {
     info!("Approving pairing request: {}", request_id);
 
-    // Note: In a production system, the pairing manager would persist its state
-    // For now, we load it from the running server's state
-    println!("Error: Cannot approve pairing request from CLI.");
-    println!("The pairing manager state is only available while the server is running.");
-    println!("Please use OS notifications to approve pairing requests.");
-    println!("\nAlternatively, you can:");
-    println!("  1. Check the server logs for the verification code");
-    println!("  2. Ensure the verification codes match on both devices");
-    println!("  3. Wait for the approval timeout to expire and try again");
+    let config_path = default_config_path().context("Failed to determine config path")?;
+    let config = load_config(&config_path).context("Failed to load configuration")?;
 
-    anyhow::bail!("Pairing approval requires server to be running")
+    let host = match config.server.bind_address.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+    .to_string();
+
+    let cert_path = if let Some(path) = config.security.cert_path.as_ref() {
+        std::path::PathBuf::from(path)
+    } else {
+        paths::server_cert_path().context("Failed to determine server certificate path")?
+    };
+
+    let server_cert = fs::read(&cert_path).with_context(|| {
+        format!(
+            "Failed to read server certificate from {}",
+            cert_path.display()
+        )
+    })?;
+
+    let target = format!("https://{}:{}", host, config.server.port);
+    let endpoint = Endpoint::from_shared(target.clone())
+        .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
+
+    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+        "localhost".to_string()
+    } else {
+        host.clone()
+    };
+
+    let tls_config = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(server_cert))
+        .domain_name(domain_name);
+
+    let channel = endpoint
+        .tls_config(tls_config)
+        .context("Failed to configure TLS for CLI client")?
+        .connect()
+        .await
+        .context("Failed to connect to HandControl server")?;
+
+    let mut client = RemoteControlClient::new(channel);
+
+    let response = client
+        .approve_pairing(ApprovePairingRequest {
+            pairing_request_id: request_id.to_string(),
+        })
+        .await
+        .context("ApprovePairing RPC failed")?
+        .into_inner();
+
+    if response.success {
+        println!("Pairing request approved. client_id={}", response.client_id);
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "Server rejected pairing approval: {}",
+            response.error_message
+        )
+    }
 }
 
 async fn handle_reject_command(request_id: &str) -> Result<()> {
@@ -166,19 +267,89 @@ async fn handle_reject_command(request_id: &str) -> Result<()> {
 async fn handle_list_pending_command() -> Result<()> {
     info!("Listing pending pairing requests");
 
-    println!("Error: Cannot list pairing requests from CLI.");
-    println!("The pairing manager state is only available while the server is running.");
-    println!("Please check the server logs for pending pairing requests.");
+    let config_path = default_config_path().context("Failed to determine config path")?;
+    let config = load_config(&config_path).context("Failed to load configuration")?;
 
-    anyhow::bail!("Listing pairing requests requires server to be running")
+    let host = match config.server.bind_address.as_str() {
+        "0.0.0.0" | "::" => "127.0.0.1",
+        other => other,
+    }
+    .to_string();
+
+    let cert_path = if let Some(path) = config.security.cert_path.as_ref() {
+        std::path::PathBuf::from(path)
+    } else {
+        paths::server_cert_path().context("Failed to determine server certificate path")?
+    };
+
+    let server_cert = fs::read(&cert_path).with_context(|| {
+        format!(
+            "Failed to read server certificate from {}",
+            cert_path.display()
+        )
+    })?;
+
+    let target = format!("https://{}:{}", host, config.server.port);
+    let endpoint = Endpoint::from_shared(target.clone())
+        .with_context(|| format!("Invalid server endpoint URL: {}", target))?;
+
+    let domain_name = if host.parse::<std::net::IpAddr>().is_ok() {
+        "localhost".to_string()
+    } else {
+        host.clone()
+    };
+
+    let tls_config = ClientTlsConfig::new()
+        .ca_certificate(Certificate::from_pem(server_cert))
+        .domain_name(domain_name);
+
+    let channel = endpoint
+        .tls_config(tls_config)
+        .context("Failed to configure TLS for CLI client")?
+        .connect()
+        .await
+        .context("Failed to connect to HandControl server")?;
+
+    let mut client = RemoteControlClient::new(channel);
+
+    let response = client
+        .list_pending_pairings(ListPendingPairingsRequest {})
+        .await
+        .context("ListPendingPairings RPC failed")?
+        .into_inner();
+
+    if response.requests.is_empty() {
+        eprintln!("No pending pairing requests.");
+        return Ok(());
+    }
+
+    // Format output for easy parsing and fzf
+    // Format: request_id | device_name | device_model | pin | expires_in_seconds
+    for req in response.requests {
+        let model = if req.device_model.is_empty() {
+            "Unknown".to_string()
+        } else {
+            req.device_model
+        };
+
+        println!(
+            "{}\t{}\t{}\t{}\t{}s",
+            req.request_id,
+            req.device_name,
+            model,
+            req.verification_code,
+            req.seconds_remaining
+        );
+    }
+
+    Ok(())
 }
 
 async fn start_handcontrol_server() -> Result<()> {
     info!("HandControl server starting...");
 
     // Determine config file path
-    let config_path = default_config_path()
-        .context("Failed to determine config path")?;
+    let config_path = default_config_path().context("Failed to determine config path")?;
 
     info!("Config path: {}", config_path.display());
 
@@ -189,21 +360,23 @@ async fn start_handcontrol_server() -> Result<()> {
         let default_config = handcontrol::config::defaults::generate_default_config_toml()
             .context("Failed to generate default config")?;
 
-        fs::write(&config_path, default_config)
-            .with_context(|| format!("Failed to write default config to {}", config_path.display()))?;
+        fs::write(&config_path, default_config).with_context(|| {
+            format!(
+                "Failed to write default config to {}",
+                config_path.display()
+            )
+        })?;
 
         info!("Default configuration written to {}", config_path.display());
     }
 
     // Load configuration
     info!("Loading configuration...");
-    let config = load_config(&config_path)
-        .context("Failed to load configuration")?;
+    let config = load_config(&config_path).context("Failed to load configuration")?;
 
     // Validate configuration
     info!("Validating configuration...");
-    validate_config(&config)
-        .context("Configuration validation failed")?;
+    validate_config(&config).context("Configuration validation failed")?;
 
     info!(
         "Configuration loaded successfully: {} commands defined",
@@ -215,23 +388,23 @@ async fn start_handcontrol_server() -> Result<()> {
         "Server will bind to {}:{}",
         config.server.bind_address, config.server.port
     );
-    info!(
-        "mDNS service name: {}",
-        config.server.mdns_service_name
-    );
+    info!("mDNS service name: {}", config.server.mdns_service_name);
     info!(
         "Enrollment modes: QR={}, Approval={}",
-        config.security.enrollment.qr_code_enabled,
-        config.security.enrollment.approval_enabled
+        config.security.enrollment.qr_code_enabled, config.security.enrollment.approval_enabled
     );
 
     // Initialize server certificate (Phase 2)
     info!("Initializing server certificate...");
-    let cert_path = config.security.cert_path
+    let cert_path = config
+        .security
+        .cert_path
         .as_ref()
         .map(|p| std::path::PathBuf::from(p))
         .unwrap_or_else(|| paths::server_cert_path().unwrap());
-    let key_path = config.security.key_path
+    let key_path = config
+        .security
+        .key_path
         .as_ref()
         .map(|p| std::path::PathBuf::from(p))
         .unwrap_or_else(|| paths::server_key_path().unwrap());
@@ -275,9 +448,10 @@ async fn start_handcontrol_server() -> Result<()> {
         info!("Notification system unavailable, using fallback");
     }
 
-    // Get values needed for mDNS before moving into Arc
+    // Get values needed for networking/mDNS before moving into Arc
     let mdns_instance_name = config.server.mdns_instance_name.clone();
-    let mdns_port = config.server.port;
+    let server_port = config.server.port;
+    let bind_address = config.server.bind_address.clone();
     let cert_fingerprint = server_cert.fingerprint_display();
 
     // Create gRPC service
@@ -293,32 +467,35 @@ async fn start_handcontrol_server() -> Result<()> {
     );
 
     // Parse bind address
-    let addr: SocketAddr = format!("{}:{}", "0.0.0.0", 50051)
+    let ip_addr: IpAddr = bind_address
         .parse()
-        .context("Failed to parse bind address")?;
+        .with_context(|| format!("Failed to parse bind address '{}'", bind_address))?;
+    let addr = SocketAddr::new(ip_addr, server_port);
 
     info!("Server initialization complete");
     info!("gRPC server will listen on {}", addr);
 
     // Initialize mDNS service (Phase 7)
     info!("Initializing mDNS service...");
-    let instance_name = mdns_instance_name
-        .unwrap_or_else(|| {
-            hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_else(|| "HandControl".to_string())
-        });
+    let instance_name = mdns_instance_name.unwrap_or_else(|| {
+        hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "HandControl".to_string())
+    });
 
     let mdns_service = MdnsService::new(
         instance_name.clone(),
-        mdns_port,
+        server_port,
         server_id,
         cert_fingerprint,
     );
 
     if let Err(e) = mdns_service.start() {
-        tracing::warn!("Failed to start mDNS service (continuing without discovery): {}", e);
+        tracing::warn!(
+            "Failed to start mDNS service (continuing without discovery): {}",
+            e
+        );
     } else {
         info!("mDNS service started: instance_name={}", instance_name);
     }
@@ -336,4 +513,3 @@ async fn start_handcontrol_server() -> Result<()> {
 
     Ok(())
 }
-

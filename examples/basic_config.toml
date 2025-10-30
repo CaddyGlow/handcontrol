@@ -1,0 +1,75 @@
+# HandControl Basic Configuration Example
+# This is a simple configuration file with common commands for daily use.
+# Copy this to ~/.config/handcontrol/config.toml to get started.
+
+[server]
+bind_address = "0.0.0.0"
+port = 50051
+mdns_instance_name = "My Computer"
+
+[security]
+enrollment_token_ttl = 300  # 5 minutes
+
+[security.enrollment]
+qr_code_enabled = true
+approval_enabled = true
+approval_notification = true
+approval_timeout_seconds = 60  # 1 minute
+
+[commands]
+timeout_seconds = 30
+
+# Lock screen (works on most Linux desktops)
+[[command]]
+id = "lock-screen"
+name = "Lock Screen"
+description = "Lock the screen immediately"
+shell = "loginctl lock-session"
+
+# Volume control with slider
+[[command]]
+id = "set-volume"
+name = "Set Volume"
+description = "Adjust system volume"
+shell = "pactl set-sink-volume @DEFAULT_SINK@ {volume}%"
+
+[[command.parameters]]
+name = "volume"
+display_name = "Volume Level"
+type = "slider"
+min = 0
+max = 100
+default = 50
+
+# Mute toggle
+[[command]]
+id = "toggle-mute"
+name = "Toggle Mute"
+description = "Mute or unmute audio"
+shell = "pactl set-sink-mute @DEFAULT_SINK@ toggle"
+
+# Screenshot
+[[command]]
+id = "screenshot"
+name = "Take Screenshot"
+description = "Capture the entire screen"
+shell = "scrot ~/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"
+
+# Media controls
+[[command]]
+id = "play-pause"
+name = "Play/Pause"
+description = "Toggle media playback"
+shell = "playerctl play-pause"
+
+[[command]]
+id = "next-track"
+name = "Next Track"
+description = "Skip to next track"
+shell = "playerctl next"
+
+[[command]]
+id = "previous-track"
+name = "Previous Track"
+description = "Go to previous track"
+shell = "playerctl previous"

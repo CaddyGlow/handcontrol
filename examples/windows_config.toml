@@ -1,0 +1,177 @@
+# HandControl Configuration Example for Windows
+# This configuration uses Windows-specific commands.
+# Copy this to %APPDATA%\handcontrol\config.toml on Windows.
+
+[server]
+bind_address = "0.0.0.0"
+port = 50051
+mdns_instance_name = "Windows PC"
+
+[security]
+enrollment_token_ttl = 300
+
+[security.enrollment]
+qr_code_enabled = true
+approval_enabled = true
+approval_notification = true
+approval_timeout_seconds = 60
+
+[commands]
+timeout_seconds = 30
+
+# --- System Power Management ---
+
+[[command]]
+id = "lock"
+name = "Lock Screen"
+description = "Lock the workstation"
+shell = "rundll32.exe user32.dll,LockWorkStation"
+
+[[command]]
+id = "shutdown"
+name = "Shutdown"
+description = "Shutdown the computer"
+shell = "shutdown /s /t 0"
+confirm = true
+
+[[command]]
+id = "restart"
+name = "Restart"
+description = "Restart the computer"
+shell = "shutdown /r /t 0"
+confirm = true
+
+[[command]]
+id = "sleep"
+name = "Sleep"
+description = "Put computer to sleep"
+shell = "rundll32.exe powrprof.dll,SetSuspendState 0,1,0"
+
+# --- Volume Control (using NirCmd) ---
+# Note: Requires NirCmd to be installed and in PATH
+# Download from: https://www.nirsoft.net/utils/nircmd.html
+
+[[command]]
+id = "volume"
+name = "Set Volume"
+description = "Adjust system volume"
+shell = "nircmd.exe setsysvolume {level}"
+
+[[command.parameters]]
+name = "level"
+display_name = "Volume Level"
+type = "slider"
+min = 0
+max = 65535
+default = 32767
+
+[[command]]
+id = "mute"
+name = "Mute"
+description = "Mute audio"
+shell = "nircmd.exe mutesysvolume 1"
+
+[[command]]
+id = "unmute"
+name = "Unmute"
+description = "Unmute audio"
+shell = "nircmd.exe mutesysvolume 0"
+
+# --- Display Management ---
+
+[[command]]
+id = "monitor-off"
+name = "Turn Monitor Off"
+description = "Turn off the monitor"
+shell = "nircmd.exe monitor off"
+
+[[command]]
+id = "brightness"
+name = "Set Brightness"
+description = "Adjust screen brightness"
+shell = "powershell.exe -Command \"(Get-WmiObject -Namespace root/WMI -Class WmiMonitorBrightnessMethods).WmiSetBrightness(1,{level})\""
+
+[[command.parameters]]
+name = "level"
+display_name = "Brightness"
+type = "slider"
+min = 10
+max = 100
+default = 50
+
+# --- Media Controls ---
+
+[[command]]
+id = "play-pause"
+name = "Play/Pause"
+description = "Toggle media playback"
+shell = "nircmd.exe sendkeypress 0xB3"
+
+[[command]]
+id = "next-track"
+name = "Next Track"
+description = "Skip to next track"
+shell = "nircmd.exe sendkeypress 0xB0"
+
+[[command]]
+id = "previous-track"
+name = "Previous Track"
+description = "Go to previous track"
+shell = "nircmd.exe sendkeypress 0xB1"
+
+# --- Screenshot ---
+
+[[command]]
+id = "screenshot"
+name = "Take Screenshot"
+description = "Capture screen to clipboard"
+shell = "nircmd.exe savescreenshot \"%USERPROFILE%\\Pictures\\screenshot-%Y%m%d-%H%M%S.png\""
+
+# --- Window Management ---
+
+[[command]]
+id = "minimize-all"
+name = "Minimize All Windows"
+description = "Show desktop"
+shell = "nircmd.exe sendkeypress 0x5B 0x44"  # Win+D
+
+[[command]]
+id = "task-manager"
+name = "Open Task Manager"
+description = "Launch Task Manager"
+shell = "taskmgr.exe"
+
+# --- Applications ---
+
+[[command]]
+id = "open-browser"
+name = "Open Browser"
+description = "Open default web browser"
+shell = "start {url}"
+
+[[command.parameters]]
+name = "url"
+display_name = "URL"
+type = "text"
+regex = "^https?://.*"
+default = "https://www.google.com"
+
+[[command]]
+id = "notepad"
+name = "Open Notepad"
+description = "Launch Notepad"
+shell = "notepad.exe"
+
+# --- Clipboard ---
+
+[[command]]
+id = "clipboard-text"
+name = "Copy to Clipboard"
+description = "Copy text to clipboard"
+shell = "powershell.exe -Command \"Set-Clipboard -Value '{text}'\""
+
+[[command.parameters]]
+name = "text"
+display_name = "Text"
+type = "text"
+default = ""

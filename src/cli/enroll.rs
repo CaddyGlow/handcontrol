@@ -25,8 +25,8 @@ pub async fn handle_qr_enrollment(
 
     // Get server IP from bind address
     let ip = if bind_addr.ip().is_unspecified() {
-        // If binding to 0.0.0.0, try to get a local IP
-        get_local_ip().unwrap_or_else(|| "0.0.0.0".to_string())
+        // If binding to an unspecified address (0.0.0.0 or ::), try to get a local IP
+        get_local_ip().unwrap_or_else(|| bind_addr.ip().to_string())
     } else {
         bind_addr.ip().to_string()
     };

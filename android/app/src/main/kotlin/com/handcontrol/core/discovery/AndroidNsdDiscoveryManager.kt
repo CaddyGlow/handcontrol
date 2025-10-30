@@ -72,7 +72,14 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                         discoveredServers[serviceInfo.serviceName] = server
                         _servers.value = discoveredServers.values.toList()
 
-                        Timber.d("Server added: $server")
+                        Timber.d(
+                            "Server added name=%s host=%s port=%d id=%s fingerprint=%s",
+                            server.name,
+                            server.host,
+                            server.port,
+                            server.serverId,
+                            server.fingerprint
+                        )
                     }
                 })
             }
@@ -151,6 +158,6 @@ class AndroidNsdDiscoveryManager @Inject constructor(
     }
 
     companion object {
-        private const val SERVICE_TYPE = "_handcontrol._tcp.local."
+        private const val SERVICE_TYPE = "_handcontrol._tcp."
     }
 }

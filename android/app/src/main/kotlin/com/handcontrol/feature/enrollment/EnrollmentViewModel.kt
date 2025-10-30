@@ -68,7 +68,7 @@ class EnrollmentViewModel @Inject constructor(
     fun requestApprovalPairing(host: String, port: Int, serverId: String?) {
         viewModelScope.launch {
             try {
-                Timber.i("Requesting approval pairing")
+                Timber.i("Requesting approval pairing host=%s port=%d serverId=%s", host, port, serverId)
 
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
                 val deviceModel = Build.MODEL

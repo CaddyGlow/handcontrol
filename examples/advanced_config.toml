@@ -1,0 +1,221 @@
+# HandControl Advanced Configuration Example
+# This demonstrates all parameter types and more complex commands.
+
+[server]
+bind_address = "0.0.0.0"
+port = 50051
+mdns_instance_name = "Advanced PC"
+
+[security]
+enrollment_token_ttl = 600  # 10 minutes
+
+[security.enrollment]
+qr_code_enabled = true
+approval_enabled = true
+approval_notification = true
+approval_timeout_seconds = 120  # 2 minutes
+
+[commands]
+timeout_seconds = 60
+
+# --- System Power Management ---
+
+[[command]]
+id = "lock"
+name = "Lock Screen"
+description = "Lock the screen"
+shell = "loginctl lock-session"
+
+[[command]]
+id = "suspend"
+name = "Suspend"
+description = "Suspend the system"
+shell = "systemctl suspend"
+
+[[command]]
+id = "reboot"
+name = "Reboot"
+description = "Reboot the system"
+shell = "systemctl reboot"
+confirm = true
+
+[[command]]
+id = "shutdown"
+name = "Shutdown"
+description = "Power off the system"
+shell = "systemctl poweroff"
+confirm = true
+
+# --- Display Management ---
+
+[[command]]
+id = "brightness"
+name = "Set Brightness"
+description = "Adjust screen brightness"
+shell = "brightnessctl set {level}%"
+
+[[command.parameters]]
+name = "level"
+display_name = "Brightness Level"
+type = "slider"
+min = 10
+max = 100
+default = 50
+
+[[command]]
+id = "display-off"
+name = "Turn Display Off"
+description = "Turn off the display"
+shell = "xset dpms force off"
+
+# --- Audio Management ---
+
+[[command]]
+id = "volume"
+name = "Set Volume"
+description = "Set system volume level"
+shell = "pactl set-sink-volume @DEFAULT_SINK@ {level}%"
+
+[[command.parameters]]
+name = "level"
+display_name = "Volume"
+type = "slider"
+min = 0
+max = 150
+default = 100
+
+[[command]]
+id = "mute"
+name = "Mute Audio"
+description = "Mute all audio output"
+shell = "pactl set-sink-mute @DEFAULT_SINK@ {enabled}"
+
+[[command.parameters]]
+name = "enabled"
+display_name = "Mute"
+type = "toggle"
+default = true
+
+[[command]]
+id = "switch-audio-output"
+name = "Switch Audio Output"
+description = "Change audio output device"
+shell = "pactl set-default-sink {output}"
+
+[[command.parameters]]
+name = "output"
+display_name = "Output Device"
+type = "selection"
+options = ["Speakers", "Headphones", "HDMI"]
+default = "Speakers"
+
+# --- Media Controls ---
+
+[[command]]
+id = "media-play-pause"
+name = "Play/Pause"
+description = "Toggle media playback"
+shell = "playerctl play-pause"
+
+[[command]]
+id = "media-next"
+name = "Next Track"
+description = "Skip to next track"
+shell = "playerctl next"
+
+[[command]]
+id = "media-previous"
+name = "Previous Track"
+description = "Go to previous track"
+shell = "playerctl previous"
+
+[[command]]
+id = "media-stop"
+name = "Stop Playback"
+description = "Stop media playback"
+shell = "playerctl stop"
+
+# --- Screenshot & Recording ---
+
+[[command]]
+id = "screenshot-full"
+name = "Full Screenshot"
+description = "Capture entire screen"
+shell = "scrot ~/Pictures/screenshot-$(date +%Y%m%d-%H%M%S).png"
+
+[[command]]
+id = "screenshot-window"
+name = "Window Screenshot"
+description = "Capture active window"
+shell = "scrot -u ~/Pictures/window-$(date +%Y%m%d-%H%M%S).png"
+
+[[command]]
+id = "screenshot-selection"
+name = "Area Screenshot"
+description = "Select area to capture"
+shell = "scrot -s ~/Pictures/selection-$(date +%Y%m%d-%H%M%S).png"
+
+# --- Custom Script Example (Text Parameter) ---
+
+[[command]]
+id = "custom-script"
+name = "Run Custom Script"
+description = "Execute a custom bash script"
+shell = "bash -c {script}"
+
+[[command.parameters]]
+name = "script"
+display_name = "Script"
+type = "text"
+regex = "^[a-zA-Z0-9_./\\- ]+$"  # Allow safe characters only
+default = "echo 'Hello from HandControl'"
+
+# --- Notification Example ---
+
+[[command]]
+id = "send-notification"
+name = "Send Notification"
+description = "Display a notification on screen"
+shell = "notify-send 'HandControl' {message}"
+
+[[command.parameters]]
+name = "message"
+display_name = "Message"
+type = "text"
+default = "Command executed successfully"
+
+# --- Clipboard Management ---
+
+[[command]]
+id = "copy-text"
+name = "Copy to Clipboard"
+description = "Copy text to system clipboard"
+shell = "echo {text} | xclip -selection clipboard"
+
+[[command.parameters]]
+name = "text"
+display_name = "Text"
+type = "text"
+default = ""
+
+# --- Window Management ---
+
+[[command]]
+id = "minimize-all"
+name = "Minimize All Windows"
+description = "Minimize all open windows"
+shell = "wmctrl -k on"
+
+[[command]]
+id = "workspace-switch"
+name = "Switch Workspace"
+description = "Change to a different workspace"
+shell = "wmctrl -s {workspace}"
+
+[[command.parameters]]
+name = "workspace"
+display_name = "Workspace Number"
+type = "slider"
+min = 0
+max = 9
+default = 0

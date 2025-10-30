@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.ui.theme.HandControlTheme
+import timber.log.Timber
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -56,6 +57,7 @@ fun ApprovalPairingScreen(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
 
     LaunchedEffect(Unit) {
+        Timber.i("ApprovalPairingScreen start host=%s port=%d serverId=%s", serverHost, serverPort, serverId)
         viewModel.requestApprovalPairing(serverHost, serverPort, serverId)
     }
 

@@ -138,13 +138,21 @@ fun QrScannerScreen(
                     CameraPreviewView(
                         onQrCodeDetected = { qrData ->
                             try {
-                                // Parse QR code JSON: {"host":"192.168.1.100","port":8443,"token":"abc123"}
+                                // Parse QR code JSON per PRD specification:
+                                // {"ip":"192.168.1.100","port":50051,"cert_fingerprint":"SHA256:abc123",
+                                //  "enrollment_token":"uuid","server_id":"uuid"}
                                 val json = org.json.JSONObject(qrData)
-                                val host = json.getString("host")
+                                val host = json.getString("ip")
                                 val port = json.getInt("port")
-                                val token = json.getString("token")
+                                val token = json.getString("enrollment_token")
+                                val fingerprint = json.optString("cert_fingerprint", null)
+                                val serverId = json.optString("server_id", null)
 
-                                Timber.i("QR code scanned: host=$host, port=$port")
+                                Timber.i("QR code scanned: ip=$host, port=$port, server_id=$serverId")
+
+                                // TODO: Validate cert_fingerprint matches server certificate
+                                // TODO: Store server_id for verification code generation
+
                                 viewModel.enrollWithQrCode(host, port, token)
                             } catch (e: Exception) {
                                 Timber.e(e, "Failed to parse QR code")

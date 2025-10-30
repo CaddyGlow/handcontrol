@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -8,11 +11,15 @@ use uuid::Uuid;
 
 use super::proto::remote_control_server::{RemoteControl, RemoteControlServer};
 use super::proto::{
-    CheckPairingStatusRequest, CheckPairingStatusResponse, EnrollRequest, EnrollResponse,
-    ExecuteCommandRequest, ExecuteCommandResponse, ListCommandsRequest, ListCommandsResponse,
-    RequestPairingRequest, RequestPairingResponse, ServerInfoRequest, ServerInfoResponse,
+    ApprovePairingRequest, ApprovePairingResponse, CheckPairingStatusRequest,
+    CheckPairingStatusResponse, EnrollRequest, EnrollResponse, ExecuteCommandRequest,
+    ExecuteCommandResponse, GenerateEnrollmentQrRequest, GenerateEnrollmentQrResponse,
+    ListCommandsRequest, ListCommandsResponse, ListPendingPairingsRequest,
+    ListPendingPairingsResponse, PendingPairingInfo, RequestPairingRequest,
+    RequestPairingResponse, ServerInfoRequest, ServerInfoResponse,
 };
 
+use crate::cli::approve::approve_pairing_request;
 use crate::config::Config;
 use crate::notifications::NotificationManager;
 use crate::security::certificates::{ClientCertificate, ServerCertificate};
@@ -62,10 +69,7 @@ impl RemoteControl for RemoteControlService {
     ) -> Result<Response<EnrollResponse>, Status> {
         let req = request.into_inner();
 
-        info!(
-            "Enrollment request from device: {}",
-            req.device_name
-        );
+        info!("Enrollment request from device: {}", req.device_name);
 
         // Check if QR code enrollment is enabled
         if !self.config.security.enrollment.qr_code_enabled {
@@ -78,11 +82,11 @@ impl RemoteControl for RemoteControlService {
         }
 
         // Validate enrollment token
-        if let Err(e) = self.enrollment_manager.validate_and_consume(&req.enrollment_token) {
-            warn!(
-                "Enrollment failed for device {}: {}",
-                req.device_name, e
-            );
+        if let Err(e) = self
+            .enrollment_manager
+            .validate_and_consume(&req.enrollment_token)
+        {
+            warn!("Enrollment failed for device {}: {}", req.device_name, e);
             return Ok(Response::new(EnrollResponse {
                 success: false,
                 client_id: String::new(),
@@ -96,9 +100,7 @@ impl RemoteControl for RemoteControlService {
                 "Enrollment failed for device {}: missing client certificate",
                 req.device_name
             );
-            return Err(Status::invalid_argument(
-                "Client certificate is required",
-            ));
+            return Err(Status::invalid_argument("Client certificate is required"));
         }
 
         // Parse client certificate
@@ -132,16 +134,107 @@ impl RemoteControl for RemoteControlService {
         }))
     }
 
+    async fn generate_enrollment_qr(
+        &self,
+        _request: Request<GenerateEnrollmentQrRequest>,
+    ) -> Result<Response<GenerateEnrollmentQrResponse>, Status> {
+        info!("GenerateEnrollmentQR RPC called");
+
+        // Check if QR code enrollment is enabled
+        if !self.config.security.enrollment.qr_code_enabled {
+            warn!("QR code enrollment is disabled");
+            return Ok(Response::new(GenerateEnrollmentQrResponse {
+                success: false,
+                qr_payload: String::new(),
+                enrollment_token: String::new(),
+                server_ip: String::new(),
+                server_port: 0,
+                server_cert_fingerprint: String::new(),
+                server_id: String::new(),
+                ttl_seconds: 0,
+                error_message: "QR code enrollment is disabled on this server".to_string(),
+            }));
+        }
+
+        // Generate enrollment token
+        let token = match self.enrollment_manager.generate_token() {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("Failed to generate enrollment token: {}", e);
+                return Ok(Response::new(GenerateEnrollmentQrResponse {
+                    success: false,
+                    qr_payload: String::new(),
+                    enrollment_token: String::new(),
+                    server_ip: String::new(),
+                    server_port: 0,
+                    server_cert_fingerprint: String::new(),
+                    server_id: String::new(),
+                    ttl_seconds: 0,
+                    error_message: format!("Failed to generate enrollment token: {}", e),
+                }));
+            }
+        };
+
+        // Determine server IP for clients to connect to
+        let server_ip = if self.config.server.bind_address == "0.0.0.0"
+            || self.config.server.bind_address == "::"
+        {
+            // Server is bound to all interfaces, try to get a local IP
+            get_local_ip().unwrap_or_else(|| "127.0.0.1".to_string())
+        } else {
+            self.config.server.bind_address.clone()
+        };
+        let server_port = self.config.server.port as i32;
+
+        // Create QR payload
+        let payload = crate::utils::qr::EnrollmentQrPayload::new(
+            server_ip.clone(),
+            self.config.server.port,
+            self.server_cert.fingerprint_display(),
+            token.token.clone(),
+            self.server_id,
+        );
+
+        let qr_payload = match payload.to_json() {
+            Ok(json) => json,
+            Err(e) => {
+                warn!("Failed to serialize QR payload: {}", e);
+                return Ok(Response::new(GenerateEnrollmentQrResponse {
+                    success: false,
+                    qr_payload: String::new(),
+                    enrollment_token: String::new(),
+                    server_ip: String::new(),
+                    server_port: 0,
+                    server_cert_fingerprint: String::new(),
+                    server_id: String::new(),
+                    ttl_seconds: 0,
+                    error_message: format!("Failed to serialize QR payload: {}", e),
+                }));
+            }
+        };
+
+        info!("Generated enrollment token, expires in {} seconds", self.config.security.enrollment_token_ttl);
+
+        Ok(Response::new(GenerateEnrollmentQrResponse {
+            success: true,
+            qr_payload,
+            enrollment_token: token.token,
+            server_ip,
+            server_port,
+            server_cert_fingerprint: self.server_cert.fingerprint_display(),
+            server_id: self.server_id.to_string(),
+            ttl_seconds: self.config.security.enrollment_token_ttl as i32,
+            error_message: String::new(),
+        }))
+    }
+
     async fn request_pairing(
         &self,
         request: Request<RequestPairingRequest>,
     ) -> Result<Response<RequestPairingResponse>, Status> {
         let req = request.into_inner();
 
-        info!(
-            "Pairing request from device: {}",
-            req.device_name
-        );
+        info!("Pairing request from device: {}", req.device_name);
 
         // Check if approval enrollment is enabled
         if !self.config.security.enrollment.approval_enabled {
@@ -162,9 +255,7 @@ impl RemoteControl for RemoteControlService {
                 "Pairing request failed for device {}: missing client certificate",
                 req.device_name
             );
-            return Err(Status::invalid_argument(
-                "Client certificate is required",
-            ));
+            return Err(Status::invalid_argument("Client certificate is required"));
         }
 
         // Generate verification code (server's computation)
@@ -221,10 +312,10 @@ impl RemoteControl for RemoteControlService {
 
         // Show OS notification if available
         if self.config.security.enrollment.approval_notification {
-            match self.notification_manager.show_pairing_notification(
-                &req.device_name,
-                &server_verification_code,
-            ) {
+            match self
+                .notification_manager
+                .show_pairing_notification(&req.device_name, &server_verification_code)
+            {
                 Ok(true) => {
                     info!("Pairing notification shown for device {}", req.device_name);
                 }
@@ -292,7 +383,10 @@ impl RemoteControl for RemoteControlService {
                 info!(
                     "Pairing request {} approved, client_id={}",
                     req.pairing_request_id,
-                    pairing_request.client_id.as_ref().unwrap_or(&"unknown".to_string())
+                    pairing_request
+                        .client_id
+                        .as_ref()
+                        .unwrap_or(&"unknown".to_string())
                 );
                 (
                     super::proto::PairingStatus::Approved as i32,
@@ -323,6 +417,81 @@ impl RemoteControl for RemoteControlService {
             client_id,
             error_message,
         }))
+    }
+
+    async fn approve_pairing(
+        &self,
+        request: Request<ApprovePairingRequest>,
+    ) -> Result<Response<ApprovePairingResponse>, Status> {
+        let req = request.into_inner();
+        info!(
+            "ApprovePairing RPC called for request_id={}",
+            req.pairing_request_id
+        );
+
+        let result = {
+            let mut client_store = self.client_store.lock().unwrap();
+            approve_pairing_request(
+                &req.pairing_request_id,
+                &self.pairing_manager,
+                &mut client_store,
+            )
+        };
+
+        match result {
+            Ok(client_id) => {
+                info!(
+                    "Pairing request {} approved via RPC",
+                    req.pairing_request_id
+                );
+                Ok(Response::new(ApprovePairingResponse {
+                    success: true,
+                    client_id,
+                    error_message: String::new(),
+                }))
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to approve pairing request {}: {}",
+                    req.pairing_request_id, err
+                );
+                Ok(Response::new(ApprovePairingResponse {
+                    success: false,
+                    client_id: String::new(),
+                    error_message: err.to_string(),
+                }))
+            }
+        }
+    }
+
+    async fn list_pending_pairings(
+        &self,
+        _request: Request<ListPendingPairingsRequest>,
+    ) -> Result<Response<ListPendingPairingsResponse>, Status> {
+        info!("ListPendingPairings RPC called");
+
+        let pending_requests = self.pairing_manager.list_pending();
+
+        let requests: Vec<PendingPairingInfo> = pending_requests
+            .into_iter()
+            .map(|req| {
+                let now = time::OffsetDateTime::now_utc();
+                let seconds_remaining = (req.expires_at - now).whole_seconds().max(0);
+
+                PendingPairingInfo {
+                    request_id: req.request_id,
+                    device_name: req.device_name,
+                    device_model: req.device_model.unwrap_or_default(),
+                    verification_code: req.verification_code,
+                    expires_at_unix: req.expires_at.unix_timestamp(),
+                    seconds_remaining: seconds_remaining as i32,
+                }
+            })
+            .collect();
+
+        info!("Found {} pending pairing request(s)", requests.len());
+
+        Ok(Response::new(ListPendingPairingsResponse { requests }))
     }
 
     async fn get_server_info(
@@ -570,13 +739,64 @@ pub async fn start_server(
     // TODO: Implement custom client certificate verification (see IMPLEMENTATION_GAPS.md #18)
     let tls_config = ServerTlsConfig::new().identity(identity);
 
+    let std_listener =
+        bind_tcp_listener(addr).context("Failed to bind TCP listener for gRPC server")?;
+    let listener =
+        TcpListener::from_std(std_listener).context("Failed to create async TCP listener")?;
+    let incoming = TcpListenerStream::new(listener);
+
     Server::builder()
         .tls_config(tls_config)
         .context("Failed to configure TLS")?
         .add_service(RemoteControlServer::new(service))
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await
         .context("Failed to start gRPC server")?;
 
     Ok(())
+}
+
+fn bind_tcp_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))
+        .context("Failed to create TCP socket")?;
+    socket
+        .set_reuse_address(true)
+        .context("Failed to enable SO_REUSEADDR")?;
+
+    if matches!(addr, SocketAddr::V6(_)) {
+        // Allow the IPv6 listener to accept IPv4 connections as well (dual-stack)
+        socket
+            .set_only_v6(false)
+            .context("Failed to configure dual-stack IPv6 listener")?;
+    }
+
+    socket
+        .bind(&addr.into())
+        .context("Failed to bind TCP socket to address")?;
+    socket
+        .listen(1024)
+        .context("Failed to listen on TCP socket")?;
+    socket
+        .set_nonblocking(true)
+        .context("Failed to set TCP socket to non-blocking mode")?;
+
+    Ok(socket.into())
+}
+
+/// Get local IP address (best effort)
+fn get_local_ip() -> Option<String> {
+    use std::net::UdpSocket;
+
+    // Try to connect to a public DNS server to determine local IP
+    // This doesn't actually send any data
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let local_addr = socket.local_addr().ok()?;
+
+    Some(local_addr.ip().to_string())
 }

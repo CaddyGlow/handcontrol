@@ -1,5 +1,6 @@
 package com.handcontrol.core.security
 
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 
 object VerificationCodeGenerator {
@@ -34,7 +35,7 @@ object VerificationCodeGenerator {
         // Combine fingerprints with server ID
         digest.update(clientFingerprint)
         digest.update(serverFingerprint)
-        digest.update(serverId.toByteArray())
+        digest.update(serverId.toUuidBytes())
 
         val hash = digest.digest()
 
@@ -57,5 +58,18 @@ object VerificationCodeGenerator {
         val digest = MessageDigest.getInstance("SHA-256")
         val hash = digest.digest(certificateDer)
         return "SHA256:" + hash.joinToString("") { "%02x".format(it) }
+    }
+}
+
+private fun String.toUuidBytes(): ByteArray {
+    return try {
+        val uuid = java.util.UUID.fromString(this)
+        java.nio.ByteBuffer.allocate(16)
+            .putLong(uuid.mostSignificantBits)
+            .putLong(uuid.leastSignificantBits)
+            .array()
+    } catch (e: IllegalArgumentException) {
+        // Fallback to ASCII bytes if parsing fails (shouldn't happen for valid server IDs)
+        this.toByteArray()
     }
 }

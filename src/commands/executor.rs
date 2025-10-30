@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -272,7 +272,9 @@ mod tests {
         };
 
         let mut command = make_test_command("env-test", shell_cmd, 5);
-        command.env.insert("TEST_VAR".to_string(), "test_value".to_string());
+        command
+            .env
+            .insert("TEST_VAR".to_string(), "test_value".to_string());
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let output_clone = output.clone();

@@ -110,8 +110,7 @@ mod tests {
         );
 
         let json = payload.to_json().unwrap();
-        let deserialized: EnrollmentQrPayload =
-            serde_json::from_str(&json).unwrap();
+        let deserialized: EnrollmentQrPayload = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.ip, payload.ip);
         assert_eq!(deserialized.port, payload.port);

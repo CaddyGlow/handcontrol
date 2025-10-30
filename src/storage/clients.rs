@@ -47,8 +47,12 @@ impl ClientStore {
     pub fn new(clients_dir: PathBuf) -> Result<Self> {
         // Ensure directory exists
         if !clients_dir.exists() {
-            fs::create_dir_all(&clients_dir)
-                .with_context(|| format!("Failed to create clients directory: {}", clients_dir.display()))?;
+            fs::create_dir_all(&clients_dir).with_context(|| {
+                format!(
+                    "Failed to create clients directory: {}",
+                    clients_dir.display()
+                )
+            })?;
         }
 
         let metadata_path = clients_dir.join("metadata.toml");
@@ -81,8 +85,12 @@ impl ClientStore {
         let content = toml::to_string_pretty(&self.registry)
             .context("Failed to serialize client registry")?;
 
-        fs::write(&self.metadata_path, content)
-            .with_context(|| format!("Failed to write metadata file: {}", self.metadata_path.display()))?;
+        fs::write(&self.metadata_path, content).with_context(|| {
+            format!(
+                "Failed to write metadata file: {}",
+                self.metadata_path.display()
+            )
+        })?;
 
         Ok(())
     }
@@ -94,8 +102,12 @@ impl ClientStore {
 
         // Save certificate file
         let cert_path = self.clients_dir.join(format!("{}.crt", client_id));
-        fs::write(&cert_path, &cert.cert_der)
-            .with_context(|| format!("Failed to write client certificate: {}", cert_path.display()))?;
+        fs::write(&cert_path, &cert.cert_der).with_context(|| {
+            format!(
+                "Failed to write client certificate: {}",
+                cert_path.display()
+            )
+        })?;
 
         // Add to registry
         let metadata = ClientMetadata {
@@ -131,8 +143,9 @@ impl ClientStore {
         // Remove certificate file
         let cert_path = self.clients_dir.join(format!("{}.crt", client_id));
         if cert_path.exists() {
-            fs::remove_file(&cert_path)
-                .with_context(|| format!("Failed to remove certificate: {}", cert_path.display()))?;
+            fs::remove_file(&cert_path).with_context(|| {
+                format!("Failed to remove certificate: {}", cert_path.display())
+            })?;
         }
 
         self.save_registry()?;
@@ -173,8 +186,9 @@ impl ClientStore {
     /// Load client certificate from file
     pub fn load_client_certificate(&self, client_id: &str) -> Result<ClientCertificate> {
         let cert_path = self.clients_dir.join(format!("{}.crt", client_id));
-        let cert_der = fs::read(&cert_path)
-            .with_context(|| format!("Failed to read client certificate: {}", cert_path.display()))?;
+        let cert_der = fs::read(&cert_path).with_context(|| {
+            format!("Failed to read client certificate: {}", cert_path.display())
+        })?;
 
         Ok(ClientCertificate::from_der(cert_der))
     }
@@ -220,7 +234,9 @@ mod tests {
         let client_cert = ClientCertificate::from_der(cert.cert_der);
 
         // Add client
-        let client_id = store.add_client(&client_cert, "Test Device".to_string()).unwrap();
+        let client_id = store
+            .add_client(&client_cert, "Test Device".to_string())
+            .unwrap();
 
         // Get by ID
         let metadata = store.get_client(&client_id).unwrap();
@@ -228,7 +244,9 @@ mod tests {
         assert_eq!(metadata.cert_fingerprint, client_cert.fingerprint_hex());
 
         // Get by fingerprint
-        let metadata2 = store.get_client_by_fingerprint(&client_cert.fingerprint_hex()).unwrap();
+        let metadata2 = store
+            .get_client_by_fingerprint(&client_cert.fingerprint_hex())
+            .unwrap();
         assert_eq!(metadata2.id, client_id);
     }
 
@@ -240,7 +258,9 @@ mod tests {
         let cert = ServerCertificate::generate().unwrap();
         let client_cert = ClientCertificate::from_der(cert.cert_der);
 
-        let client_id = store.add_client(&client_cert, "Test Device".to_string()).unwrap();
+        let client_id = store
+            .add_client(&client_cert, "Test Device".to_string())
+            .unwrap();
         assert_eq!(store.list_clients().len(), 1);
 
         store.remove_client(&client_id).unwrap();
@@ -256,7 +276,9 @@ mod tests {
         let cert = ServerCertificate::generate().unwrap();
         let client_cert = ClientCertificate::from_der(cert.cert_der);
 
-        let client_id = store.add_client(&client_cert, "Test Device".to_string()).unwrap();
+        let client_id = store
+            .add_client(&client_cert, "Test Device".to_string())
+            .unwrap();
         let original_last_seen = store.get_client(&client_id).unwrap().last_seen;
 
         // Wait a tiny bit to ensure time difference
@@ -278,7 +300,9 @@ mod tests {
 
         assert!(!store.is_authorized(&client_cert.fingerprint_hex()));
 
-        store.add_client(&client_cert, "Test Device".to_string()).unwrap();
+        store
+            .add_client(&client_cert, "Test Device".to_string())
+            .unwrap();
 
         assert!(store.is_authorized(&client_cert.fingerprint_hex()));
     }
@@ -294,7 +318,9 @@ mod tests {
         // Add client in first store
         let client_id = {
             let mut store = ClientStore::new(clients_dir.clone()).unwrap();
-            store.add_client(&client_cert, "Test Device".to_string()).unwrap()
+            store
+                .add_client(&client_cert, "Test Device".to_string())
+                .unwrap()
         };
 
         // Load from disk in second store

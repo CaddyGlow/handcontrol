@@ -1,9 +1,11 @@
 use anyhow::{Context, Result};
-use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{CertificateParams, DistinguishedName, KeyPair, PKCS_ECDSA_P256_SHA256, SanType};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use sha2::{Digest, Sha256};
+use std::convert::TryInto;
 use std::fs;
 use std::io::BufReader;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use time::{Duration, OffsetDateTime};
 use tracing::{info, warn};
@@ -33,6 +35,21 @@ impl ServerCertificate {
         dn.push(rcgen::DnType::CommonName, "HandControl Server");
         dn.push(rcgen::DnType::OrganizationName, "HandControl");
         params.distinguished_name = dn;
+
+        params.subject_alt_names = vec![
+            SanType::DnsName(
+                "localhost"
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("Invalid DNS name localhost: {}", e))?,
+            ),
+            SanType::DnsName(
+                "handcontrol.local"
+                    .try_into()
+                    .map_err(|e| anyhow::anyhow!("Invalid DNS name handcontrol.local: {}", e))?,
+            ),
+            SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            SanType::IpAddress(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        ];
 
         // Set validity period (10 years)
         let now = OffsetDateTime::now_utc();

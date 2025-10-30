@@ -1,0 +1,223 @@
+# HandControl Configuration Example for macOS
+# This configuration uses macOS-specific commands.
+# Copy this to ~/Library/Application Support/handcontrol/config.toml on macOS.
+
+[server]
+bind_address = "0.0.0.0"
+port = 50051
+mdns_instance_name = "Mac"
+
+[security]
+enrollment_token_ttl = 300
+
+[security.enrollment]
+qr_code_enabled = true
+approval_enabled = true
+approval_notification = true
+approval_timeout_seconds = 60
+
+[commands]
+timeout_seconds = 30
+
+# --- System Power Management ---
+
+[[command]]
+id = "lock"
+name = "Lock Screen"
+description = "Lock the screen"
+shell = "/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend"
+
+[[command]]
+id = "sleep"
+name = "Sleep"
+description = "Put Mac to sleep"
+shell = "pmset sleepnow"
+
+[[command]]
+id = "shutdown"
+name = "Shutdown"
+description = "Shutdown the Mac"
+shell = "osascript -e 'tell application \"System Events\" to shut down'"
+confirm = true
+
+[[command]]
+id = "restart"
+name = "Restart"
+description = "Restart the Mac"
+shell = "osascript -e 'tell application \"System Events\" to restart'"
+confirm = true
+
+# --- Display Management ---
+
+[[command]]
+id = "brightness"
+name = "Set Brightness"
+description = "Adjust display brightness"
+shell = "osascript -e 'tell application \"System Events\" to set brightness of display 1 to {level}'"
+
+[[command.parameters]]
+name = "level"
+display_name = "Brightness"
+type = "slider"
+min = 10
+max = 100
+default = 50
+
+[[command]]
+id = "display-sleep"
+name = "Sleep Display"
+description = "Turn off the display"
+shell = "pmset displaysleepnow"
+
+# --- Volume Control ---
+
+[[command]]
+id = "volume"
+name = "Set Volume"
+description = "Adjust system volume"
+shell = "osascript -e 'set volume output volume {level}'"
+
+[[command.parameters]]
+name = "level"
+display_name = "Volume"
+type = "slider"
+min = 0
+max = 100
+default = 50
+
+[[command]]
+id = "mute"
+name = "Mute Audio"
+description = "Mute system audio"
+shell = "osascript -e 'set volume with output muted'"
+
+[[command]]
+id = "unmute"
+name = "Unmute Audio"
+description = "Unmute system audio"
+shell = "osascript -e 'set volume without output muted'"
+
+# --- Media Controls ---
+
+[[command]]
+id = "play-pause"
+name = "Play/Pause"
+description = "Toggle media playback"
+shell = "osascript -e 'tell application \"Music\" to playpause'"
+
+[[command]]
+id = "next-track"
+name = "Next Track"
+description = "Skip to next track"
+shell = "osascript -e 'tell application \"Music\" to next track'"
+
+[[command]]
+id = "previous-track"
+name = "Previous Track"
+description = "Go to previous track"
+shell = "osascript -e 'tell application \"Music\" to previous track'"
+
+# --- Screenshot ---
+
+[[command]]
+id = "screenshot-full"
+name = "Full Screenshot"
+description = "Capture entire screen"
+shell = "screencapture -x ~/Desktop/screenshot-$(date +%Y%m%d-%H%M%S).png"
+
+[[command]]
+id = "screenshot-window"
+name = "Window Screenshot"
+description = "Capture active window"
+shell = "screencapture -w ~/Desktop/window-$(date +%Y%m%d-%H%M%S).png"
+
+[[command]]
+id = "screenshot-selection"
+name = "Area Screenshot"
+description = "Select area to capture"
+shell = "screencapture -s ~/Desktop/selection-$(date +%Y%m%d-%H%M%S).png"
+
+# --- Notification ---
+
+[[command]]
+id = "notification"
+name = "Send Notification"
+description = "Display a notification"
+shell = "osascript -e 'display notification \"{message}\" with title \"HandControl\"'"
+
+[[command.parameters]]
+name = "message"
+display_name = "Message"
+type = "text"
+default = "Command executed successfully"
+
+# --- Finder & Applications ---
+
+[[command]]
+id = "open-finder"
+name = "Open Finder"
+description = "Open Finder window"
+shell = "open -a Finder"
+
+[[command]]
+id = "open-safari"
+name = "Open Safari"
+description = "Launch Safari"
+shell = "open -a Safari {url}"
+
+[[command.parameters]]
+name = "url"
+display_name = "URL"
+type = "text"
+regex = "^https?://.*"
+default = "https://www.apple.com"
+
+[[command]]
+id = "open-terminal"
+name = "Open Terminal"
+description = "Launch Terminal"
+shell = "open -a Terminal"
+
+# --- Clipboard ---
+
+[[command]]
+id = "clipboard"
+name = "Copy to Clipboard"
+description = "Copy text to clipboard"
+shell = "echo {text} | pbcopy"
+
+[[command.parameters]]
+name = "text"
+display_name = "Text"
+type = "text"
+default = ""
+
+# --- Keyboard Brightness (MacBook) ---
+
+[[command]]
+id = "keyboard-brightness"
+name = "Keyboard Brightness"
+description = "Adjust keyboard backlight"
+shell = "osascript -e 'tell application \"System Events\" to set brightness of keyboard 1 to {level}'"
+
+[[command.parameters]]
+name = "level"
+display_name = "Brightness"
+type = "slider"
+min = 0
+max = 100
+default = 50
+
+# --- Do Not Disturb ---
+
+[[command]]
+id = "dnd-on"
+name = "Enable Do Not Disturb"
+description = "Turn on Do Not Disturb"
+shell = "shortcuts run 'Turn Do Not Disturb On'"
+
+[[command]]
+id = "dnd-off"
+name = "Disable Do Not Disturb"
+description = "Turn off Do Not Disturb"
+shell = "shortcuts run 'Turn Do Not Disturb Off'"

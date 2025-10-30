@@ -1,4 +1,4 @@
-use super::{NotificationProvider};
+use super::NotificationProvider;
 use anyhow::Result;
 use tracing::info;
 
@@ -24,7 +24,9 @@ impl NotificationProvider for FallbackNotificationProvider {
         // Log to console - user must have terminal access
         info!("=================================================================");
         info!("PAIRING REQUEST from device: {}", device_name);
-        info!("Verification code displayed in notification (check terminal or notification center)");
+        info!(
+            "Verification code displayed in notification (check terminal or notification center)"
+        );
         info!("=================================================================");
         info!("To approve or reject this request, use:");
         info!("  handcontrol approve <request-id>  # Accept the pairing");

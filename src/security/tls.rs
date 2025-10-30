@@ -17,9 +17,7 @@ pub struct AuthorizedClientVerifier {
 impl AuthorizedClientVerifier {
     /// Create a new authorized client verifier
     pub fn new(client_store: Arc<Mutex<ClientStore>>) -> Result<Self> {
-        Ok(Self {
-            client_store,
-        })
+        Ok(Self { client_store })
     }
 
     /// Verify a client certificate against the authorized clients list
@@ -30,7 +28,10 @@ impl AuthorizedClientVerifier {
         let fingerprint = Sha256::digest(cert_der);
         let fingerprint_hex = hex::encode(fingerprint);
 
-        debug!("Verifying client certificate with fingerprint: {}", fingerprint_hex);
+        debug!(
+            "Verifying client certificate with fingerprint: {}",
+            fingerprint_hex
+        );
 
         // Check if certificate is in authorized list
         let client_store = self.client_store.lock().unwrap();
@@ -38,12 +39,18 @@ impl AuthorizedClientVerifier {
 
         for client in clients {
             if client.cert_fingerprint == fingerprint_hex {
-                info!("Client certificate verified: {} ({})", client.name, client.id);
+                info!(
+                    "Client certificate verified: {} ({})",
+                    client.name, client.id
+                );
                 return Ok(());
             }
         }
 
-        warn!("Client certificate not found in authorized list: {}", fingerprint_hex);
+        warn!(
+            "Client certificate not found in authorized list: {}",
+            fingerprint_hex
+        );
         anyhow::bail!("Client certificate not authorized");
     }
 }
@@ -72,10 +79,9 @@ impl ClientCertVerifier for AuthorizedClientVerifier {
         _now: rustls::pki_types::UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
         // First, verify the certificate is in our authorized list
-        self.verify_client_cert(end_entity.as_ref())
-            .map_err(|e| {
-                rustls::Error::General(format!("Client certificate not authorized: {}", e))
-            })?;
+        self.verify_client_cert(end_entity.as_ref()).map_err(|e| {
+            rustls::Error::General(format!("Client certificate not authorized: {}", e))
+        })?;
 
         // Verify certificate is not expired
         // Note: We rely on the client certificate's validity period
@@ -147,9 +153,7 @@ pub fn build_server_config(
 }
 
 /// Create a ServerConfig without client certificate verification (for enrollment endpoints)
-pub fn build_server_config_no_client_auth(
-    server_cert: &ServerCertificate,
-) -> Result<ServerConfig> {
+pub fn build_server_config_no_client_auth(server_cert: &ServerCertificate) -> Result<ServerConfig> {
     info!("Building TLS server configuration without client authentication");
 
     // Load server certificate chain

@@ -17,8 +17,8 @@ use super::proto::{
     ExecuteCommandRequest, ExecuteCommandResponse, GenerateEnrollmentQrRequest,
     GenerateEnrollmentQrResponse, GetConfigVersionRequest, GetConfigVersionResponse,
     ListCommandsRequest, ListCommandsResponse, ListPendingPairingsRequest,
-    ListPendingPairingsResponse, PendingPairingInfo, RequestPairingRequest,
-    RequestPairingResponse, ServerInfoRequest, ServerInfoResponse, WatchConfigUpdatesRequest,
+    ListPendingPairingsResponse, PendingPairingInfo, RequestPairingRequest, RequestPairingResponse,
+    ServerInfoRequest, ServerInfoResponse, WatchConfigUpdatesRequest,
 };
 
 use crate::cli::approve::approve_pairing_request;
@@ -90,7 +90,10 @@ impl RemoteControl for RemoteControlService {
         info!(
             "Enrollment request from device: {} (IP: {})",
             req.device_name,
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Check if QR code enrollment is enabled
@@ -204,24 +207,23 @@ impl RemoteControl for RemoteControlService {
         };
 
         // Determine server IPs for clients to connect to
-        let server_ips = if config.server.bind_address == "0.0.0.0"
-            || config.server.bind_address == "::"
-        {
-            // Server is bound to all interfaces, get all usable local IPs with network config
-            let network_options = crate::utils::network::NetworkOptions {
-                include_link_local_ipv6: config.network.include_link_local,
-                prefer_stable_addresses: config.network.prefer_stable_addresses,
-                max_addresses: Some(config.network.max_advertised_addresses),
-            };
-            let ips = crate::utils::network::get_all_local_ips_with_options(&network_options);
-            if ips.is_empty() {
-                vec!["127.0.0.1".to_string()]
+        let server_ips =
+            if config.server.bind_address == "0.0.0.0" || config.server.bind_address == "::" {
+                // Server is bound to all interfaces, get all usable local IPs with network config
+                let network_options = crate::utils::network::NetworkOptions {
+                    include_link_local_ipv6: config.network.include_link_local,
+                    prefer_stable_addresses: config.network.prefer_stable_addresses,
+                    max_addresses: Some(config.network.max_advertised_addresses),
+                };
+                let ips = crate::utils::network::get_all_local_ips_with_options(&network_options);
+                if ips.is_empty() {
+                    vec!["127.0.0.1".to_string()]
+                } else {
+                    ips
+                }
             } else {
-                ips
-            }
-        } else {
-            vec![config.server.bind_address.clone()]
-        };
+                vec![config.server.bind_address.clone()]
+            };
         let server_port = config.server.port as i32;
 
         // Create QR payload
@@ -252,7 +254,10 @@ impl RemoteControl for RemoteControlService {
             }
         };
 
-        info!("Generated enrollment token, expires in {} seconds", config.security.enrollment_token_ttl);
+        info!(
+            "Generated enrollment token, expires in {} seconds",
+            config.security.enrollment_token_ttl
+        );
 
         Ok(Response::new(GenerateEnrollmentQrResponse {
             success: true,
@@ -264,7 +269,7 @@ impl RemoteControl for RemoteControlService {
             enrollment_token: token.token,
             ttl_seconds: config.security.enrollment_token_ttl as i32,
             error_message: String::new(),
-            relay_info: None,  // Future relay support
+            relay_info: None, // Future relay support
         }))
     }
 
@@ -283,7 +288,10 @@ impl RemoteControl for RemoteControlService {
         info!(
             "Pairing request from device: {} (IP: {})",
             req.device_name,
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Read config once and use it throughout
@@ -424,7 +432,10 @@ impl RemoteControl for RemoteControlService {
         info!(
             "CheckPairingStatus RPC called: request_id={} (IP: {})",
             req.pairing_request_id,
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Get pairing request
@@ -511,7 +522,10 @@ impl RemoteControl for RemoteControlService {
         info!(
             "ApprovePairing RPC called for request_id={} (IP: {})",
             req.pairing_request_id,
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         let result = {
@@ -592,7 +606,10 @@ impl RemoteControl for RemoteControlService {
 
         info!(
             "GetServerInfo RPC called (IP: {})",
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Get hostname
@@ -629,7 +646,10 @@ impl RemoteControl for RemoteControlService {
 
         info!(
             "ListCommands RPC called (IP: {})",
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Read config once and use it throughout
@@ -665,6 +685,8 @@ impl RemoteControl for RemoteControlService {
                             validation: p.validation.clone(),
                             label_on: p.label_on.clone(),
                             label_off: p.label_off.clone(),
+                            default_value_command: p.default_value_command.clone(),
+                            default_value_pattern: p.default_value_pattern.clone(),
                         }
                     })
                     .collect();
@@ -676,11 +698,17 @@ impl RemoteControl for RemoteControlService {
                     icon: cmd.icon.clone().unwrap_or_default(),
                     tags: cmd.tags.clone(),
                     parameters,
+                    requires_confirmation: Some(cmd.requires_confirmation),
+                    show_output: Some(cmd.show_output),
                 }
             })
             .collect();
 
-        info!("Returning {} commands (config version {})", commands.len(), config_version);
+        info!(
+            "Returning {} commands (config version {})",
+            commands.len(),
+            config_version
+        );
 
         Ok(Response::new(ListCommandsResponse {
             commands,
@@ -706,7 +734,10 @@ impl RemoteControl for RemoteControlService {
         info!(
             "ExecuteCommand RPC called: command_id={} (IP: {})",
             req.command_id,
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Read config and find command
@@ -846,13 +877,19 @@ impl RemoteControl for RemoteControlService {
 
         info!(
             "GetConfigVersion RPC called (IP: {})",
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         let config_version = self.config_version.load(Ordering::SeqCst);
         let last_updated_ms = self.last_config_update.load(Ordering::SeqCst) as i64;
 
-        info!("Returning config version {} (last updated: {}ms)", config_version, last_updated_ms);
+        info!(
+            "Returning config version {} (last updated: {}ms)",
+            config_version, last_updated_ms
+        );
 
         Ok(Response::new(GetConfigVersionResponse {
             config_version,
@@ -875,7 +912,10 @@ impl RemoteControl for RemoteControlService {
 
         info!(
             "WatchConfigUpdates RPC called - starting config update stream (IP: {})",
-            client_ip.as_ref().map(|ip| ip.to_string()).unwrap_or_else(|| "unknown".to_string())
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
         );
 
         // Subscribe to config updates

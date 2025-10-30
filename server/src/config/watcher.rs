@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::broadcaster::{ConfigBroadcaster, ConfigUpdateNotification};
-use super::parser::{load_config, Config};
+use super::parser::{Config, load_config};
 
 /// Watches config file for changes and triggers hot-reload
 pub struct ConfigWatcher {
@@ -38,7 +38,10 @@ impl ConfigWatcher {
 
     /// Start watching the config file for changes
     pub async fn start(self) -> Result<()> {
-        info!("Starting config file watcher: {}", self.config_path.display());
+        info!(
+            "Starting config file watcher: {}",
+            self.config_path.display()
+        );
 
         let (tx, mut rx) = mpsc::channel(100);
 

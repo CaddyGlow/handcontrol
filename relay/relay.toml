@@ -1,6 +1,6 @@
 # Address and port the relay listens on.
 bind_address = "0.0.0.0"
-port = 443
+port = 8443
 
 # Seconds to wait for both tunnel endpoints to send `tunnel_ready`.
 handshake_timeout_seconds = 5

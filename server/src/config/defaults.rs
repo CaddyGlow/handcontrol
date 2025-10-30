@@ -55,6 +55,8 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
             timeout_seconds: 5,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: false,
+            show_output: true,
         },
         CommandConfig {
             id: "suspend".to_string(),
@@ -66,6 +68,8 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
             timeout_seconds: 5,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: true,
+            show_output: true,
         },
         CommandConfig {
             id: "set-volume".to_string(),
@@ -88,7 +92,11 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 label_on: None,
                 label_off: None,
                 step: Some(5),
+                default_value_command: None,
+                default_value_pattern: None,
             }],
+            requires_confirmation: false,
+            show_output: false,
         },
         CommandConfig {
             id: "toggle-mute".to_string(),
@@ -111,7 +119,11 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 label_on: Some("Mute".to_string()),
                 label_off: Some("Unmute".to_string()),
                 step: None,
+                default_value_command: None,
+                default_value_pattern: None,
             }],
+            requires_confirmation: false,
+            show_output: false,
         },
     ]
 }
@@ -129,6 +141,8 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
             timeout_seconds: 5,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: false,
+            show_output: true,
         },
         CommandConfig {
             id: "shutdown".to_string(),
@@ -140,6 +154,8 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
             timeout_seconds: 5,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: true,
+            show_output: true,
         },
     ]
 }
@@ -157,6 +173,8 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
             timeout_seconds: 5,
             env: HashMap::new(),
             parameters: vec![],
+            requires_confirmation: false,
+            show_output: true,
         },
         CommandConfig {
             id: "set-volume".to_string(),
@@ -179,7 +197,11 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 label_on: None,
                 label_off: None,
                 step: Some(5),
+                default_value_command: None,
+                default_value_pattern: None,
             }],
+            requires_confirmation: false,
+            show_output: false,
         },
     ]
 }

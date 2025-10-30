@@ -134,6 +134,10 @@ pub struct CommandConfig {
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub parameters: Vec<ParameterConfig>,
+    #[serde(default)]
+    pub requires_confirmation: bool,
+    #[serde(default = "default_true")]
+    pub show_output: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -151,6 +155,8 @@ pub struct ParameterConfig {
     pub label_on: Option<String>,
     pub label_off: Option<String>,
     pub step: Option<i32>,
+    pub default_value_command: Option<String>,
+    pub default_value_pattern: Option<String>,
 }
 
 // Default value functions

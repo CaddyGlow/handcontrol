@@ -3,10 +3,10 @@ use std::net::{IpAddr, Ipv6Addr, SocketAddr, UdpSocket};
 /// IPv6 address scope classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ipv6AddressScope {
-    LinkLocal,      // fe80::/10
-    UniqueLocal,    // fc00::/7 (ULA)
-    Global,         // 2000::/3
-    Multicast,      // ff00::/8
+    LinkLocal,   // fe80::/10
+    UniqueLocal, // fc00::/7 (ULA)
+    Global,      // 2000::/3
+    Multicast,   // ff00::/8
     Other,
 }
 
@@ -83,7 +83,10 @@ impl AddressPriority {
             }
         };
 
-        Self { score, is_temporary }
+        Self {
+            score,
+            is_temporary,
+        }
     }
 }
 
@@ -247,10 +250,7 @@ fn should_filter_interface(name: &str) -> bool {
     let name_lower = name.to_lowercase();
 
     // Docker interfaces
-    if name_lower == "docker0"
-        || name_lower.starts_with("br-")
-        || name_lower.starts_with("veth")
-    {
+    if name_lower == "docker0" || name_lower.starts_with("br-") || name_lower.starts_with("veth") {
         return true;
     }
 

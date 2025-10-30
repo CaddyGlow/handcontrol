@@ -55,11 +55,8 @@ mod tests {
     #[test]
     fn test_fallback_show_notification() {
         let provider = FallbackNotificationProvider::new();
-        let result = provider.show_pairing_notification(
-            "Test Device",
-            "123-456",
-            "test-request-id-123",
-        );
+        let result =
+            provider.show_pairing_notification("Test Device", "123-456", "test-request-id-123");
         assert!(result.is_ok());
         assert!(result.unwrap());
     }

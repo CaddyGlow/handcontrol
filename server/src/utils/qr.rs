@@ -6,7 +6,7 @@ use uuid::Uuid;
 /// QR code payload for enrollment
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnrollmentQrPayload {
-    pub ips: Vec<String>,  // Changed from single ip (Breaking change)
+    pub ips: Vec<String>, // Changed from single ip (Breaking change)
     pub port: u16,
     pub cert_fingerprint: String,
     pub enrollment_token: String,

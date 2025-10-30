@@ -49,7 +49,11 @@ pub fn approve_pairing_request(
     let client_cert = ClientCertificate::from_der(request.client_certificate.clone());
 
     // Store client certificate with IP from pairing request
-    let client_id = client_store.add_client(&client_cert, request.device_name.clone(), request.ip_address)?;
+    let client_id = client_store.add_client(
+        &client_cert,
+        request.device_name.clone(),
+        request.ip_address,
+    )?;
 
     // Mark as approved
     pairing_manager.approve_request(request_id, client_id.clone())?;

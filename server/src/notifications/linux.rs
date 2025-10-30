@@ -109,11 +109,8 @@ mod tests {
 
         // Only test if D-Bus is available
         if provider.is_available() {
-            let result = provider.show_pairing_notification(
-                "Test Device",
-                "123-456",
-                "test-request-id-123",
-            );
+            let result =
+                provider.show_pairing_notification("Test Device", "123-456", "test-request-id-123");
             // Should succeed or fail gracefully
             assert!(result.is_ok() || result.is_err());
         }

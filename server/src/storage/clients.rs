@@ -114,7 +114,12 @@ impl ClientStore {
     }
 
     /// Add a new authorized client
-    pub fn add_client(&mut self, cert: &ClientCertificate, device_name: String, ip: Option<IpAddr>) -> Result<String> {
+    pub fn add_client(
+        &mut self,
+        cert: &ClientCertificate,
+        device_name: String,
+        ip: Option<IpAddr>,
+    ) -> Result<String> {
         let client_id = Uuid::new_v4().to_string();
         let now = OffsetDateTime::now_utc();
 
@@ -212,7 +217,9 @@ impl ClientStore {
                 let ip_str = ip.to_string();
 
                 // Only add if it's different from the most recent IP or if history is empty
-                let should_add = client.ip_history.last()
+                let should_add = client
+                    .ip_history
+                    .last()
                     .map(|last| last.ip_address != ip_str)
                     .unwrap_or(true);
 
@@ -225,7 +232,9 @@ impl ClientStore {
                     // Keep only the last 100 connections to prevent unbounded growth
                     const MAX_IP_HISTORY: usize = 100;
                     if client.ip_history.len() > MAX_IP_HISTORY {
-                        client.ip_history.drain(0..client.ip_history.len() - MAX_IP_HISTORY);
+                        client
+                            .ip_history
+                            .drain(0..client.ip_history.len() - MAX_IP_HISTORY);
                     }
                 }
             }

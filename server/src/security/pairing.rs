@@ -351,10 +351,22 @@ mod tests {
 
         // Create multiple expired requests
         manager
-            .create_request("Device 1".to_string(), None, vec![1], "111-111".to_string(), None)
+            .create_request(
+                "Device 1".to_string(),
+                None,
+                vec![1],
+                "111-111".to_string(),
+                None,
+            )
             .unwrap();
         manager
-            .create_request("Device 2".to_string(), None, vec![2], "222-222".to_string(), None)
+            .create_request(
+                "Device 2".to_string(),
+                None,
+                vec![2],
+                "222-222".to_string(),
+                None,
+            )
             .unwrap();
 
         thread::sleep(StdDuration::from_millis(10));
@@ -362,7 +374,13 @@ mod tests {
         // Create a new request, which should trigger cleanup
         let manager2 = PairingRequestManager::new(60);
         manager2
-            .create_request("Device 3".to_string(), None, vec![3], "333-333".to_string(), None)
+            .create_request(
+                "Device 3".to_string(),
+                None,
+                vec![3],
+                "333-333".to_string(),
+                None,
+            )
             .unwrap();
 
         // Only the new request should be pending

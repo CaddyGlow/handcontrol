@@ -255,8 +255,7 @@ mod tests {
         assert!(manager.is_available());
 
         // Use the manager to show a notification
-        let result =
-            manager.show_pairing_notification("MyPhone", "654321", "test-request");
+        let result = manager.show_pairing_notification("MyPhone", "654321", "test-request");
         assert!(result.is_ok());
         assert!(result.unwrap());
 

@@ -1,24 +1,26 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use handcontrol::config::{default_config_path, load_config, validate_config, ConfigBroadcaster, ConfigWatcher};
+use handcontrol::config::{
+    ConfigBroadcaster, ConfigWatcher, default_config_path, load_config, validate_config,
+};
+use handcontrol::grpc::proto::remote_control_client::RemoteControlClient;
 use handcontrol::grpc::proto::{
     ApprovePairingRequest, GenerateEnrollmentQrRequest, ListPendingPairingsRequest,
 };
-use handcontrol::grpc::proto::remote_control_client::RemoteControlClient;
-use std::sync::atomic::AtomicU64;
 use handcontrol::grpc::server::{RemoteControlService, start_server};
 use handcontrol::mdns::service::MdnsService;
 use handcontrol::notifications::NotificationManager;
 use handcontrol::security::certificates::ensure_server_certificate;
 use handcontrol::security::enrollment::EnrollmentTokenManager;
 use handcontrol::security::pairing::PairingRequestManager;
+use handcontrol::storage;
 use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
-use handcontrol::storage;
 use handcontrol::utils::logging;
 use handcontrol::utils::network::get_all_local_ips;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tracing::info;
@@ -510,7 +512,7 @@ async fn start_handcontrol_server() -> Result<()> {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_millis() as u64
+            .as_millis() as u64,
     ));
 
     // Wrap config in RwLock for hot-reload support

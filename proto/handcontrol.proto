@@ -156,6 +156,10 @@ message Command {
   string icon = 4;
   repeated string tags = 5;
   repeated Parameter parameters = 6;
+
+  // Execution behavior flags
+  optional bool requires_confirmation = 7;   // Show confirmation dialog before execution
+  optional bool show_output = 8;             // Show output screen after execution (default: true)
 }
 
 message Parameter {
@@ -171,6 +175,10 @@ message Parameter {
   optional string validation = 8;   // Regex for text
   optional string label_on = 9;     // For toggle
   optional string label_off = 10;   // For toggle
+
+  // Dynamic default value support
+  optional string default_value_command = 11;  // Shell command to get current value
+  optional string default_value_pattern = 12;  // Regex pattern to extract value from output
 }
 
 enum ParameterType {

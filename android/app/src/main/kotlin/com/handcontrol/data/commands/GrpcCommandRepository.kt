@@ -75,9 +75,13 @@ class GrpcCommandRepository @Inject constructor(
                             options = protoParam.optionsList,
                             validation = if (protoParam.hasValidation()) protoParam.validation else null,
                             labelOn = if (protoParam.hasLabelOn()) protoParam.labelOn else null,
-                            labelOff = if (protoParam.hasLabelOff()) protoParam.labelOff else null
+                            labelOff = if (protoParam.hasLabelOff()) protoParam.labelOff else null,
+                            defaultValueCommand = if (protoParam.hasDefaultValueCommand()) protoParam.defaultValueCommand else null,
+                            defaultValuePattern = if (protoParam.hasDefaultValuePattern()) protoParam.defaultValuePattern else null
                         )
-                    }
+                    },
+                    requiresConfirmation = if (protoCommand.hasRequiresConfirmation()) protoCommand.requiresConfirmation else false,
+                    showOutput = if (protoCommand.hasShowOutput()) protoCommand.showOutput else true
                 )
             }
 

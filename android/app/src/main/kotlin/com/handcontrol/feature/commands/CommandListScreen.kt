@@ -33,6 +33,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -51,7 +53,9 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterType
+import com.handcontrol.ui.components.CommandConfirmationDialog
 import com.handcontrol.ui.theme.HandControlTheme
+import kotlinx.coroutines.flow.collectLatest
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -65,12 +69,24 @@ fun CommandListScreen(
     viewModel: CommandListViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    var showConfirmationDialog by remember { mutableStateOf(false) }
+    var selectedCommand by remember { mutableStateOf<Command?>(null) }
 
     LaunchedEffect(Unit) {
         viewModel.loadCommands(serverHost, serverPort)
     }
 
+    // Collect toast messages
+    LaunchedEffect(Unit) {
+        viewModel.toastMessage.collectLatest { message ->
+            snackbarHostState.showSnackbar(message)
+        }
+    }
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = {
@@ -145,11 +161,79 @@ fun CommandListScreen(
                                 viewModel.searchCommands(query)
                             },
                             onCommandClick = { command ->
-                                onNavigateToCommandExecution(serverHost, serverPort, command.id)
+                                handleCommandClick(
+                                    command = command,
+                                    viewModel = viewModel,
+                                    onNavigateToExecution = {
+                                        onNavigateToCommandExecution(serverHost, serverPort, command.id)
+                                    },
+                                    onShowConfirmation = {
+                                        selectedCommand = command
+                                        showConfirmationDialog = true
+                                    }
+                                )
                             }
                         )
                     }
                 }
+            }
+        }
+    }
+
+    // Confirmation dialog
+    if (showConfirmationDialog && selectedCommand != null) {
+        CommandConfirmationDialog(
+            command = selectedCommand!!,
+            onConfirm = {
+                val cmd = selectedCommand!!
+                viewModel.executeCommandWithMode(
+                    commandId = cmd.id,
+                    commandName = cmd.name,
+                    parameters = emptyMap(),
+                    showOutput = cmd.showOutput
+                )
+                if (cmd.showOutput) {
+                    onNavigateToCommandExecution(serverHost, serverPort, cmd.id)
+                }
+                showConfirmationDialog = false
+                selectedCommand = null
+            },
+            onDismiss = {
+                showConfirmationDialog = false
+                selectedCommand = null
+            }
+        )
+    }
+}
+
+/**
+ * Determine how to handle command click based on parameters and flags
+ */
+private fun handleCommandClick(
+    command: Command,
+    viewModel: CommandListViewModel,
+    onNavigateToExecution: () -> Unit,
+    onShowConfirmation: () -> Unit
+) {
+    when {
+        // Has parameters - always show parameter screen
+        command.parameters.isNotEmpty() -> {
+            onNavigateToExecution()
+        }
+        // No parameters but requires confirmation
+        command.requiresConfirmation -> {
+            onShowConfirmation()
+        }
+        // No parameters, no confirmation - immediate execution
+        else -> {
+            viewModel.executeCommandWithMode(
+                commandId = command.id,
+                commandName = command.name,
+                parameters = emptyMap(),
+                showOutput = command.showOutput
+            )
+            if (command.showOutput) {
+                onNavigateToExecution()
             }
         }
     }

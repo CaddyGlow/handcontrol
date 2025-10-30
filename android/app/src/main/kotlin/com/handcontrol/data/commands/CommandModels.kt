@@ -9,7 +9,9 @@ data class Command(
     val description: String,
     val icon: String,
     val tags: List<String>,
-    val parameters: List<CommandParameter>
+    val parameters: List<CommandParameter>,
+    val requiresConfirmation: Boolean = false,
+    val showOutput: Boolean = true
 )
 
 /**
@@ -25,7 +27,9 @@ data class CommandParameter(
     val options: List<String> = emptyList(),
     val validation: String? = null,
     val labelOn: String? = null,
-    val labelOff: String? = null
+    val labelOff: String? = null,
+    val defaultValueCommand: String? = null,
+    val defaultValuePattern: String? = null
 )
 
 /**
@@ -57,3 +61,22 @@ data class ServerInfo(
     val version: String,
     val os: String
 )
+
+/**
+ * Represents the current state of a parameter input in the UI
+ */
+data class ParameterInputState(
+    val parameter: com.handcontrol.grpc.Parameter,
+    val currentValue: String,
+    val validationResult: ValidationResult,
+    val isDirty: Boolean = false
+)
+
+/**
+ * Result of parameter validation
+ */
+sealed class ValidationResult {
+    object Valid : ValidationResult()
+    data class Invalid(val message: String) : ValidationResult()
+    object Pending : ValidationResult()
+}

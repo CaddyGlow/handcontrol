@@ -8,9 +8,13 @@ import com.handcontrol.data.commands.CommandRepository
 import com.handcontrol.data.commands.ServerInfo
 import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
@@ -59,6 +63,9 @@ class CommandListViewModel @Inject constructor(
 
     private val _executionState = MutableStateFlow<CommandExecutionState>(CommandExecutionState.Idle)
     val executionState: StateFlow<CommandExecutionState> = _executionState.asStateFlow()
+
+    private val _toastMessage = MutableSharedFlow<String>()
+    val toastMessage: SharedFlow<String> = _toastMessage.asSharedFlow()
 
     private var currentHost: String? = null
     private var currentPort: Int? = null
@@ -187,5 +194,157 @@ class CommandListViewModel @Inject constructor(
         val host = currentHost ?: return
         val port = currentPort ?: return
         loadCommands(host, port)
+    }
+
+    /**
+     * Execute command with mode-specific behavior (show/hide output)
+     */
+    fun executeCommandWithMode(
+        commandId: String,
+        commandName: String,
+        parameters: Map<String, String>,
+        showOutput: Boolean
+    ) {
+        val host = currentHost ?: return
+        val port = currentPort ?: return
+
+        viewModelScope.launch {
+            try {
+                if (showOutput) {
+                    // Standard execution with output screen
+                    _executionState.value = CommandExecutionState.Executing(
+                        commandId = commandId,
+                        commandName = commandName,
+                        output = emptyList()
+                    )
+                }
+
+                Timber.i("Executing command: $commandId (showOutput=$showOutput)")
+
+                commandRepository.executeCommand(host, port, commandId, parameters)
+                    .catch { e ->
+                        Timber.e(e, "Command execution failed")
+                        if (showOutput) {
+                            _executionState.value = CommandExecutionState.Failed(
+                                e.message ?: "Execution failed"
+                            )
+                        } else {
+                            _toastMessage.emit("Error: ${e.message}")
+                        }
+                    }
+                    .collect { result ->
+                        when (result) {
+                            is CommandExecutionResult.Output -> {
+                                if (showOutput) {
+                                    val currentState = _executionState.value
+                                    if (currentState is CommandExecutionState.Executing) {
+                                        val newOutput = currentState.output + CommandOutputLine(
+                                            text = result.text,
+                                            isError = result.isError
+                                        )
+                                        _executionState.value = currentState.copy(output = newOutput)
+                                    }
+                                }
+                            }
+                            is CommandExecutionResult.ExitCode -> {
+                                Timber.i("Command completed with exit code: ${result.code}")
+                                if (showOutput) {
+                                    val currentState = _executionState.value
+                                    if (currentState is CommandExecutionState.Executing) {
+                                        _executionState.value = CommandExecutionState.Completed(
+                                            commandId = commandId,
+                                            commandName = commandName,
+                                            exitCode = result.code,
+                                            output = currentState.output
+                                        )
+                                    }
+                                } else {
+                                    // Show toast notification
+                                    val message = if (result.code == 0) {
+                                        "$commandName completed successfully"
+                                    } else {
+                                        "$commandName failed (exit code: ${result.code})"
+                                    }
+                                    _toastMessage.emit(message)
+                                }
+                            }
+                            is CommandExecutionResult.Error -> {
+                                Timber.e("Command failed: ${result.message}")
+                                if (showOutput) {
+                                    _executionState.value = CommandExecutionState.Failed(result.message)
+                                } else {
+                                    _toastMessage.emit("Error: ${result.message}")
+                                }
+                            }
+                        }
+                    }
+            } catch (e: Exception) {
+                Timber.e(e, "Command execution exception")
+                if (showOutput) {
+                    _executionState.value = CommandExecutionState.Failed(e.message ?: "Unknown error")
+                } else {
+                    _toastMessage.emit("Error: ${e.message}")
+                }
+            }
+        }
+    }
+
+    /**
+     * Fetch dynamic default value for a parameter by executing a command
+     */
+    suspend fun fetchDynamicDefault(
+        command: String,
+        pattern: String?,
+        fallback: String
+    ): String {
+        val host = currentHost ?: return fallback
+        val port = currentPort ?: return fallback
+
+        return try {
+            val outputBuilder = StringBuilder()
+
+            // Execute the command and collect output
+            commandRepository.executeCommand(host, port, "_dynamic_default", mapOf("_cmd" to command))
+                .catch { e ->
+                    Timber.w(e, "Failed to fetch dynamic default")
+                    emit(CommandExecutionResult.Error(e.message ?: "Failed"))
+                }
+                .collect { result ->
+                    when (result) {
+                        is CommandExecutionResult.Output -> {
+                            if (!result.isError) {
+                                outputBuilder.append(result.text)
+                            }
+                        }
+                        is CommandExecutionResult.ExitCode -> {
+                            if (result.code != 0) {
+                                Timber.w("Dynamic default command exited with code ${result.code}")
+                            }
+                        }
+                        is CommandExecutionResult.Error -> {
+                            Timber.w("Dynamic default error: ${result.message}")
+                        }
+                    }
+                }
+
+            val output = outputBuilder.toString().trim()
+
+            // Apply pattern if provided
+            if (pattern != null && pattern.isNotBlank()) {
+                try {
+                    val regex = Regex(pattern)
+                    val match = regex.find(output)
+                    match?.groupValues?.getOrNull(1) ?: fallback
+                } catch (e: Exception) {
+                    Timber.w(e, "Failed to apply pattern: $pattern")
+                    fallback
+                }
+            } else {
+                output.ifEmpty { fallback }
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to fetch dynamic default")
+            fallback
+        }
     }
 }

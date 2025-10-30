@@ -24,9 +24,9 @@ sealed interface EnrollmentUiState {
         val verificationCode: String,
         val timeoutSeconds: Int
     ) : EnrollmentUiState
-    data class Success(val clientId: String) : EnrollmentUiState
+    data class Success(val clientId: String, val serverId: String) : EnrollmentUiState
     data class Error(val message: String) : EnrollmentUiState
-    data class AlreadyEnrolled(val serverName: String) : EnrollmentUiState
+    data class AlreadyEnrolled(val serverName: String, val serverId: String) : EnrollmentUiState
 }
 
 @HiltViewModel
@@ -38,7 +38,13 @@ class EnrollmentViewModel @Inject constructor(
     private val _uiState = MutableStateFlow<EnrollmentUiState>(EnrollmentUiState.Idle)
     val uiState: StateFlow<EnrollmentUiState> = _uiState.asStateFlow()
 
-    fun enrollWithQrCode(hosts: List<String>, port: Int, token: String) {
+    fun enrollWithQrCode(
+        hosts: List<String>,
+        port: Int,
+        token: String,
+        certFingerprint: String,
+        serverId: String
+    ) {
         viewModelScope.launch {
             try {
                 // Check if server is already enrolled (check first host)
@@ -50,7 +56,7 @@ class EnrollmentViewModel @Inject constructor(
                 val existingServer = enrolledServerRepository.getServerByHostAndPort(primaryHost, port)
                 if (existingServer != null) {
                     Timber.i("Server already enrolled: ${existingServer.serverName}")
-                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName)
+                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName, existingServer.serverId)
                     return@launch
                 }
 
@@ -58,12 +64,19 @@ class EnrollmentViewModel @Inject constructor(
                 Timber.i("Enrolling with QR code using ${hosts.size} IP addresses")
 
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"
-                val result = enrollmentRepository.enrollWithToken(hosts, port, token, deviceName)
+                val result = enrollmentRepository.enrollWithToken(
+                    hosts = hosts,
+                    port = port,
+                    token = token,
+                    deviceName = deviceName,
+                    expectedCertFingerprint = certFingerprint,
+                    expectedServerId = serverId
+                )
 
                 when (result) {
                     is EnrollmentResult.Success -> {
                         Timber.i("QR enrollment successful")
-                        _uiState.value = EnrollmentUiState.Success(result.clientId)
+                        _uiState.value = EnrollmentUiState.Success(result.clientId, result.serverId)
                     }
                     is EnrollmentResult.Error -> {
                         Timber.w("QR enrollment failed: ${result.message}")
@@ -88,7 +101,7 @@ class EnrollmentViewModel @Inject constructor(
                 val existingServer = enrolledServerRepository.getServerByHostAndPort(host, port)
                 if (existingServer != null) {
                     Timber.i("Server already enrolled: ${existingServer.serverName}")
-                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName)
+                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName, existingServer.serverId)
                     return@launch
                 }
 
@@ -111,7 +124,7 @@ class EnrollmentViewModel @Inject constructor(
                     }
                     is EnrollmentResult.Success -> {
                         Timber.i("Approval pairing immediately approved")
-                        _uiState.value = EnrollmentUiState.Success(result.clientId)
+                        _uiState.value = EnrollmentUiState.Success(result.clientId, result.serverId)
                     }
                     is EnrollmentResult.Error -> {
                         Timber.w("Approval pairing failed: ${result.message}")
@@ -146,7 +159,7 @@ class EnrollmentViewModel @Inject constructor(
                     when (result) {
                         is EnrollmentResult.Success -> {
                             Timber.i("Approval pairing approved!")
-                            _uiState.value = EnrollmentUiState.Success(result.clientId)
+                            _uiState.value = EnrollmentUiState.Success(result.clientId, result.serverId)
                             break
                         }
                         is EnrollmentResult.Pending -> {

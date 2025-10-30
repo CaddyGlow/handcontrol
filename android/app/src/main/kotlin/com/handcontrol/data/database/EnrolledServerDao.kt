@@ -30,6 +30,9 @@ interface EnrolledServerDao {
     @Query("UPDATE enrolled_servers SET last_connected = :timestamp WHERE serverId = :serverId")
     suspend fun updateLastConnected(serverId: String, timestamp: Long)
 
+    @Query("UPDATE enrolled_servers SET last_connected = :timestamp, lastConnectionMode = :mode WHERE serverId = :serverId")
+    suspend fun updateConnectionMode(serverId: String, timestamp: Long, mode: ConnectionMode)
+
     @Delete
     suspend fun deleteServer(server: EnrolledServerEntity)
 

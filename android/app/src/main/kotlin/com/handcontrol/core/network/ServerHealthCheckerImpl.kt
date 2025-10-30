@@ -2,6 +2,7 @@ package com.handcontrol.core.network
 
 import com.handcontrol.core.model.HealthCheckResult
 import com.handcontrol.data.database.EnrolledServerEntity
+import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.RemoteControlGrpcKt
 import com.handcontrol.grpc.ServerInfoRequest
 import io.grpc.StatusException
@@ -14,71 +15,44 @@ import javax.inject.Singleton
 
 @Singleton
 class ServerHealthCheckerImpl @Inject constructor(
-    private val channelFactory: MtlsGrpcChannelFactory
+    private val connectionManager: ServerConnectionManager,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : ServerHealthChecker {
 
     override suspend fun checkHealth(server: EnrolledServerEntity): HealthCheckResult = withContext(Dispatchers.IO) {
-        // Try primary IP first, then fallback to other IPs
-        val ipAddresses = if (server.ips.isNotEmpty()) {
-            server.ips
-        } else {
-            // Fallback to serverHost for backward compatibility
-            server.serverHost?.let { listOf(it) } ?: emptyList()
-        }
-
-        if (ipAddresses.isEmpty()) {
-            Timber.w("No IP addresses available for server ${server.serverId}")
-            return@withContext HealthCheckResult(
-                isReachable = false,
-                error = "No IP addresses configured"
-            )
-        }
-
-        // Try each IP address until one succeeds
-        for ((index, ip) in ipAddresses.withIndex()) {
-            try {
-                Timber.d("Health check attempt ${index + 1}/${ipAddresses.size} for ${server.serverName} at $ip:${server.serverPort}")
-                return@withContext checkSingleHost(ip, server.serverPort)
-            } catch (e: Exception) {
-                Timber.d("Health check failed for $ip: ${e.message}")
-                if (index == ipAddresses.size - 1) {
-                    // Last IP failed, return error
-                    return@withContext HealthCheckResult(
-                        isReachable = false,
-                        error = e.message ?: "Connection failed"
-                    )
-                }
-                // Try next IP
-            }
-        }
-
-        // Should not reach here, but just in case
-        HealthCheckResult(
-            isReachable = false,
-            error = "All connection attempts failed"
-        )
-    }
-
-    private suspend fun checkSingleHost(host: String, port: Int): HealthCheckResult {
+        Timber.d("Starting health check for ${server.serverName} (${server.serverId})")
         val startTime = System.currentTimeMillis()
-        var channel: io.grpc.ManagedChannel? = null
 
-        return try {
-            // Use a short timeout for health checks (3 seconds)
-            withTimeout(3000L) {
-                channel = channelFactory.createChannel(host, port)
-                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel!!)
+        try {
+            // Use a timeout for the entire health check (including connection attempts)
+            withTimeout(10000L) {
+                // Use ServerConnectionManager to connect (tries direct, then relay)
+                val connectionResult = connectionManager.connect(server)
 
-                // Call GetServerInfo as a lightweight health check
-                stub.getServerInfo(ServerInfoRequest.getDefaultInstance())
+                try {
+                    val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(connectionResult.channel)
 
-                val latency = System.currentTimeMillis() - startTime
-                Timber.d("Health check successful for $host:$port, latency=${latency}ms")
+                    // Call GetServerInfo as a lightweight health check
+                    stub.getServerInfo(ServerInfoRequest.getDefaultInstance())
 
-                HealthCheckResult(
-                    isReachable = true,
-                    latencyMs = latency
-                )
+                    val latency = System.currentTimeMillis() - startTime
+
+                    Timber.i(
+                        "Health check successful for ${server.serverName} via ${connectionResult.mode}, " +
+                        "latency=${latency}ms, address=${connectionResult.connectedAddress ?: "relay"}"
+                    )
+
+                    // Persist successful connection mode
+                    enrolledServerRepository.updateConnectionMode(server.serverId, connectionResult.mode)
+
+                    HealthCheckResult(
+                        isReachable = true,
+                        latencyMs = latency
+                    )
+                } finally {
+                    // Always disconnect the channel
+                    connectionManager.disconnect(connectionResult)
+                }
             }
         } catch (e: StatusException) {
             val errorMsg = when (e.status.code) {
@@ -87,25 +61,17 @@ class ServerHealthCheckerImpl @Inject constructor(
                 io.grpc.Status.Code.UNAUTHENTICATED -> "Authentication failed"
                 else -> e.status.description ?: "gRPC error: ${e.status.code}"
             }
-            Timber.w("Health check gRPC error for $host:$port: $errorMsg")
+            Timber.w("Health check gRPC error for ${server.serverName}: $errorMsg")
             HealthCheckResult(
                 isReachable = false,
                 error = errorMsg
             )
         } catch (e: Exception) {
-            Timber.w("Health check failed for $host:$port: ${e.message}")
+            Timber.w("Health check failed for ${server.serverName}: ${e.message}")
             HealthCheckResult(
                 isReachable = false,
                 error = e.message ?: "Connection failed"
             )
-        } finally {
-            channel?.let {
-                try {
-                    channelFactory.shutdownChannel(it)
-                } catch (e: Exception) {
-                    Timber.w(e, "Error shutting down health check channel")
-                }
-            }
         }
     }
 }

@@ -509,7 +509,7 @@ async fn start_handcontrol_server() -> Result<()> {
 
         let issuer = Arc::new(
             TokenIssuer::new(server_id, &relay_key_path)
-                .context("Failed to initialize relay token issuer")?
+                .context("Failed to initialize relay token issuer")?,
         );
 
         info!("Relay token issuer initialized");

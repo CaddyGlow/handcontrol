@@ -60,9 +60,8 @@ import kotlinx.coroutines.flow.collectLatest
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CommandListScreen(
-    serverHost: String,
-    serverPort: Int,
-    onNavigateToCommandExecution: (String, Int, String) -> Unit,
+    serverId: String,
+    onNavigateToCommandExecution: (String, String) -> Unit,
     onNavigateBack: () -> Unit = {},
     onNavigateToServerList: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -75,7 +74,7 @@ fun CommandListScreen(
     var selectedCommand by remember { mutableStateOf<Command?>(null) }
 
     LaunchedEffect(Unit) {
-        viewModel.loadCommands(serverHost, serverPort)
+        viewModel.loadCommands(serverId)
     }
 
     // Collect toast messages
@@ -120,7 +119,7 @@ fun CommandListScreen(
                         )
                     }
                     IconButton(onClick = {
-                        viewModel.loadCommands(serverHost, serverPort)
+                        viewModel.loadCommands(serverId)
                     }) {
                         Icon(
                             imageVector = Icons.Default.Refresh,
@@ -145,7 +144,7 @@ fun CommandListScreen(
                     ErrorView(
                         message = state.message,
                         onRetry = {
-                            viewModel.loadCommands(serverHost, serverPort)
+                            viewModel.loadCommands(serverId)
                         }
                     )
                 }
@@ -165,7 +164,7 @@ fun CommandListScreen(
                                     command = command,
                                     viewModel = viewModel,
                                     onNavigateToExecution = {
-                                        onNavigateToCommandExecution(serverHost, serverPort, command.id)
+                                        onNavigateToCommandExecution(serverId, command.id)
                                     },
                                     onShowConfirmation = {
                                         selectedCommand = command
@@ -193,7 +192,7 @@ fun CommandListScreen(
                     showOutput = cmd.showOutput
                 )
                 if (cmd.showOutput) {
-                    onNavigateToCommandExecution(serverHost, serverPort, cmd.id)
+                    onNavigateToCommandExecution(serverId, cmd.id)
                 }
                 showConfirmationDialog = false
                 selectedCommand = null

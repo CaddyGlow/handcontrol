@@ -51,7 +51,7 @@ fun ApprovalPairingScreen(
     serverPort: Int,
     serverId: String?,
     onNavigateBack: () -> Unit,
-    onNavigateToCommands: (String, Int) -> Unit,
+    onEnrollmentSuccess: (String) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: EnrollmentViewModel = hiltViewModel()
 ) {
@@ -60,6 +60,15 @@ fun ApprovalPairingScreen(
     LaunchedEffect(Unit) {
         Timber.i("ApprovalPairingScreen start host=%s port=%d serverId=%s", serverHost, serverPort, serverId)
         viewModel.requestApprovalPairing(serverHost, serverPort, serverId)
+    }
+
+    // Handle enrollment success and already enrolled
+    LaunchedEffect(uiState) {
+        when (val state = uiState) {
+            is EnrollmentUiState.Success -> onEnrollmentSuccess(state.serverId)
+            is EnrollmentUiState.AlreadyEnrolled -> onEnrollmentSuccess(state.serverId)
+            else -> {} // Do nothing for other states
+        }
     }
 
     Scaffold(
@@ -101,11 +110,10 @@ fun ApprovalPairingScreen(
                 }
 
                 is EnrollmentUiState.Success -> {
+                    // Navigation handled automatically by LaunchedEffect
                     SuccessView(
                         clientId = state.clientId,
-                        onContinue = {
-                            onNavigateToCommands(serverHost, serverPort)
-                        }
+                        onContinue = { /* Navigation handled by LaunchedEffect */ }
                     )
                 }
 
@@ -124,11 +132,10 @@ fun ApprovalPairingScreen(
                 }
 
                 is EnrollmentUiState.AlreadyEnrolled -> {
+                    // Navigation handled automatically by LaunchedEffect
                     AlreadyEnrolledView(
                         serverName = state.serverName,
-                        onGoToCommands = {
-                            onNavigateToCommands(serverHost, serverPort)
-                        },
+                        onGoToCommands = { /* Navigation handled by LaunchedEffect */ },
                         onCancel = {
                             viewModel.cancelEnrollment()
                             onNavigateBack()

@@ -162,6 +162,8 @@ class ServerDetailsViewModel @Inject constructor(
             enrolledAt = enrolledAt,
             lastConnected = lastConnected,
             lastConnectionMode = lastConnectionMode,
+            relayEnabled = relayEnabled,
+            relayUrl = relayUrl,
             healthStatus = healthStatus,
             isDiscoveredViaMdns = discoveredServer != null,
             mdnsServiceName = discoveredServer?.name,

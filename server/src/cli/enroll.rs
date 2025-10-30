@@ -44,6 +44,7 @@ pub async fn handle_qr_enrollment(
         server_cert.fingerprint_display(),
         token.token,
         server_id,
+        None,
     );
 
     // Display QR code

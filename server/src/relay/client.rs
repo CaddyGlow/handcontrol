@@ -1,6 +1,6 @@
 use crate::config::parser::RelayConfig;
 use crate::relay::tokens::TokenIssuer;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -11,10 +11,8 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_tungstenite::{
-    connect_async,
+    MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, protocol::frame::Payload},
-    MaybeTlsStream,
-    WebSocketStream
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -213,8 +211,8 @@ impl RelayClient {
     }
 
     async fn handle_control_message(&self, payload: &str) -> Result<()> {
-        let msg: ControlMessage = serde_json::from_str(payload)
-            .context("Failed to parse control message")?;
+        let msg: ControlMessage =
+            serde_json::from_str(payload).context("Failed to parse control message")?;
 
         match msg {
             ControlMessage::OpenTunnel {
@@ -222,7 +220,10 @@ impl RelayClient {
                 client_id,
                 ..
             } => {
-                info!("Relay requested tunnel {} for client {}", tunnel_id, client_id);
+                info!(
+                    "Relay requested tunnel {} for client {}",
+                    tunnel_id, client_id
+                );
                 self.spawn_tunnel_task(&tunnel_id).await?;
             }
             ControlMessage::Ping {} => {

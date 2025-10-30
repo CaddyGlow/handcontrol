@@ -50,11 +50,17 @@ class GrpcEnrollmentRepository @Inject constructor(
         hosts: List<String>,
         port: Int,
         token: String,
-        deviceName: String
+        deviceName: String,
+        expectedCertFingerprint: String,
+        expectedServerId: String
     ): EnrollmentResult {
         require(hosts.isNotEmpty()) { "At least one host is required" }
+        require(expectedCertFingerprint.isNotEmpty()) { "Certificate fingerprint is required for secure enrollment" }
+        require(expectedServerId.isNotEmpty()) { "Server ID is required for secure enrollment" }
 
         Timber.i("Enrolling with ${hosts.size} IP(s): ${hosts.take(3).joinToString()}")
+        Timber.i("Expected cert fingerprint: $expectedCertFingerprint")
+        Timber.i("Expected server ID: $expectedServerId")
 
         // Strategy: IPv6 first -> IPv4 second -> remaining IPs in parallel
         // Server orders IPs as: [best IPv6, best IPv4, other IPv6s, other IPv4s]
@@ -68,7 +74,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                 port = port,
                 token = token,
                 deviceName = deviceName,
-                timeoutMs = 3000L
+                timeoutMs = 3000L,
+                expectedCertFingerprint = expectedCertFingerprint,
+                expectedServerId = expectedServerId
             )
         } catch (e: Exception) {
             Timber.w(e, "Primary IP $firstHost failed: ${e.javaClass.simpleName}")
@@ -84,7 +92,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                     port = port,
                     token = token,
                     deviceName = deviceName,
-                    timeoutMs = 3000L
+                    timeoutMs = 3000L,
+                    expectedCertFingerprint = expectedCertFingerprint,
+                    expectedServerId = expectedServerId
                 )
             } catch (e: Exception) {
                 Timber.w(e, "Fallback IP $secondHost failed: ${e.javaClass.simpleName}")
@@ -106,7 +116,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                                 port = port,
                                 token = token,
                                 deviceName = deviceName,
-                                timeoutMs = 5000L
+                                timeoutMs = 5000L,
+                                expectedCertFingerprint = expectedCertFingerprint,
+                                expectedServerId = expectedServerId
                             )
                         } catch (e: Exception) {
                             Timber.w(e, "Alternative IP $host failed: ${e.javaClass.simpleName}")
@@ -141,7 +153,9 @@ class GrpcEnrollmentRepository @Inject constructor(
         port: Int,
         token: String,
         deviceName: String,
-        timeoutMs: Long
+        timeoutMs: Long,
+        expectedCertFingerprint: String,
+        expectedServerId: String
     ): EnrollmentResult {
         return withTimeout(timeoutMs) {
             try {
@@ -169,36 +183,75 @@ class GrpcEnrollmentRepository @Inject constructor(
                 val serverCertDer = extractServerCertificate(channel)
                 val fingerprint = if (serverCertDer != null) {
                     val fp = VerificationCodeGenerator.computeFingerprint(serverCertDer)
+
+                    // Validate certificate fingerprint (MANDATORY)
+                    if (expectedCertFingerprint != fp) {
+                        Timber.e("Certificate fingerprint mismatch! Expected: $expectedCertFingerprint, Got: $fp")
+                        channelFactory.shutdownChannel(channel)
+                        return@withTimeout EnrollmentResult.Error(
+                            "Security verification failed: server certificate does not match QR code"
+                        )
+                    }
+
                     certificateManager.pinServerFingerprint(fp)
-                    Timber.i("Server certificate pinned: $fp")
+                    Timber.i("Server certificate pinned and verified: $fp")
                     fp
                 } else {
-                    Timber.w("Could not extract server certificate for pinning")
-                    ""
+                    Timber.e("Could not extract server certificate")
+                    channelFactory.shutdownChannel(channel)
+                    return@withTimeout EnrollmentResult.Error(
+                        "Security verification failed: could not extract server certificate"
+                    )
                 }
 
                 if (response.success) {
                     // Fetch server info and save to database
+                    val serverId: String
                     try {
                         val serverInfo = getServerInfo(channel)
+                        serverId = serverInfo.serverId
+
+                        // Validate server ID (MANDATORY)
+                        if (expectedServerId != serverId) {
+                            Timber.e("Server ID mismatch! Expected: $expectedServerId, Got: $serverId")
+                            channelFactory.shutdownChannel(channel)
+                            return@withTimeout EnrollmentResult.Error(
+                                "Security verification failed: server ID does not match QR code"
+                            )
+                        }
+
+                        // Parse relay info if available
+                        val relayEnabled = response.hasRelayInfo() && !response.relayInfo.relayUrl.isEmpty()
+                        val relayUrl = if (relayEnabled) response.relayInfo.relayUrl else null
+                        val relayToken = if (relayEnabled) response.relayInfo.relayToken else null
+
+                        if (relayEnabled) {
+                            Timber.i("Relay info received: url=$relayUrl")
+                        }
+
                         enrolledServerRepository.saveServer(
-                            serverId = serverInfo.serverId,
+                            serverId = serverId,
                             serverHost = host,
                             serverPort = port,
                             clientId = response.clientId,
                             serverName = serverInfo.hostname,
-                            certFingerprint = fingerprint
+                            certFingerprint = fingerprint,
+                            relayEnabled = relayEnabled,
+                            relayUrl = relayUrl,
+                            relayToken = relayToken
                         )
-                        Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
+                        Timber.i("Server info saved: serverId=$serverId, hostname=${serverInfo.hostname}, relay=${relayEnabled}")
                     } catch (e: Exception) {
-                        Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+                        Timber.e(e, "Failed to fetch/save server info")
+                        channelFactory.shutdownChannel(channel)
+                        return@withTimeout EnrollmentResult.Error("Failed to fetch server information: ${e.message}")
                     }
 
                     saveClientId(response.clientId)
-                    Timber.i("QR enrollment successful: clientId=${response.clientId} via host=$host")
+                    Timber.i("QR enrollment successful: clientId=${response.clientId}, serverId=$serverId via host=$host")
 
                     channelFactory.shutdownChannel(channel)
-                    EnrollmentResult.Success(response.clientId)
+                    EnrollmentResult.Success(response.clientId, serverId)
                 } else {
                     channelFactory.shutdownChannel(channel)
                     Timber.w("QR enrollment failed: ${response.errorMessage}")
@@ -365,8 +418,11 @@ class GrpcEnrollmentRepository @Inject constructor(
             when (response.status) {
                 PairingStatus.PAIRING_STATUS_APPROVED -> {
                     // Fetch server info and save to database
+                    val serverId: String
                     try {
                         val serverInfo = getServerInfo(channel)
+                        serverId = serverInfo.serverId
+
                         val serverCertDer = extractServerCertificate(channel)
                         val fingerprint = if (serverCertDer != null) {
                             VerificationCodeGenerator.computeFingerprint(serverCertDer)
@@ -374,24 +430,38 @@ class GrpcEnrollmentRepository @Inject constructor(
                             ""
                         }
 
+                        // Parse relay info if available
+                        val relayEnabled = response.hasRelayInfo() && !response.relayInfo.relayUrl.isEmpty()
+                        val relayUrl = if (relayEnabled) response.relayInfo.relayUrl else null
+                        val relayToken = if (relayEnabled) response.relayInfo.relayToken else null
+
+                        if (relayEnabled) {
+                            Timber.i("Relay info received: url=$relayUrl")
+                        }
+
                         enrolledServerRepository.saveServer(
-                            serverId = serverInfo.serverId,
+                            serverId = serverId,
                             serverHost = host,
                             serverPort = port,
                             clientId = response.clientId,
                             serverName = serverInfo.hostname,
-                            certFingerprint = fingerprint
+                            certFingerprint = fingerprint,
+                            relayEnabled = relayEnabled,
+                            relayUrl = relayUrl,
+                            relayToken = relayToken
                         )
-                        Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
+                        Timber.i("Server info saved: serverId=$serverId, hostname=${serverInfo.hostname}, relay=${relayEnabled}")
                     } catch (e: Exception) {
-                        Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+                        Timber.e(e, "Failed to fetch/save server info")
+                        channelFactory.shutdownChannel(channel)
+                        return EnrollmentResult.Error("Failed to fetch server information: ${e.message}")
                     }
 
                     saveClientId(response.clientId)
-                    Timber.i("Approval pairing approved: clientId=${response.clientId}")
+                    Timber.i("Approval pairing approved: clientId=${response.clientId}, serverId=$serverId")
 
                     channelFactory.shutdownChannel(channel)
-                    EnrollmentResult.Success(response.clientId)
+                    EnrollmentResult.Success(response.clientId, serverId)
                 }
                 PairingStatus.PAIRING_STATUS_PENDING -> {
                     channelFactory.shutdownChannel(channel)

@@ -67,19 +67,17 @@ class CommandListViewModel @Inject constructor(
     private val _toastMessage = MutableSharedFlow<String>()
     val toastMessage: SharedFlow<String> = _toastMessage.asSharedFlow()
 
-    private var currentHost: String? = null
-    private var currentPort: Int? = null
+    private var currentServerId: String? = null
 
-    fun loadCommands(host: String, port: Int) {
-        currentHost = host
-        currentPort = port
+    fun loadCommands(serverId: String) {
+        currentServerId = serverId
 
         viewModelScope.launch {
             _uiState.value = CommandListUiState.Loading
 
             try {
                 // Load server info
-                val serverInfoResult = commandRepository.getServerInfo(host, port)
+                val serverInfoResult = commandRepository.getServerInfo(serverId)
                 if (serverInfoResult.isFailure) {
                     _uiState.value = CommandListUiState.Error(
                         serverInfoResult.exceptionOrNull()?.message ?: "Failed to get server info"
@@ -91,7 +89,7 @@ class CommandListViewModel @Inject constructor(
                 Timber.i("Connected to server: ${serverInfo.hostname} v${serverInfo.version}")
 
                 // Load commands
-                val commandsResult = commandRepository.listCommands(host, port)
+                val commandsResult = commandRepository.listCommands(serverId)
                 if (commandsResult.isFailure) {
                     _uiState.value = CommandListUiState.Error(
                         commandsResult.exceptionOrNull()?.message ?: "Failed to load commands"
@@ -108,8 +106,7 @@ class CommandListViewModel @Inject constructor(
                     filteredCommands = commands
                 )
 
-                // Update last connected timestamp
-                enrolledServerRepository.updateLastConnected(serverInfo.serverId)
+                // Note: Connection mode is already updated by repository
             } catch (e: Exception) {
                 Timber.e(e, "Error loading commands")
                 _uiState.value = CommandListUiState.Error(e.message ?: "Unknown error")
@@ -138,8 +135,7 @@ class CommandListViewModel @Inject constructor(
     }
 
     fun executeCommand(commandId: String, commandName: String, parameters: Map<String, String>) {
-        val host = currentHost ?: return
-        val port = currentPort ?: return
+        val serverId = currentServerId ?: return
 
         viewModelScope.launch {
             try {
@@ -151,7 +147,7 @@ class CommandListViewModel @Inject constructor(
 
                 Timber.i("Executing command: $commandId")
 
-                commandRepository.executeCommand(host, port, commandId, parameters)
+                commandRepository.executeCommand(serverId, commandId, parameters)
                     .collect { result ->
                         val currentState = _executionState.value
                         if (currentState !is CommandExecutionState.Executing) return@collect
@@ -191,9 +187,8 @@ class CommandListViewModel @Inject constructor(
     }
 
     fun retryLoad() {
-        val host = currentHost ?: return
-        val port = currentPort ?: return
-        loadCommands(host, port)
+        val serverId = currentServerId ?: return
+        loadCommands(serverId)
     }
 
     /**
@@ -205,8 +200,7 @@ class CommandListViewModel @Inject constructor(
         parameters: Map<String, String>,
         showOutput: Boolean
     ) {
-        val host = currentHost ?: return
-        val port = currentPort ?: return
+        val serverId = currentServerId ?: return
 
         viewModelScope.launch {
             try {
@@ -221,7 +215,7 @@ class CommandListViewModel @Inject constructor(
 
                 Timber.i("Executing command: $commandId (showOutput=$showOutput)")
 
-                commandRepository.executeCommand(host, port, commandId, parameters)
+                commandRepository.executeCommand(serverId, commandId, parameters)
                     .catch { e ->
                         Timber.e(e, "Command execution failed")
                         if (showOutput) {
@@ -297,14 +291,13 @@ class CommandListViewModel @Inject constructor(
         pattern: String?,
         fallback: String
     ): String {
-        val host = currentHost ?: return fallback
-        val port = currentPort ?: return fallback
+        val serverId = currentServerId ?: return fallback
 
         return try {
             val outputBuilder = StringBuilder()
 
             // Execute the command and collect output
-            commandRepository.executeCommand(host, port, "_dynamic_default", mapOf("_cmd" to command))
+            commandRepository.executeCommand(serverId, "_dynamic_default", mapOf("_cmd" to command))
                 .catch { e ->
                     Timber.w(e, "Failed to fetch dynamic default")
                     emit(CommandExecutionResult.Error(e.message ?: "Failed"))

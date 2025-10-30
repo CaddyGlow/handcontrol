@@ -14,6 +14,8 @@ pub struct RelayConfig {
     #[serde(default = "default_handshake_timeout_seconds")]
     pub handshake_timeout_seconds: u64,
     #[serde(default)]
+    pub public_hostname: Option<String>,
+    #[serde(default)]
     pub registration_secrets: HashMap<Uuid, String>,
 }
 

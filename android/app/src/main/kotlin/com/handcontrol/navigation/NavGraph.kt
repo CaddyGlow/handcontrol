@@ -29,19 +29,17 @@ sealed interface Route {
     ) : Route
 
     @Serializable
-    data class CommandList(val serverHost: String, val serverPort: Int) : Route
+    data class CommandList(val serverId: String) : Route
 
     @Serializable
     data class CommandDetail(
-        val serverHost: String,
-        val serverPort: Int,
+        val serverId: String,
         val commandId: String
     ) : Route
 
     @Serializable
     data class CommandExecution(
-        val serverHost: String,
-        val serverPort: Int,
+        val serverId: String,
         val commandId: String
     ) : Route
 }

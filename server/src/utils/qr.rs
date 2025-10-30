@@ -11,6 +11,15 @@ pub struct EnrollmentQrPayload {
     pub cert_fingerprint: String,
     pub enrollment_token: String,
     pub server_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RelayQrInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayQrInfo {
+    pub relay_url: String,
+    pub relay_token: String,
+    pub relay_required: bool,
 }
 
 impl EnrollmentQrPayload {
@@ -21,6 +30,7 @@ impl EnrollmentQrPayload {
         cert_fingerprint: String,
         enrollment_token: String,
         server_id: Uuid,
+        relay: Option<RelayQrInfo>,
     ) -> Self {
         Self {
             ips,
@@ -28,6 +38,7 @@ impl EnrollmentQrPayload {
             cert_fingerprint,
             enrollment_token,
             server_id: server_id.to_string(),
+            relay,
         }
     }
 
@@ -60,6 +71,11 @@ impl EnrollmentQrPayload {
         println!("\nPort: {}", self.port);
         println!("Server ID: {}", self.server_id);
         println!("Token expires in 5 minutes");
+        if let Some(relay) = &self.relay {
+            println!("\nRelay URL: {}", relay.relay_url);
+            println!("Relay Required: {}", relay.relay_required);
+            println!("Relay Token: {}", relay.relay_token);
+        }
         println!("\n======================================\n");
 
         Ok(())
@@ -79,6 +95,7 @@ mod tests {
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            None,
         );
 
         assert_eq!(payload.ips, vec!["192.168.1.100", "10.0.0.1"]);
@@ -97,6 +114,7 @@ mod tests {
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            None,
         );
 
         let json = payload.to_json().unwrap();
@@ -118,6 +136,7 @@ mod tests {
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            None,
         );
 
         let json = payload.to_json().unwrap();

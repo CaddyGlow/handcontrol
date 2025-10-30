@@ -259,12 +259,22 @@ impl RemoteControl for RemoteControlService {
         let server_port = config.server.port as i32;
 
         // Create QR payload
+        let relay_info_proto = self.generate_relay_info(&token.token);
+        let relay_qr_info = relay_info_proto
+            .as_ref()
+            .map(|info| crate::utils::qr::RelayQrInfo {
+                relay_url: info.relay_url.clone(),
+                relay_token: info.relay_token.clone(),
+                relay_required: info.relay_required,
+            });
+
         let payload = crate::utils::qr::EnrollmentQrPayload::new(
             server_ips.clone(),
             config.server.port,
             self.server_cert.fingerprint_display(),
             token.token.clone(),
             self.server_id,
+            relay_qr_info,
         );
 
         let qr_payload = match payload.to_json() {
@@ -301,7 +311,7 @@ impl RemoteControl for RemoteControlService {
             enrollment_token: token.token,
             ttl_seconds: config.security.enrollment_token_ttl as i32,
             error_message: String::new(),
-            relay_info: None, // Future relay support
+            relay_info: relay_info_proto,
         }))
     }
 

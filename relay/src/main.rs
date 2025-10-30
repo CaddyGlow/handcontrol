@@ -22,7 +22,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::timeout;
 use tracing::{info, warn};
 use tungstenite::protocol::frame::coding::CloseCode;
+use url::Url;
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -77,6 +78,7 @@ fn build_router(state: Arc<AppState>) -> Router {
 #[derive(Clone)]
 struct AppState {
     listen_addr: String,
+    listen_port: u16,
     relay_host: String,
     secrets: Arc<HashMap<Uuid, String>>,
     registered_servers: Arc<RwLock<HashMap<Uuid, Arc<RegisteredServer>>>>,
@@ -195,15 +197,27 @@ impl AppState {
             bind_address,
             port,
             handshake_timeout_seconds,
+            public_hostname,
             registration_secrets,
         } = config;
 
         let listen_addr = format!("{}:{}", bind_address, port);
-        let relay_host = bind_address;
+        let relay_host = public_hostname
+            .and_then(|host| {
+                let trimmed = host.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            })
+            .or_else(detect_default_route_ip)
+            .unwrap_or_else(|| fallback_public_host(&bind_address));
         let handshake_timeout = Duration::from_secs(handshake_timeout_seconds.max(1));
 
         Self {
             listen_addr,
+            listen_port: port,
             relay_host,
             secrets: Arc::new(registration_secrets),
             registered_servers: Arc::new(RwLock::new(HashMap::new())),
@@ -252,6 +266,77 @@ impl AppState {
 
     async fn remove_tunnel(&self, tunnel_id: &Uuid) {
         self.tunnels.write().await.remove(tunnel_id);
+    }
+
+    fn is_allowed_audience(&self, audience: &str) -> bool {
+        let aud = audience.trim();
+        if aud.eq_ignore_ascii_case(&self.relay_host) {
+            return true;
+        }
+
+        let host_with_port = format!("{}:{}", self.relay_host, self.listen_port);
+        if aud.eq_ignore_ascii_case(&host_with_port) {
+            return true;
+        }
+
+        if let Ok(url) = Url::parse(aud) {
+            if let Some(host) = url.host_str() {
+                if host.eq_ignore_ascii_case(&self.relay_host) {
+                    if let Some(port) = url.port() {
+                        return port == self.listen_port;
+                    }
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+fn detect_default_route_ip() -> Option<String> {
+    detect_default_route_ip_v6().or_else(detect_default_route_ip_v4)
+}
+
+fn detect_default_route_ip_v4() -> Option<String> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)).ok()?;
+    socket
+        .connect(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 80))
+        .ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+fn detect_default_route_ip_v6() -> Option<String> {
+    let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)).ok()?;
+    socket
+        .connect(SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888)),
+            80,
+        ))
+        .ok()?;
+    let local_addr = socket.local_addr().ok()?;
+    let ip = local_addr.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+fn fallback_public_host(bind_address: &str) -> String {
+    match bind_address.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => match ip {
+            IpAddr::V4(_) => "127.0.0.1".to_string(),
+            IpAddr::V6(_) => "::1".to_string(),
+        },
+        Ok(ip) => ip.to_string(),
+        Err(_) => bind_address.to_string(),
     }
 }
 
@@ -401,7 +486,7 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     let public_key_b64url = URL_SAFE_NO_PAD.encode(&key_bytes);
     let decoding_key = Arc::new(
         DecodingKey::from_ed_components(&public_key_b64url)
-            .context("failed to create decoding key from public key")?
+            .context("failed to create decoding key from public key")?,
     );
 
     info!(
@@ -491,8 +576,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         return Ok(());
     };
 
-    let mut validation = Validation::new(Algorithm::EdDSA);
-    validation.set_audience(&[state.relay_host.as_str()]);
+    let validation = Validation::new(Algorithm::EdDSA);
     let claims = match decode::<RelayClaims>(
         &msg.relay_token,
         server_entry.decoding_key.as_ref(),
@@ -515,6 +599,25 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             return Ok(());
         }
     };
+
+    if !state.is_allowed_audience(&claims.aud) {
+        warn!(
+            "Relay token audience '{}' did not match expected host '{}'",
+            claims.aud, state.relay_host
+        );
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "connect_ack",
+                    "status": "error",
+                    "error": "invalid_token"
+                })
+                .to_string(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return Ok(());
+    }
 
     let claims_server = match Uuid::parse_str(&claims.server_id) {
         Ok(uuid) => uuid,
@@ -843,6 +946,7 @@ mod tests {
             bind_address: "127.0.0.1".to_string(),
             port: 0,
             handshake_timeout_seconds: timeout_secs,
+            public_hostname: Some("127.0.0.1".to_string()),
             registration_secrets: secrets,
         }
     }

@@ -6,20 +6,19 @@ interface CommandRepository {
     /**
      * Get server information
      */
-    suspend fun getServerInfo(host: String, port: Int): Result<ServerInfo>
+    suspend fun getServerInfo(serverId: String): Result<ServerInfo>
 
     /**
      * List all available commands from the server
      */
-    suspend fun listCommands(host: String, port: Int): Result<List<Command>>
+    suspend fun listCommands(serverId: String): Result<List<Command>>
 
     /**
      * Execute a command with parameters and stream the output
      * Returns a Flow that emits stdout, stderr, and final exit code
      */
     suspend fun executeCommand(
-        host: String,
-        port: Int,
+        serverId: String,
         commandId: String,
         parameters: Map<String, String>
     ): Flow<CommandExecutionResult>

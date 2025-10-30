@@ -20,7 +20,10 @@ class EnrolledServerRepository @Inject constructor(
         serverPort: Int,
         clientId: String,
         serverName: String,
-        certFingerprint: String
+        certFingerprint: String,
+        relayEnabled: Boolean = false,
+        relayUrl: String? = null,
+        relayToken: String? = null
     ) {
         // Convert single host to list for backward compatibility
         val server = EnrolledServerEntity(
@@ -32,13 +35,20 @@ class EnrolledServerRepository @Inject constructor(
             certFingerprint = certFingerprint,
             enrolledAt = System.currentTimeMillis(),
             lastConnected = System.currentTimeMillis(),
-            serverHost = serverHost  // Keep for migration compatibility
+            serverHost = serverHost,  // Keep for migration compatibility
+            relayEnabled = relayEnabled,
+            relayUrl = relayUrl,
+            relayToken = relayToken
         )
         enrolledServerDao.insertServer(server)
     }
 
     suspend fun updateLastConnected(serverId: String) {
         enrolledServerDao.updateLastConnected(serverId, System.currentTimeMillis())
+    }
+
+    suspend fun updateConnectionMode(serverId: String, mode: ConnectionMode) {
+        enrolledServerDao.updateConnectionMode(serverId, System.currentTimeMillis(), mode)
     }
 
     suspend fun removeServer(serverId: String) {

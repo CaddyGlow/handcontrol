@@ -17,9 +17,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -57,7 +59,7 @@ import java.util.Locale
 fun ServerListScreen(
     onNavigateBack: () -> Unit,
     onNavigateToServerDiscovery: () -> Unit,
-    onNavigateToServer: (String, Int) -> Unit,
+    onNavigateToServer: (String) -> Unit,
     onNavigateToServerDetails: (String) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: ServerListViewModel = hiltViewModel()
@@ -132,9 +134,7 @@ fun ServerListScreen(
                             server = server,
                             onClick = {
                                 viewModel.connectToServer(server.serverId)
-                                // Use first IP from the list or fallback to deprecated serverHost
-                                val host = server.ips.firstOrNull() ?: server.serverHost ?: ""
-                                onNavigateToServer(host, server.serverPort)
+                                onNavigateToServer(server.serverId)
                             },
                             onDelete = {
                                 serverToDelete = server
@@ -232,11 +232,43 @@ private fun ServerCard(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                Text(
-                    text = "${server.ips.firstOrNull() ?: server.serverHost ?: "unknown"}:${server.serverPort}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "${server.ips.firstOrNull() ?: server.serverHost ?: "unknown"}:${server.serverPort}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    // Connection mode indicator
+                    if (server.relayEnabled && !server.relayUrl.isNullOrEmpty()) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Cloud,
+                                contentDescription = "Relay available",
+                                tint = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "Relay",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.secondary
+                            )
+                        }
+                    } else {
+                        Icon(
+                            imageVector = Icons.Filled.Wifi,
+                            contentDescription = "Direct connection only",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                            modifier = Modifier.size(14.dp)
+                        )
+                    }
+                }
 
                 Spacer(modifier = Modifier.height(4.dp))
 
@@ -327,7 +359,7 @@ private fun ServerListPreview() {
         ServerListScreen(
             onNavigateBack = {},
             onNavigateToServerDiscovery = {},
-            onNavigateToServer = { _, _ -> },
+            onNavigateToServer = { _ -> },
             onNavigateToServerDetails = {}
         )
     }

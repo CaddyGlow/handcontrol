@@ -28,6 +28,7 @@ ed25519-dalek = "2.2.0"
 base64 = "0.22"
 base64ct = "1.8"
 spki = "0.7"
+url = "2.5"
 
 [workspace.dependencies.prost-build]
 version = "0.14"

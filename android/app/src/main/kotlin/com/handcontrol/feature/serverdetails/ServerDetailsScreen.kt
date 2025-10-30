@@ -351,13 +351,29 @@ private fun ConnectionDetailsContent(serverInfo: ServerDetailInfo) {
 
     HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
     InfoRow(
-        label = "Connection Mode",
+        label = "Last Connection Mode",
         value = when (serverInfo.lastConnectionMode) {
             ConnectionMode.DIRECT -> "Direct"
             ConnectionMode.RELAY -> "Relay"
             ConnectionMode.UNKNOWN -> "Unknown"
         }
     )
+
+    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+    InfoRow(
+        label = "Relay Support",
+        value = if (serverInfo.relayEnabled) "Available" else "Not configured"
+    )
+
+    if (serverInfo.relayEnabled && !serverInfo.relayUrl.isNullOrEmpty()) {
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+        InfoRow(
+            label = "Relay Server",
+            value = serverInfo.relayUrl,
+            isCopyable = true,
+            context = context
+        )
+    }
 }
 
 @Composable

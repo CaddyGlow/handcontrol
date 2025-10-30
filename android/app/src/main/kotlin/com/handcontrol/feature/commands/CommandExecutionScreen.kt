@@ -52,8 +52,7 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CommandExecutionScreen(
-    serverHost: String,
-    serverPort: Int,
+    serverId: String,
     commandId: String,
     onNavigateBack: () -> Unit,
     modifier: Modifier = Modifier,
@@ -69,7 +68,7 @@ fun CommandExecutionScreen(
     var dynamicDefaultLoadingStates by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
 
     LaunchedEffect(Unit) {
-        viewModel.loadCommands(serverHost, serverPort)
+        viewModel.loadCommands(serverId)
     }
 
     val command = when (val state = listUiState) {

@@ -1,6 +1,7 @@
 package com.handcontrol.data.commands
 
-import com.handcontrol.core.network.GrpcChannelFactory
+import com.handcontrol.core.network.ServerConnectionManager
+import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.ExecuteCommandRequest
 import com.handcontrol.grpc.ListCommandsRequest
 import com.handcontrol.grpc.ParameterType as ProtoParameterType
@@ -11,24 +12,36 @@ import io.grpc.StatusException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onCompletion
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class GrpcCommandRepository @Inject constructor(
-    private val channelFactory: GrpcChannelFactory
+    private val connectionManager: ServerConnectionManager,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : CommandRepository {
 
-    override suspend fun getServerInfo(host: String, port: Int): Result<ServerInfo> {
+    override suspend fun getServerInfo(serverId: String): Result<ServerInfo> {
         return try {
-            val channel = channelFactory.createChannel(host, port)
+            val server = enrolledServerRepository.getServerById(serverId)
+                ?: return Result.failure(Exception("Server not found: $serverId"))
+
+            Timber.i("Connecting to server ${server.serverName} for server info")
+            val connectionResult = connectionManager.connect(server)
+            val channel = connectionResult.channel
+
+            Timber.d("Connected via ${connectionResult.mode} mode")
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
             val request = ServerInfoRequest.newBuilder().build()
             val response = stub.getServerInfo(request)
 
-            channelFactory.shutdownChannel(channel)
+            connectionManager.disconnect(connectionResult)
+
+            // Persist successful connection mode
+            enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
 
             Result.success(
                 ServerInfo(
@@ -47,15 +60,25 @@ class GrpcCommandRepository @Inject constructor(
         }
     }
 
-    override suspend fun listCommands(host: String, port: Int): Result<List<Command>> {
+    override suspend fun listCommands(serverId: String): Result<List<Command>> {
         return try {
-            val channel = channelFactory.createChannel(host, port)
+            val server = enrolledServerRepository.getServerById(serverId)
+                ?: return Result.failure(Exception("Server not found: $serverId"))
+
+            Timber.i("Connecting to server ${server.serverName} to list commands")
+            val connectionResult = connectionManager.connect(server)
+            val channel = connectionResult.channel
+
+            Timber.d("Connected via ${connectionResult.mode} mode")
             val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
             val request = ListCommandsRequest.newBuilder().build()
             val response = stub.listCommands(request)
 
-            channelFactory.shutdownChannel(channel)
+            connectionManager.disconnect(connectionResult)
+
+            // Persist successful connection mode
+            enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
 
             val commands = response.commandsList.map { protoCommand ->
                 Command(
@@ -97,12 +120,18 @@ class GrpcCommandRepository @Inject constructor(
     }
 
     override suspend fun executeCommand(
-        host: String,
-        port: Int,
+        serverId: String,
         commandId: String,
         parameters: Map<String, String>
     ): Flow<CommandExecutionResult> {
-        val channel = channelFactory.createChannel(host, port)
+        val server = enrolledServerRepository.getServerById(serverId)
+            ?: throw Exception("Server not found: $serverId")
+
+        Timber.i("Connecting to server ${server.serverName} to execute command: $commandId")
+        val connectionResult = connectionManager.connect(server)
+        val channel = connectionResult.channel
+
+        Timber.d("Connected via ${connectionResult.mode} mode")
         val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
         val request = ExecuteCommandRequest.newBuilder()
@@ -125,12 +154,10 @@ class GrpcCommandRepository @Inject constructor(
                     }
                     response.hasExitCode() -> {
                         Timber.i("Command finished with exit code: ${response.exitCode}")
-                        channelFactory.shutdownChannel(channel)
                         CommandExecutionResult.ExitCode(response.exitCode)
                     }
                     response.hasError() -> {
                         Timber.e("Command error: ${response.error}")
-                        channelFactory.shutdownChannel(channel)
                         CommandExecutionResult.Error(response.error)
                     }
                     else -> {
@@ -141,10 +168,19 @@ class GrpcCommandRepository @Inject constructor(
             }
             .catch { e ->
                 Timber.e(e, "Command execution failed")
-                channelFactory.shutdownChannel(channel)
                 when (e) {
                     is StatusException -> emit(CommandExecutionResult.Error(mapGrpcError(e.status)))
                     else -> emit(CommandExecutionResult.Error(e.message ?: "Unknown error"))
+                }
+            }
+            .onCompletion { cause ->
+                // Disconnect channel when flow completes (success or error)
+                Timber.d("Command execution flow completed (cause: $cause)")
+                connectionManager.disconnect(connectionResult)
+
+                // Persist successful connection mode (even if command failed)
+                if (cause == null || cause is StatusException) {
+                    enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
                 }
             }
     }

@@ -53,6 +53,8 @@ data class ServerDetailInfo(
     val enrolledAt: Long,
     val lastConnected: Long?,
     val lastConnectionMode: ConnectionMode,
+    val relayEnabled: Boolean = false,
+    val relayUrl: String? = null,
     val healthStatus: ServerHealthStatus = ServerHealthStatus.Unknown,
     val isDiscoveredViaMdns: Boolean = false,
     val mdnsServiceName: String? = null,

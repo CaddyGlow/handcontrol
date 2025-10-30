@@ -56,13 +56,22 @@ import java.util.concurrent.Executors
 @Composable
 fun QrScannerScreen(
     onNavigateBack: () -> Unit,
-    onQrCodeScanned: (String, Int, String) -> Unit,
+    onEnrollmentSuccess: (String) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: EnrollmentViewModel = hiltViewModel()
 ) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+
+    // Handle enrollment success and already enrolled
+    LaunchedEffect(uiState) {
+        when (val state = uiState) {
+            is EnrollmentUiState.Success -> onEnrollmentSuccess(state.serverId)
+            is EnrollmentUiState.AlreadyEnrolled -> onEnrollmentSuccess(state.serverId)
+            else -> {} // Do nothing for other states
+        }
+    }
 
     var hasCameraPermission by remember {
         mutableStateOf(
@@ -163,15 +172,27 @@ fun QrScannerScreen(
 
                                 val port = json.getInt("port")
                                 val token = json.getString("enrollment_token")
-                                val fingerprint = json.optString("cert_fingerprint", null)
-                                val serverId = json.optString("server_id", null)
 
-                                Timber.i("QR code scanned: ips=$ips, port=$port, server_id=$serverId")
+                                // cert_fingerprint and server_id are MANDATORY for security
+                                val fingerprint = json.getString("cert_fingerprint")
+                                if (fingerprint.isEmpty()) {
+                                    throw IllegalArgumentException("QR code missing required cert_fingerprint")
+                                }
 
-                                // TODO: Validate cert_fingerprint matches server certificate
-                                // TODO: Store server_id for verification code generation
+                                val serverId = json.getString("server_id")
+                                if (serverId.isEmpty()) {
+                                    throw IllegalArgumentException("QR code missing required server_id")
+                                }
 
-                                viewModel.enrollWithQrCode(ips, port, token)
+                                Timber.i("QR code scanned: ips=$ips, port=$port, fingerprint=$fingerprint, server_id=$serverId")
+
+                                viewModel.enrollWithQrCode(
+                                    hosts = ips,
+                                    port = port,
+                                    token = token,
+                                    certFingerprint = fingerprint,
+                                    serverId = serverId
+                                )
                             } catch (e: Exception) {
                                 Timber.e(e, "Failed to parse QR code")
                                 viewModel.clearError()

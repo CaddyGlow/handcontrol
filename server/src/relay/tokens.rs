@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use ed25519_dalek::{
-    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
     SigningKey, VerifyingKey,
+    pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey},
 };
-use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
@@ -88,8 +88,9 @@ impl TokenIssuer {
         {
             use std::os::unix::fs::PermissionsExt;
             let perms = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(path, perms)
-                .with_context(|| format!("Failed to set permissions on key file: {}", path.display()))?;
+            fs::set_permissions(path, perms).with_context(|| {
+                format!("Failed to set permissions on key file: {}", path.display())
+            })?;
         }
 
         Ok(())
@@ -146,7 +147,10 @@ impl TokenIssuer {
 
     /// Get the public key in base64 format (raw bytes)
     pub fn public_key_base64(&self) -> String {
-        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, self.verifying_key.as_bytes())
+        base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            self.verifying_key.as_bytes(),
+        )
     }
 }
 

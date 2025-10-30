@@ -3,16 +3,9 @@ package com.handcontrol.core.security
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
-import androidx.datastore.core.DataStore
-import androidx.datastore.preferences.core.Preferences
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
+import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.flow.firstOrNull
-import kotlinx.coroutines.flow.map
 import timber.log.Timber
-import java.io.ByteArrayOutputStream
 import java.math.BigInteger
 import java.security.KeyPairGenerator
 import java.security.KeyStore
@@ -22,13 +15,10 @@ import javax.inject.Inject
 import javax.inject.Singleton
 import javax.security.auth.x500.X500Principal
 
-private val Context.securityDataStore: DataStore<Preferences> by preferencesDataStore(
-    name = "security_prefs"
-)
-
 @Singleton
 class AndroidKeystoreCertificateManager @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : ClientCertificateManager {
 
     private val keyStore: KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply {
@@ -50,23 +40,22 @@ class AndroidKeystoreCertificateManager @Inject constructor(
     }
 
     override suspend fun pinServerFingerprint(fingerprint: String) {
-        Timber.i("Pinning server certificate fingerprint")
-        context.securityDataStore.edit { prefs ->
-            prefs[SERVER_FINGERPRINT_KEY] = fingerprint
-        }
+        Timber.i("Pinning server certificate fingerprint: $fingerprint")
+        // Fingerprints are now stored in Room database per server
+        // This method is kept for interface compatibility but actual storage
+        // happens in EnrolledServerRepository during enrollment
     }
 
     override suspend fun getPinnedServerFingerprint(): String? {
-        return context.securityDataStore.data
-            .map { prefs -> prefs[SERVER_FINGERPRINT_KEY] }
-            .firstOrNull()
+        // Return fingerprint from last connected server for backwards compatibility
+        val lastServer = enrolledServerRepository.getLastConnectedServer()
+        return lastServer?.certFingerprint
     }
 
     override suspend fun clearPinnedServer() {
         Timber.i("Clearing pinned server certificate")
-        context.securityDataStore.edit { prefs ->
-            prefs.remove(SERVER_FINGERPRINT_KEY)
-        }
+        // This would remove all enrolled servers - not recommended
+        // Keeping as no-op for safety, individual servers should be removed via repository
     }
 
     private fun generateClientCertificate(): ClientCertificate {
@@ -102,7 +91,6 @@ class AndroidKeystoreCertificateManager @Inject constructor(
     companion object {
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val CLIENT_KEY_ALIAS = "handcontrol_client_key"
-        private val SERVER_FINGERPRINT_KEY = stringPreferencesKey("server_fingerprint")
         private const val CERT_VALIDITY_MS = 10L * 365 * 24 * 60 * 60 * 1000 // 10 years
     }
 }

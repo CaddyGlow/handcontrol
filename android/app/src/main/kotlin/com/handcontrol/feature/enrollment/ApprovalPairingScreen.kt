@@ -11,9 +11,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Error
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -71,7 +72,7 @@ fun ApprovalPairingScreen(
                         onNavigateBack()
                     }) {
                         Icon(
-                            imageVector = Icons.Default.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back"
                         )
                     }
@@ -114,6 +115,19 @@ fun ApprovalPairingScreen(
                         onRetry = {
                             viewModel.clearError()
                             viewModel.requestApprovalPairing(serverHost, serverPort, serverId)
+                        },
+                        onCancel = {
+                            viewModel.cancelEnrollment()
+                            onNavigateBack()
+                        }
+                    )
+                }
+
+                is EnrollmentUiState.AlreadyEnrolled -> {
+                    AlreadyEnrolledView(
+                        serverName = state.serverName,
+                        onGoToCommands = {
+                            onNavigateToCommands(serverHost, serverPort)
                         },
                         onCancel = {
                             viewModel.cancelEnrollment()
@@ -340,6 +354,63 @@ private fun ErrorView(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text("Cancel")
+        }
+    }
+}
+
+@Composable
+private fun AlreadyEnrolledView(
+    serverName: String,
+    onGoToCommands: () -> Unit,
+    onCancel: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = Icons.Default.Info,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(80.dp)
+        )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        Text(
+            text = "Already Enrolled",
+            style = MaterialTheme.typography.headlineMedium,
+            color = MaterialTheme.colorScheme.primary,
+            textAlign = TextAlign.Center
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+            text = "This server ($serverName) is already enrolled on this device.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.padding(horizontal = 16.dp)
+        )
+
+        Spacer(modifier = Modifier.height(48.dp))
+
+        Button(
+            onClick = onGoToCommands,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Go to Commands")
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        OutlinedButton(
+            onClick = onCancel,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("Back")
         }
     }
 }

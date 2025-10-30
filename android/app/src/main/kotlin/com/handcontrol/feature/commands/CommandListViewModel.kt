@@ -6,6 +6,7 @@ import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.CommandExecutionResult
 import com.handcontrol.data.commands.CommandRepository
 import com.handcontrol.data.commands.ServerInfo
+import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -49,7 +50,8 @@ data class CommandOutputLine(
 
 @HiltViewModel
 class CommandListViewModel @Inject constructor(
-    private val commandRepository: CommandRepository
+    private val commandRepository: CommandRepository,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow<CommandListUiState>(CommandListUiState.Loading)
@@ -98,6 +100,9 @@ class CommandListViewModel @Inject constructor(
                     commands = commands,
                     filteredCommands = commands
                 )
+
+                // Update last connected timestamp
+                enrolledServerRepository.updateLastConnected(serverInfo.serverId)
             } catch (e: Exception) {
                 Timber.e(e, "Error loading commands")
                 _uiState.value = CommandListUiState.Error(e.message ?: "Unknown error")

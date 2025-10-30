@@ -3,6 +3,7 @@ package com.handcontrol.core.discovery
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import android.os.Build
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
@@ -11,6 +12,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.callbackFlow
 import timber.log.Timber
+import java.util.concurrent.Executor
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -48,40 +50,96 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                 Timber.d("Service found: ${serviceInfo.serviceName}")
 
                 // Resolve the service to get host and port
-                nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                    override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                        Timber.w("Failed to resolve service ${serviceInfo.serviceName}: error $errorCode")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    val executor = context.mainExecutor
+                    val callback = object : NsdManager.ServiceInfoCallback {
+                        override fun onServiceInfoCallbackRegistrationFailed(errorCode: Int) {
+                            Timber.w("Failed to register service info callback for ${serviceInfo.serviceName}: error $errorCode")
+                        }
+
+                        override fun onServiceUpdated(serviceInfo: NsdServiceInfo) {
+                            Timber.i("Service resolved: ${serviceInfo.serviceName} at ${serviceInfo.hostAddresses}:${serviceInfo.port}")
+
+                            val fingerprint = extractFingerprint(serviceInfo)
+                            val serverId = extractServerId(serviceInfo)
+                            val version = extractVersion(serviceInfo)
+
+                            val host = serviceInfo.hostAddresses.firstOrNull()?.hostAddress
+                                ?: serviceInfo.hostAddresses.firstOrNull()?.hostName
+                                ?: "unknown"
+
+                            val server = DiscoveredServer(
+                                name = serviceInfo.serviceName,
+                                host = host,
+                                port = serviceInfo.port,
+                                fingerprint = fingerprint,
+                                serverId = serverId,
+                                version = version
+                            )
+
+                            discoveredServers[serviceInfo.serviceName] = server
+                            _servers.value = discoveredServers.values.toList()
+
+                            Timber.d(
+                                "Server added name=%s host=%s port=%d id=%s fingerprint=%s",
+                                server.name,
+                                server.host,
+                                server.port,
+                                server.serverId,
+                                server.fingerprint
+                            )
+                        }
+
+                        override fun onServiceLost() {
+                            Timber.d("Service info callback lost for ${serviceInfo.serviceName}")
+                        }
+
+                        override fun onServiceInfoCallbackUnregistered() {
+                            Timber.d("Service info callback unregistered for ${serviceInfo.serviceName}")
+                        }
                     }
+                    nsdManager.registerServiceInfoCallback(serviceInfo, executor, callback)
+                } else {
+                    @Suppress("DEPRECATION")
+                    val resolveListener = object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            Timber.w("Failed to resolve service ${serviceInfo.serviceName}: error $errorCode")
+                        }
 
-                    override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                        Timber.i("Service resolved: ${serviceInfo.serviceName} at ${serviceInfo.host}:${serviceInfo.port}")
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            Timber.i("Service resolved: ${serviceInfo.serviceName} at ${serviceInfo.host}:${serviceInfo.port}")
 
-                        val fingerprint = extractFingerprint(serviceInfo)
-                        val serverId = extractServerId(serviceInfo)
-                        val version = extractVersion(serviceInfo)
+                            val fingerprint = extractFingerprint(serviceInfo)
+                            val serverId = extractServerId(serviceInfo)
+                            val version = extractVersion(serviceInfo)
 
-                        val server = DiscoveredServer(
-                            name = serviceInfo.serviceName,
-                            host = serviceInfo.host.hostAddress ?: serviceInfo.host.hostName,
-                            port = serviceInfo.port,
-                            fingerprint = fingerprint,
-                            serverId = serverId,
-                            version = version
-                        )
+                            @Suppress("DEPRECATION")
+                            val host = serviceInfo.host?.hostAddress ?: serviceInfo.host?.hostName ?: "unknown"
 
-                        discoveredServers[serviceInfo.serviceName] = server
-                        _servers.value = discoveredServers.values.toList()
+                            val server = DiscoveredServer(
+                                name = serviceInfo.serviceName,
+                                host = host,
+                                port = serviceInfo.port,
+                                fingerprint = fingerprint,
+                                serverId = serverId,
+                                version = version
+                            )
 
-                        Timber.d(
-                            "Server added name=%s host=%s port=%d id=%s fingerprint=%s",
-                            server.name,
-                            server.host,
-                            server.port,
-                            server.serverId,
-                            server.fingerprint
-                        )
+                            discoveredServers[serviceInfo.serviceName] = server
+                            _servers.value = discoveredServers.values.toList()
+
+                            Timber.d(
+                                "Server added name=%s host=%s port=%d id=%s fingerprint=%s",
+                                server.name,
+                                server.host,
+                                server.port,
+                                server.serverId,
+                                server.fingerprint
+                            )
+                        }
                     }
-                })
+                    nsdManager.resolveService(serviceInfo, resolveListener)
+                }
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {

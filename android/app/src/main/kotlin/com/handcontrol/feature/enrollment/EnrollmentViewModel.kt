@@ -3,6 +3,7 @@ package com.handcontrol.feature.enrollment
 import android.os.Build
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.data.enrollment.EnrollmentRepository
 import com.handcontrol.data.enrollment.EnrollmentResult
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -25,11 +26,13 @@ sealed interface EnrollmentUiState {
     ) : EnrollmentUiState
     data class Success(val clientId: String) : EnrollmentUiState
     data class Error(val message: String) : EnrollmentUiState
+    data class AlreadyEnrolled(val serverName: String) : EnrollmentUiState
 }
 
 @HiltViewModel
 class EnrollmentViewModel @Inject constructor(
-    private val enrollmentRepository: EnrollmentRepository
+    private val enrollmentRepository: EnrollmentRepository,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow<EnrollmentUiState>(EnrollmentUiState.Idle)
@@ -38,6 +41,14 @@ class EnrollmentViewModel @Inject constructor(
     fun enrollWithQrCode(host: String, port: Int, token: String) {
         viewModelScope.launch {
             try {
+                // Check if server is already enrolled
+                val existingServer = enrolledServerRepository.getServerByHostAndPort(host, port)
+                if (existingServer != null) {
+                    Timber.i("Server already enrolled: ${existingServer.serverName}")
+                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName)
+                    return@launch
+                }
+
                 _uiState.value = EnrollmentUiState.QrEnrolling(token)
                 Timber.i("Enrolling with QR code")
 
@@ -68,6 +79,14 @@ class EnrollmentViewModel @Inject constructor(
     fun requestApprovalPairing(host: String, port: Int, serverId: String?) {
         viewModelScope.launch {
             try {
+                // Check if server is already enrolled
+                val existingServer = enrolledServerRepository.getServerByHostAndPort(host, port)
+                if (existingServer != null) {
+                    Timber.i("Server already enrolled: ${existingServer.serverName}")
+                    _uiState.value = EnrollmentUiState.AlreadyEnrolled(existingServer.serverName)
+                    return@launch
+                }
+
                 Timber.i("Requesting approval pairing host=%s port=%d serverId=%s", host, port, serverId)
 
                 val deviceName = "${Build.MANUFACTURER} ${Build.MODEL}"

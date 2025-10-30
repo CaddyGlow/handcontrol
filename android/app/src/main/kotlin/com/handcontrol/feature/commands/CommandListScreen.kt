@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Error
@@ -57,6 +59,8 @@ fun CommandListScreen(
     serverHost: String,
     serverPort: Int,
     onNavigateToCommandExecution: (String, Int, String) -> Unit,
+    onNavigateBack: () -> Unit = {},
+    onNavigateToServerList: () -> Unit = {},
     modifier: Modifier = Modifier,
     viewModel: CommandListViewModel = hiltViewModel()
 ) {
@@ -84,7 +88,21 @@ fun CommandListScreen(
                         else -> Text("Commands")
                     }
                 },
+                navigationIcon = {
+                    IconButton(onClick = onNavigateBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back"
+                        )
+                    }
+                },
                 actions = {
+                    IconButton(onClick = onNavigateToServerList) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.List,
+                            contentDescription = "Server List"
+                        )
+                    }
                     IconButton(onClick = {
                         viewModel.loadCommands(serverHost, serverPort)
                     }) {

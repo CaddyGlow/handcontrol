@@ -13,6 +13,9 @@ sealed interface Route {
     data object ServerDiscovery : Route
 
     @Serializable
+    data object ServerList : Route
+
+    @Serializable
     data class EnrollmentQr(val serverHost: String, val serverPort: Int) : Route
 
     @Serializable

@@ -55,6 +55,7 @@ message RequestPairingResponse {
   string verification_code = 4;     // Server's computed verification code
   bytes server_cert_fingerprint = 5; // SHA256 of server certificate
   string error_message = 6;         // If verification mismatch, approval mode disabled, or other error
+  bytes verification_nonce = 7;     // Random nonce used in verification code computation (prevents precomputation attacks)
 }
 
 message CheckPairingStatusRequest {

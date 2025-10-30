@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -22,6 +23,7 @@ import com.handcontrol.ui.theme.HandControlTheme
 @Composable
 fun WelcomeScreen(
     onNavigateToServerDiscovery: () -> Unit = {},
+    onNavigateToServerList: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Scaffold { paddingValues ->
@@ -62,6 +64,20 @@ fun WelcomeScreen(
             ) {
                 Text(
                     text = "Get Started",
+                    style = MaterialTheme.typography.titleMedium
+                )
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedButton(
+                onClick = onNavigateToServerList,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp)
+            ) {
+                Text(
+                    text = "View Enrolled Servers",
                     style = MaterialTheme.typography.titleMedium
                 )
             }

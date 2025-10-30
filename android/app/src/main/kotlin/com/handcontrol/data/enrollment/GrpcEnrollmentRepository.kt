@@ -10,11 +10,14 @@ import com.google.protobuf.ByteString
 import com.handcontrol.core.security.ClientCertificate
 import com.handcontrol.core.security.ClientCertificateManager
 import com.handcontrol.core.security.VerificationCodeGenerator
+import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.CheckPairingStatusRequest
 import com.handcontrol.grpc.EnrollRequest
 import com.handcontrol.grpc.PairingStatus
 import com.handcontrol.grpc.RemoteControlGrpcKt
 import com.handcontrol.grpc.RequestPairingRequest
+import com.handcontrol.grpc.ServerInfoRequest
+import com.handcontrol.grpc.ServerInfoResponse
 import dagger.hilt.android.qualifiers.ApplicationContext
 import io.grpc.ManagedChannel
 import io.grpc.Status
@@ -33,7 +36,8 @@ private val Context.enrollmentDataStore: DataStore<Preferences> by preferencesDa
 class GrpcEnrollmentRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val certificateManager: ClientCertificateManager,
-    private val channelFactory: com.handcontrol.core.network.MtlsGrpcChannelFactory
+    private val channelFactory: com.handcontrol.core.network.MtlsGrpcChannelFactory,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : EnrollmentRepository {
 
     private val CLIENT_ID_KEY = stringPreferencesKey("client_id")
@@ -59,21 +63,40 @@ class GrpcEnrollmentRepository @Inject constructor(
 
             // Extract and pin server certificate for future connections (TOFU)
             val serverCertDer = extractServerCertificate(channel)
-            if (serverCertDer != null) {
-                val fingerprint = VerificationCodeGenerator.computeFingerprint(serverCertDer)
-                certificateManager.pinServerFingerprint(fingerprint)
-                Timber.i("Server certificate pinned: $fingerprint")
+            val fingerprint = if (serverCertDer != null) {
+                val fp = VerificationCodeGenerator.computeFingerprint(serverCertDer)
+                certificateManager.pinServerFingerprint(fp)
+                Timber.i("Server certificate pinned: $fp")
+                fp
             } else {
                 Timber.w("Could not extract server certificate for pinning")
+                ""
             }
 
-            channelFactory.shutdownChannel(channel)
-
             if (response.success) {
+                // Fetch server info and save to database
+                try {
+                    val serverInfo = getServerInfo(channel)
+                    enrolledServerRepository.saveServer(
+                        serverId = serverInfo.serverId,
+                        serverHost = host,
+                        serverPort = port,
+                        clientId = response.clientId,
+                        serverName = serverInfo.hostname,
+                        certFingerprint = fingerprint
+                    )
+                    Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+                }
+
                 saveClientId(response.clientId)
                 Timber.i("QR enrollment successful: clientId=${response.clientId}")
+
+                channelFactory.shutdownChannel(channel)
                 EnrollmentResult.Success(response.clientId)
             } else {
+                channelFactory.shutdownChannel(channel)
                 Timber.w("QR enrollment failed: ${response.errorMessage}")
                 EnrollmentResult.Error(response.errorMessage)
             }
@@ -211,26 +234,53 @@ class GrpcEnrollmentRepository @Inject constructor(
 
             val response = stub.checkPairingStatus(request)
 
-            channelFactory.shutdownChannel(channel)
-
             when (response.status) {
                 PairingStatus.PAIRING_STATUS_APPROVED -> {
+                    // Fetch server info and save to database
+                    try {
+                        val serverInfo = getServerInfo(channel)
+                        val serverCertDer = extractServerCertificate(channel)
+                        val fingerprint = if (serverCertDer != null) {
+                            VerificationCodeGenerator.computeFingerprint(serverCertDer)
+                        } else {
+                            ""
+                        }
+
+                        enrolledServerRepository.saveServer(
+                            serverId = serverInfo.serverId,
+                            serverHost = host,
+                            serverPort = port,
+                            clientId = response.clientId,
+                            serverName = serverInfo.hostname,
+                            certFingerprint = fingerprint
+                        )
+                        Timber.i("Server info saved: serverId=${serverInfo.serverId}, hostname=${serverInfo.hostname}")
+                    } catch (e: Exception) {
+                        Timber.e(e, "Failed to fetch/save server info, continuing with enrollment")
+                    }
+
                     saveClientId(response.clientId)
                     Timber.i("Approval pairing approved: clientId=${response.clientId}")
+
+                    channelFactory.shutdownChannel(channel)
                     EnrollmentResult.Success(response.clientId)
                 }
                 PairingStatus.PAIRING_STATUS_PENDING -> {
+                    channelFactory.shutdownChannel(channel)
                     EnrollmentResult.Pending(requestId, 0, "")
                 }
                 PairingStatus.PAIRING_STATUS_REJECTED -> {
+                    channelFactory.shutdownChannel(channel)
                     Timber.w("Approval pairing rejected by user")
                     EnrollmentResult.Error("Pairing rejected by server")
                 }
                 PairingStatus.PAIRING_STATUS_TIMEOUT -> {
+                    channelFactory.shutdownChannel(channel)
                     Timber.w("Approval pairing timed out")
                     EnrollmentResult.Error("Pairing request timed out")
                 }
                 else -> {
+                    channelFactory.shutdownChannel(channel)
                     Timber.w("Unknown pairing status: ${response.status}")
                     EnrollmentResult.Error("Unknown pairing status")
                 }
@@ -273,6 +323,11 @@ class GrpcEnrollmentRepository @Inject constructor(
 
         Timber.d("Server certificate extracted: ${serverCert.subjectX500Principal}")
         return serverCert.encoded
+    }
+
+    private suspend fun getServerInfo(channel: ManagedChannel): ServerInfoResponse {
+        val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+        return stub.getServerInfo(ServerInfoRequest.getDefaultInstance())
     }
 
     private fun mapGrpcError(status: Status): String {

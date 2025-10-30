@@ -40,6 +40,7 @@ impl NotificationProvider for LinuxNotificationProvider {
         &self,
         device_name: &str,
         verification_code: &str,
+        _request_id: &str,
     ) -> Result<bool> {
         debug!(
             "Showing Linux D-Bus notification for device: {}",
@@ -56,8 +57,10 @@ impl NotificationProvider for LinuxNotificationProvider {
             .summary("HandControl Pairing Request")
             .body(&body)
             .icon("dialog-question")
-            .timeout(Timeout::Never) // Stay visible until user dismisses
+            .timeout(Timeout::Milliseconds(30000)) // 30 second timeout
             .urgency(notify_rust::Urgency::Critical) // High priority
+            .action("accept", "Accept")
+            .action("reject", "Reject")
             .show()
         {
             Ok(handle) => {
@@ -94,7 +97,11 @@ mod tests {
 
         // Only test if D-Bus is available
         if provider.is_available() {
-            let result = provider.show_pairing_notification("Test Device", "123-456");
+            let result = provider.show_pairing_notification(
+                "Test Device",
+                "123-456",
+                "test-request-id-123",
+            );
             // Should succeed or fail gracefully
             assert!(result.is_ok() || result.is_err());
         }

@@ -19,6 +19,7 @@ impl NotificationProvider for WindowsNotificationProvider {
         &self,
         _device_name: &str,
         _verification_code: &str,
+        _request_id: &str,
     ) -> Result<bool> {
         debug!("Windows notifications not yet implemented");
         Ok(false)

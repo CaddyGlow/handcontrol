@@ -28,8 +28,12 @@ pub struct NotificationResponse {
 pub trait NotificationProvider: Send + Sync {
     /// Show a pairing notification with Accept/Reject actions
     /// Returns true if notification was shown successfully
-    fn show_pairing_notification(&self, device_name: &str, verification_code: &str)
-    -> Result<bool>;
+    fn show_pairing_notification(
+        &self,
+        device_name: &str,
+        verification_code: &str,
+        request_id: &str,
+    ) -> Result<bool>;
 
     /// Check if notifications are available on this platform
     fn is_available(&self) -> bool;
@@ -82,9 +86,10 @@ impl NotificationManager {
         &self,
         device_name: &str,
         verification_code: &str,
+        request_id: &str,
     ) -> Result<bool> {
         self.provider
-            .show_pairing_notification(device_name, verification_code)
+            .show_pairing_notification(device_name, verification_code, request_id)
     }
 
     /// Check if notifications are available

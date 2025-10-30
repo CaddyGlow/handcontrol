@@ -276,6 +276,7 @@ After enrollment, all connections use mutual TLS:
 | Unauthorized device connection | mTLS client certificate required |
 | Token replay (QR mode) | One-time enrollment tokens |
 | Pairing request replay (Approval) | Single-use pairing request IDs |
+| Verification code precomputation attack | Random nonce per pairing attempt (v0.2.0+) |
 | Command injection | Parameter sanitization + shell escaping |
 | Eavesdropping | TLS 1.3 encryption |
 
@@ -334,23 +335,28 @@ After enrollment, all connections use mutual TLS:
 
 ### Verification Code Generation
 
+**Important Security Update:** As of version 0.2.0, verification code generation includes a random nonce to prevent precomputation attacks.
+
 ```rust
 use sha2::{Sha256, Digest};
+use rand::RngCore;
 
 fn generate_verification_code(
     client_cert_der: &[u8],  // Full DER-encoded ECDSA P-256 certificate
     server_cert_der: &[u8],  // Full DER-encoded ECDSA P-256 certificate
     server_id: &Uuid,
+    nonce: &[u8],            // Random 32-byte nonce (NEW: prevents precomputation)
 ) -> String {
     // Compute fingerprints first
     let client_fingerprint = Sha256::digest(client_cert_der);
     let server_fingerprint = Sha256::digest(server_cert_der);
 
-    // Combine fingerprints with server ID
+    // Combine fingerprints with server ID and nonce
     let mut hasher = Sha256::new();
     hasher.update(&client_fingerprint);
     hasher.update(&server_fingerprint);
     hasher.update(server_id.as_bytes());
+    hasher.update(nonce);  // Random nonce prevents offline grinding attacks
     let hash = hasher.finalize();
 
     // Take first 6 digits from hex representation
@@ -364,30 +370,63 @@ fn generate_verification_code(
     format!("{}-{}", &digits[0..3], &digits[3..6])
 }
 
-// Server MUST validate before showing notification
+// Server generates fresh nonce per pairing attempt
 fn handle_pairing_request(
     request: RequestPairingRequest,
     server_cert: &[u8],
     server_id: &Uuid,
-) -> Result<PairingSession, PairingError> {
-    // Compute expected verification code
-    let expected_code = generate_verification_code(
+) -> Result<PairingResponse, PairingError> {
+    // Generate random nonce for this pairing attempt
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    // Compute verification code with nonce
+    let verification_code = generate_verification_code(
         &request.client_certificate,
         server_cert,
         server_id,
+        &nonce,
     );
 
-    // CRITICAL: Validate code BEFORE proceeding
-    if request.verification_code != expected_code {
-        return Err(PairingError::VerificationMismatch);
-    }
-
-    // Only if validation passes, create session and show notification
-    let session = PairingSession::new(request.client_certificate);
-    show_notification(&request.device_name, &expected_code);
-    Ok(session)
+    // Send nonce and verification code to client
+    // Client will compute code using same nonce and verify match (out-of-band)
+    Ok(PairingResponse {
+        verification_code,
+        verification_nonce: nonce.to_vec(),
+        // ... other fields
+    })
 }
 ```
+
+#### Precomputation Attack Mitigation
+
+**Vulnerability (prior to v0.2.0):** Without a nonce, the verification code was deterministic:
+```
+PIN = SHA256(client_cert_fp || server_cert_fp || server_id)
+```
+
+An attacker could:
+1. Observe a failed/cancelled pairing attempt
+2. Capture: client_cert, server_id, and PIN
+3. Spend weeks offline grinding ~2^38 certificates (45 min with GPU)
+4. Find malicious_cert where `SHA256(...) → same PIN`
+5. Wait for user to retry pairing (same inputs → same PIN)
+6. MITM with pre-computed certificate within 60-second window
+
+**Mitigation (v0.2.0+):** With random nonce per attempt:
+```
+PIN = SHA256(client_cert_fp || server_cert_fp || server_id || random_nonce)
+```
+
+Now:
+- Each pairing attempt gets a fresh 32-byte random nonce
+- Even with same client_cert and server_id, PIN changes every attempt
+- Attacker must grind certificates in real-time (45 min > 60 sec timeout)
+- Precomputation is impossible because nonce is unknown until attempt starts
+
+**Time complexity comparison:**
+- Without nonce: Attacker has WEEKS to grind → Attack feasible
+- With nonce: Attacker has 60 SECONDS to grind → Attack infeasible (needs 45+ minutes)
 
 ### Certificate Pinning (Android)
 

@@ -148,18 +148,13 @@ class GrpcEnrollmentRepository @Inject constructor(
             }
 
             val effectiveServerId = resolvedServerId
-            val verificationCode = VerificationCodeGenerator.generate(
-                certificate.certificateDer,
-                serverCertDer,
-                effectiveServerId
-            )
-            Timber.d("Computed verification code=%s serverId=%s", verificationCode, effectiveServerId)
 
+            // Send pairing request WITHOUT verification code (will be computed after receiving nonce)
             val request = RequestPairingRequest.newBuilder()
                 .setDeviceName(deviceName)
                 .setDeviceModel(deviceModel ?: "")
                 .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
-                .setVerificationCode(verificationCode)
+                .setVerificationCode("")  // Empty - will compute after receiving nonce from server
                 .build()
 
             val response = stub.requestPairing(request)
@@ -169,6 +164,21 @@ class GrpcEnrollmentRepository @Inject constructor(
                 return EnrollmentResult.Error(response.errorMessage)
             }
 
+            // Compute verification code using nonce from server response
+            if (response.verificationNonce.isEmpty) {
+                Timber.e("Server did not provide verification nonce")
+                return EnrollmentResult.Error("Invalid server response: missing nonce")
+            }
+
+            val verificationCode = VerificationCodeGenerator.generate(
+                certificate.certificateDer,
+                serverCertDer,
+                effectiveServerId,
+                response.verificationNonce.toByteArray()
+            )
+            Timber.d("Computed verification code=%s serverId=%s", verificationCode, effectiveServerId)
+
+            // Verify server's code matches our computation
             if (response.verificationCode != verificationCode) {
                 Timber.e(
                     "Verification code mismatch - possible MITM attack! expected=%s actual=%s",

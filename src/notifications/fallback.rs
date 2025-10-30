@@ -19,18 +19,18 @@ impl NotificationProvider for FallbackNotificationProvider {
     fn show_pairing_notification(
         &self,
         device_name: &str,
-        _verification_code: &str,
+        verification_code: &str,
+        request_id: &str,
     ) -> Result<bool> {
         // Log to console - user must have terminal access
         info!("=================================================================");
         info!("PAIRING REQUEST from device: {}", device_name);
-        info!(
-            "Verification code displayed in notification (check terminal or notification center)"
-        );
+        info!("Verification Code: {}", verification_code);
+        info!("Request ID: {}", request_id);
         info!("=================================================================");
         info!("To approve or reject this request, use:");
-        info!("  handcontrol approve <request-id>  # Accept the pairing");
-        info!("  handcontrol reject <request-id>   # Reject the pairing");
+        info!("  handcontrol approve {}  # Accept the pairing", request_id);
+        info!("  handcontrol reject {}   # Reject the pairing", request_id);
         info!("=================================================================");
 
         Ok(true)
@@ -55,7 +55,11 @@ mod tests {
     #[test]
     fn test_fallback_show_notification() {
         let provider = FallbackNotificationProvider::new();
-        let result = provider.show_pairing_notification("Test Device", "123-456");
+        let result = provider.show_pairing_notification(
+            "Test Device",
+            "123-456",
+            "test-request-id-123",
+        );
         assert!(result.is_ok());
         assert!(result.unwrap());
     }

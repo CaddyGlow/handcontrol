@@ -246,6 +246,7 @@ impl RemoteControl for RemoteControlService {
                 verification_code: String::new(),
                 server_cert_fingerprint: vec![],
                 error_message: "Approval mode enrollment is disabled on this server".to_string(),
+                verification_nonce: vec![],
             }));
         }
 
@@ -258,15 +259,23 @@ impl RemoteControl for RemoteControlService {
             return Err(Status::invalid_argument("Client certificate is required"));
         }
 
+        // Generate random nonce for this pairing attempt (prevents precomputation attacks)
+        let mut nonce = [0u8; 32];
+        use rand::RngCore;
+        rand::thread_rng().fill_bytes(&mut nonce);
+
         // Generate verification code (server's computation)
         let server_verification_code = generate_verification_code(
             &req.client_certificate,
             &self.server_cert.cert_der,
             &self.server_id,
+            &nonce,
         );
 
-        // MANDATORY: Verify client's code matches server's
-        if req.verification_code != server_verification_code {
+        // Verify client's code matches server's (if client sent one)
+        // Note: With nonce-based verification, client computes code AFTER receiving nonce from server
+        // So this verification is now done on the client side (out-of-band verification)
+        if !req.verification_code.is_empty() && req.verification_code != server_verification_code {
             warn!(
                 "Pairing verification failed for device {}: code mismatch (possible MITM)",
                 req.device_name
@@ -278,6 +287,7 @@ impl RemoteControl for RemoteControlService {
                 verification_code: String::new(),
                 server_cert_fingerprint: vec![],
                 error_message: "Verification failed - possible MITM attack".to_string(),
+                verification_nonce: vec![],
             }));
         }
 
@@ -312,10 +322,11 @@ impl RemoteControl for RemoteControlService {
 
         // Show OS notification if available
         if self.config.security.enrollment.approval_notification {
-            match self
-                .notification_manager
-                .show_pairing_notification(&req.device_name, &server_verification_code)
-            {
+            match self.notification_manager.show_pairing_notification(
+                &req.device_name,
+                &server_verification_code,
+                &pairing_request.request_id,
+            ) {
                 Ok(true) => {
                     info!("Pairing notification shown for device {}", req.device_name);
                 }
@@ -340,6 +351,7 @@ impl RemoteControl for RemoteControlService {
             verification_code: server_verification_code,
             server_cert_fingerprint: self.server_cert.fingerprint.to_vec(),
             error_message: String::new(),
+            verification_nonce: nonce.to_vec(),
         }))
     }
 

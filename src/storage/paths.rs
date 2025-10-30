@@ -71,6 +71,11 @@ pub fn authorized_clients_metadata_path() -> Result<PathBuf> {
     Ok(authorized_clients_dir()?.join("metadata.toml"))
 }
 
+/// Get the path to the server ID file
+pub fn server_id_path() -> Result<PathBuf> {
+    Ok(config_dir()?.join("server_id.txt"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

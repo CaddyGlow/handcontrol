@@ -13,13 +13,13 @@ use handcontrol::security::enrollment::EnrollmentTokenManager;
 use handcontrol::security::pairing::PairingRequestManager;
 use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
+use handcontrol::storage;
 use handcontrol::utils::logging;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tracing::info;
-use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "handcontrol")]
@@ -425,9 +425,9 @@ async fn start_handcontrol_server() -> Result<()> {
         ClientStore::new(clients_dir).context("Failed to initialize client store")?,
     ));
 
-    // Generate server ID (UUID v4)
-    let server_id = Uuid::new_v4();
-    info!("Server ID: {}", server_id);
+    // Load or create persistent server ID
+    let server_id = storage::server_identity::load_or_create_server_id()
+        .context("Failed to initialize server ID")?;
 
     // Initialize enrollment token manager
     let enrollment_ttl = config.security.enrollment_token_ttl;

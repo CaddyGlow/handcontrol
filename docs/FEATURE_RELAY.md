@@ -171,7 +171,13 @@ relay_auth_secret = "base64-encoded-secret"
 max_relay_tunnels = 10
 auto_connect = true
 include_in_enrollment = true
+# allow_self_signed_tls = true               # Optional: accept self-signed relay certificate
+# pinned_cert_sha256 = "AA...FF"             # Optional: SHA-256 fingerprint when using self-signed TLS
 ```
+
+When connecting to a relay with a self-signed certificate, set `allow_self_signed_tls = true`.
+For additional protection, supply the relay's SHA-256 certificate fingerprint via `pinned_cert_sha256`
+so that only the expected certificate is trusted.
 
 #### 3. Android Client (Updated)
 

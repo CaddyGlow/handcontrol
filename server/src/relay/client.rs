@@ -1,8 +1,9 @@
 use crate::config::parser::RelayConfig;
 use crate::relay::tokens::TokenIssuer;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,13 +12,19 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tokio_tungstenite::{
-    MaybeTlsStream, WebSocketStream, connect_async,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, protocol::frame::Payload},
 };
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+#[derive(Debug, Clone, Copy)]
+struct RelayTlsOptions {
+    allow_self_signed: bool,
+    pinned_cert_sha256: Option<[u8; 32]>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum RelayClientState {
@@ -78,6 +85,13 @@ impl RelayClient {
         }
     }
 
+    fn tls_options(&self) -> Result<RelayTlsOptions> {
+        Ok(RelayTlsOptions {
+            allow_self_signed: self.config.allow_self_signed_tls,
+            pinned_cert_sha256: parse_pinned_cert(self.config.pinned_cert_sha256.as_deref())?,
+        })
+    }
+
     pub async fn get_state(&self) -> RelayClientState {
         self.state.read().await.clone()
     }
@@ -124,9 +138,28 @@ impl RelayClient {
         let register_url = format!("{}/register", relay_url);
         info!(url = %register_url, "Connecting to relay server");
 
-        let (ws_stream, _) = connect_async(&register_url)
-            .await
-            .context("Failed to connect to relay server")?;
+        let tls_options = self.tls_options()?;
+
+        let (ws_stream, _) = if register_url.starts_with("wss://") {
+            if let Some(connector) = build_tls_connector(tls_options)? {
+                tokio_tungstenite::connect_async_tls_with_config(
+                    &register_url,
+                    None,
+                    false,
+                    Some(connector),
+                )
+                .await
+                .context("Failed to connect to relay server")?
+            } else {
+                connect_async(&register_url)
+                    .await
+                    .context("Failed to connect to relay server")?
+            }
+        } else {
+            connect_async(&register_url)
+                .await
+                .context("Failed to connect to relay server")?
+        };
 
         let (mut sink, mut stream) = ws_stream.split();
 
@@ -247,9 +280,11 @@ impl RelayClient {
         let tunnel_url = format!("{}/tunnel/{}?role=server", relay_url, tunnel_id);
         let local_endpoint = self.local_grpc_endpoint;
         let tunnel_id = tunnel_id.to_string();
+        let tls_options = self.tls_options()?;
 
         tokio::spawn(async move {
-            if let Err(e) = handle_tunnel(tunnel_url, tunnel_id, local_endpoint).await {
+            if let Err(e) = handle_tunnel(tunnel_url, tunnel_id, local_endpoint, tls_options).await
+            {
                 error!("Tunnel task failed: {:#}", e);
             }
         });
@@ -263,13 +298,31 @@ async fn handle_tunnel(
     tunnel_url: String,
     tunnel_id: String,
     local_endpoint: SocketAddr,
+    tls_options: RelayTlsOptions,
 ) -> Result<()> {
     info!(tunnel_id = %tunnel_id, "Opening tunnel to relay");
 
     // Connect to relay tunnel endpoint
-    let (ws_stream, _) = connect_async(&tunnel_url)
-        .await
-        .context("Failed to connect to tunnel endpoint")?;
+    let (ws_stream, _) = if tunnel_url.starts_with("wss://") {
+        if let Some(connector) = build_tls_connector(tls_options)? {
+            tokio_tungstenite::connect_async_tls_with_config(
+                &tunnel_url,
+                None,
+                false,
+                Some(connector),
+            )
+            .await
+            .context("Failed to connect to tunnel endpoint")?
+        } else {
+            connect_async(&tunnel_url)
+                .await
+                .context("Failed to connect to tunnel endpoint")?
+        }
+    } else {
+        connect_async(&tunnel_url)
+            .await
+            .context("Failed to connect to tunnel endpoint")?
+    };
 
     let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
@@ -349,6 +402,115 @@ async fn handle_tunnel(
     Ok(())
 }
 
+fn parse_pinned_cert(value: Option<&str>) -> Result<Option<[u8; 32]>> {
+    if let Some(fingerprint) = value {
+        let normalized: String = fingerprint
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace() && *c != ':')
+            .collect();
+
+        if normalized.is_empty() {
+            bail!("relay.pinned_cert_sha256 must not be empty");
+        }
+
+        let bytes = hex::decode(&normalized)
+            .context("relay.pinned_cert_sha256 must be valid hexadecimal")?;
+
+        if bytes.len() != 32 {
+            bail!("relay.pinned_cert_sha256 must decode to 32 bytes (SHA-256)");
+        }
+
+        let mut fingerprint_bytes = [0u8; 32];
+        fingerprint_bytes.copy_from_slice(&bytes);
+        Ok(Some(fingerprint_bytes))
+    } else {
+        Ok(None)
+    }
+}
+
+fn build_tls_connector(tls_options: RelayTlsOptions) -> Result<Option<Connector>> {
+    use rustls::DigitallySignedStruct;
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+
+    if !tls_options.allow_self_signed {
+        return Ok(None);
+    }
+
+    #[derive(Debug)]
+    struct AcceptSelfSignedVerifier {
+        pinned_cert_sha256: Option<[u8; 32]>,
+    }
+
+    impl ServerCertVerifier for AcceptSelfSignedVerifier {
+        fn verify_server_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            if let Some(expected) = self.pinned_cert_sha256 {
+                let digest = Sha256::digest(end_entity.as_ref());
+                let digest_bytes: &[u8] = digest.as_ref();
+                let expected_bytes: &[u8] = expected.as_ref();
+                if digest_bytes != expected_bytes {
+                    return Err(rustls::Error::InvalidCertificate(
+                        rustls::CertificateError::ApplicationVerificationFailure,
+                    ));
+                }
+            }
+
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            vec![
+                rustls::SignatureScheme::RSA_PKCS1_SHA256,
+                rustls::SignatureScheme::RSA_PKCS1_SHA384,
+                rustls::SignatureScheme::RSA_PKCS1_SHA512,
+                rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+                rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+                rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+                rustls::SignatureScheme::RSA_PSS_SHA256,
+                rustls::SignatureScheme::RSA_PSS_SHA384,
+                rustls::SignatureScheme::RSA_PSS_SHA512,
+                rustls::SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let mut client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptSelfSignedVerifier {
+            pinned_cert_sha256: tls_options.pinned_cert_sha256,
+        }))
+        .with_no_client_auth();
+
+    client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    Ok(Some(Connector::Rustls(std::sync::Arc::new(client_config))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,5 +522,22 @@ mod tests {
 
         let error_state = RelayClientState::Error("test error".to_string());
         assert!(matches!(error_state, RelayClientState::Error(_)));
+    }
+
+    #[test]
+    fn test_parse_pinned_cert_valid() {
+        let fingerprint = (0..32).map(|_| "AA").collect::<Vec<_>>().join(":");
+
+        let parsed = parse_pinned_cert(Some(&fingerprint)).expect("should parse");
+        assert_eq!(parsed, Some([0xAA; 32]));
+    }
+
+    #[test]
+    fn test_parse_pinned_cert_invalid_length() {
+        let err = parse_pinned_cert(Some("DEADBEEF")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("relay.pinned_cert_sha256 must decode to 32 bytes")
+        );
     }
 }

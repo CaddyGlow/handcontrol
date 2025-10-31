@@ -28,6 +28,23 @@ fn validate_server_config(config: &Config) -> Result<()> {
         bail!("Enrollment token TTL cannot be 0");
     }
 
+    if let Some(fingerprint) = config.relay.pinned_cert_sha256.as_ref() {
+        if !config.relay.allow_self_signed_tls {
+            bail!("relay.pinned_cert_sha256 requires relay.allow_self_signed_tls to be true");
+        }
+
+        let normalized: String = fingerprint
+            .chars()
+            .filter(|c| !c.is_ascii_whitespace() && *c != ':')
+            .collect();
+
+        if normalized.len() != 64 || !normalized.chars().all(|c| c.is_ascii_hexdigit()) {
+            bail!(
+                "relay.pinned_cert_sha256 must be a SHA-256 fingerprint (64 hex characters, colons optional)"
+            );
+        }
+    }
+
     if config.relay.enabled {
         let relay_url = config
             .relay

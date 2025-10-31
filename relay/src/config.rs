@@ -17,6 +17,10 @@ pub struct RelayConfig {
     pub public_hostname: Option<String>,
     #[serde(default)]
     pub registration_secrets: HashMap<Uuid, String>,
+    #[serde(default)]
+    pub tls_cert_path: Option<PathBuf>,
+    #[serde(default)]
+    pub tls_key_path: Option<PathBuf>,
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<RelayConfig> {

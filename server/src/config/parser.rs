@@ -103,6 +103,11 @@ pub struct RelayConfig {
     pub include_in_enrollment: bool,
     #[serde(default = "default_relay_reconnect_delay")]
     pub reconnect_delay_seconds: u64,
+    /// Allow the relay client to accept self-signed TLS certificates
+    #[serde(default)]
+    pub allow_self_signed_tls: bool,
+    /// Optional SHA-256 fingerprint used to pin the relay certificate
+    pub pinned_cert_sha256: Option<String>,
 }
 
 impl Default for RelayConfig {
@@ -115,6 +120,8 @@ impl Default for RelayConfig {
             auto_connect: true,
             include_in_enrollment: true,
             reconnect_delay_seconds: default_relay_reconnect_delay(),
+            allow_self_signed_tls: false,
+            pinned_cert_sha256: None,
         }
     }
 }

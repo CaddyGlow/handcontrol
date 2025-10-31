@@ -52,17 +52,33 @@ async fn main() -> Result<()> {
     let config = load_config(&config_path)
         .with_context(|| format!("Failed to load relay configuration {:?}", config_path))?;
 
+    // Keep TLS paths before moving config
+    let tls_cert_path = config.tls_cert_path.clone();
+    let tls_key_path = config.tls_key_path.clone();
+
     let state = Arc::new(AppState::new(config));
 
     let app = build_router(state.clone());
 
     let addr: SocketAddr = state.listen_addr.parse().context("Invalid bind address")?;
 
-    info!("Starting relay on {}", state.listen_addr);
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-
-    axum::serve(listener, app.into_make_service()).await?;
+    // Check if TLS is configured
+    match (tls_cert_path, tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            info!("Starting relay with TLS on {}", state.listen_addr);
+            serve_with_tls(addr, app, cert_path, key_path).await?;
+        }
+        (None, None) => {
+            info!("Starting relay without TLS on {}", state.listen_addr);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            axum::serve(listener, app.into_make_service()).await?;
+        }
+        _ => {
+            anyhow::bail!(
+                "Both tls_cert_path and tls_key_path must be specified for TLS, or neither for plain HTTP"
+            );
+        }
+    }
 
     Ok(())
 }
@@ -73,6 +89,51 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/connect", get(connect_handler))
         .route("/tunnel/:tunnel_id", get(tunnel_handler))
         .with_state(state)
+}
+
+async fn serve_with_tls(
+    addr: SocketAddr,
+    app: Router,
+    cert_path: std::path::PathBuf,
+    key_path: std::path::PathBuf,
+) -> Result<()> {
+    use rustls_pemfile::{certs, private_key};
+    use std::fs::File;
+    use std::io::BufReader;
+
+    // Load TLS certificate
+    let cert_file = File::open(&cert_path)
+        .with_context(|| format!("Failed to open certificate file: {}", cert_path.display()))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let certs: Vec<_> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse certificate")?;
+
+    if certs.is_empty() {
+        anyhow::bail!("No certificates found in {}", cert_path.display());
+    }
+
+    // Load TLS private key
+    let key_file = File::open(&key_path)
+        .with_context(|| format!("Failed to open private key file: {}", key_path.display()))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key = private_key(&mut key_reader)
+        .context("Failed to read private key")?
+        .context("No private key found")?;
+
+    // Configure TLS
+    let server_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("Failed to build TLS config")?;
+
+    let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
+
+    // Serve with TLS using axum-server
+    axum_server::bind_rustls(addr, tls_config)
+        .serve(app.into_make_service())
+        .await
+        .context("TLS server failed")
 }
 
 #[derive(Clone)]
@@ -199,6 +260,8 @@ impl AppState {
             handshake_timeout_seconds,
             public_hostname,
             registration_secrets,
+            tls_cert_path: _,
+            tls_key_path: _,
         } = config;
 
         let listen_addr = format!("{}:{}", bind_address, port);

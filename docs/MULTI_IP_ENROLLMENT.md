@@ -948,6 +948,8 @@ enabled = false
 relay_server_url = "https://relay.example.com:50052"
 relay_auth_secret = "server-secret"
 auto_connect = true
+# allow_self_signed_tls = true
+# pinned_cert_sha256 = "AA...FF"
 
 [relay.client]
 prefer_relay = false        # Try relay before fallback IPs

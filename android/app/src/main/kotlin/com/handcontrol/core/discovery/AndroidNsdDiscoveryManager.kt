@@ -4,21 +4,23 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.os.Build
+import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
-import kotlinx.coroutines.channels.awaitClose
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import timber.log.Timber
-import java.util.concurrent.Executor
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class AndroidNsdDiscoveryManager @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val enrolledServerRepository: EnrolledServerRepository
 ) : NsdDiscoveryManager {
 
     private val nsdManager: NsdManager by lazy {
@@ -31,6 +33,7 @@ class AndroidNsdDiscoveryManager @Inject constructor(
     private val discoveredServers = mutableMapOf<String, DiscoveredServer>()
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var isDiscovering = false
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     override suspend fun startDiscovery() {
         if (isDiscovering) {
@@ -64,9 +67,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                             val serverId = extractServerId(serviceInfo)
                             val version = extractVersion(serviceInfo)
 
-                            val host = serviceInfo.hostAddresses.firstOrNull()?.hostAddress
-                                ?: serviceInfo.hostAddresses.firstOrNull()?.hostName
-                                ?: "unknown"
+                            val ipAddresses = extractHostAddresses(serviceInfo)
+                            val host = ipAddresses.firstOrNull() ?: "unknown"
 
                             val server = DiscoveredServer(
                                 name = serviceInfo.serviceName,
@@ -74,7 +76,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                                 port = serviceInfo.port,
                                 fingerprint = fingerprint,
                                 serverId = serverId,
-                                version = version
+                                version = version,
+                                ips = ipAddresses
                             )
 
                             discoveredServers[serviceInfo.serviceName] = server
@@ -88,6 +91,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                                 server.serverId,
                                 server.fingerprint
                             )
+
+                            mergeDiscoveredIps(serverId, ipAddresses)
                         }
 
                         override fun onServiceLost() {
@@ -114,7 +119,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                             val version = extractVersion(serviceInfo)
 
                             @Suppress("DEPRECATION")
-                            val host = serviceInfo.host?.hostAddress ?: serviceInfo.host?.hostName ?: "unknown"
+                            val ipAddresses = extractHostAddressesLegacy(serviceInfo)
+                            val host = ipAddresses.firstOrNull() ?: "unknown"
 
                             val server = DiscoveredServer(
                                 name = serviceInfo.serviceName,
@@ -122,7 +128,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                                 port = serviceInfo.port,
                                 fingerprint = fingerprint,
                                 serverId = serverId,
-                                version = version
+                                version = version,
+                                ips = ipAddresses
                             )
 
                             discoveredServers[serviceInfo.serviceName] = server
@@ -136,6 +143,8 @@ class AndroidNsdDiscoveryManager @Inject constructor(
                                 server.serverId,
                                 server.fingerprint
                             )
+
+                            mergeDiscoveredIps(serverId, ipAddresses)
                         }
                     }
                     nsdManager.resolveService(serviceInfo, resolveListener)
@@ -212,6 +221,54 @@ class AndroidNsdDiscoveryManager @Inject constructor(
     private fun extractVersion(serviceInfo: NsdServiceInfo): String? {
         return serviceInfo.attributes?.get("version")?.let { bytes ->
             String(bytes, Charsets.UTF_8)
+        }
+    }
+
+    private fun extractHostAddresses(serviceInfo: NsdServiceInfo): List<String> {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return extractHostAddressesLegacy(serviceInfo)
+        }
+
+        val addresses = mutableListOf<String>()
+
+        for (address in serviceInfo.hostAddresses) {
+            val hostAddress = address?.hostAddress
+            if (!hostAddress.isNullOrBlank() && hostAddress !in addresses) {
+                addresses.add(hostAddress)
+            }
+        }
+
+        return addresses
+    }
+
+    @Suppress("DEPRECATION")
+    private fun extractHostAddressesLegacy(serviceInfo: NsdServiceInfo): List<String> {
+        val addresses = mutableListOf<String>()
+        serviceInfo.host?.hostAddress?.let { addresses.add(it) }
+        serviceInfo.host?.hostName?.let { hostName ->
+            if (hostName.isNotBlank() && hostName !in addresses) {
+                addresses.add(hostName)
+            }
+        }
+        return addresses
+    }
+
+    private fun mergeDiscoveredIps(serverId: String?, ips: List<String>) {
+        if (serverId.isNullOrBlank() || ips.isEmpty()) {
+            return
+        }
+
+        val filteredIps = ips.filter { it.isNotBlank() && it != "unknown" }
+        if (filteredIps.isEmpty()) {
+            return
+        }
+
+        scope.launch {
+            try {
+                enrolledServerRepository.mergeServerIps(serverId, filteredIps)
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to merge discovered IPs for $serverId")
+            }
         }
     }
 

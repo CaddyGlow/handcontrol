@@ -78,4 +78,8 @@ class EnrolledServerRepository @Inject constructor(
     suspend fun getServerByHostAndPort(host: String, port: Int): EnrolledServerEntity? {
         return enrolledServerDao.getServerByHostAndPort(host, port)
     }
+
+    suspend fun mergeServerIps(serverId: String, discoveredIps: List<String>) {
+        enrolledServerDao.mergeServerIpsTransactional(serverId, discoveredIps)
+    }
 }

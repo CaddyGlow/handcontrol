@@ -5,6 +5,7 @@ import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -44,4 +45,34 @@ interface EnrolledServerDao {
 
     @Query("SELECT * FROM enrolled_servers WHERE serverHost = :host AND serverPort = :port")
     suspend fun getServerByHostAndPort(host: String, port: Int): EnrolledServerEntity?
+
+    @Query(
+        """
+        UPDATE enrolled_servers 
+        SET ips = :ips, serverHost = :primaryHost 
+        WHERE serverId = :serverId
+        """
+    )
+    suspend fun updateServerIps(serverId: String, ips: List<String>, primaryHost: String?)
+
+    @Transaction
+    suspend fun mergeServerIpsTransactional(serverId: String, discoveredIps: List<String>) {
+        if (discoveredIps.isEmpty()) {
+            return
+        }
+
+        val server = getServerById(serverId) ?: return
+
+        val sanitized = (server.ips + discoveredIps)
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        if (sanitized.isEmpty() || sanitized == server.ips) {
+            return
+        }
+
+        val primaryHost = sanitized.firstOrNull()
+        updateServerIps(serverId, sanitized, primaryHost)
+    }
 }

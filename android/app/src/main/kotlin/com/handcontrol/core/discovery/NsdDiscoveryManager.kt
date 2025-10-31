@@ -8,7 +8,8 @@ data class DiscoveredServer(
     val port: Int,
     val fingerprint: String?,
     val serverId: String?,
-    val version: String?
+    val version: String?,
+    val ips: List<String> = emptyList()
 )
 
 interface NsdDiscoveryManager {

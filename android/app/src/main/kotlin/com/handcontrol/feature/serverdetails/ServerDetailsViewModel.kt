@@ -144,7 +144,14 @@ class ServerDetailsViewModel @Inject constructor(
 
         // Try to match by IP and port
         return discoveredServers.find { discovered ->
-            server.ips.any { ip -> discovered.host == ip } && discovered.port == server.serverPort
+            val discoveredIps = if (discovered.ips.isNotEmpty()) {
+                discovered.ips
+            } else {
+                listOf(discovered.host)
+            }
+
+            discovered.port == server.serverPort &&
+                server.ips.any { ip -> discoveredIps.contains(ip) }
         }
     }
 

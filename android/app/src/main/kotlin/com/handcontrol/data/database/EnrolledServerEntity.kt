@@ -11,6 +11,12 @@ enum class ConnectionMode {
     UNKNOWN      // Unknown/not yet connected
 }
 
+enum class ConnectionPreference {
+    AUTO,          // Try direct first, fall back to relay
+    DIRECT_ONLY,   // Use direct connections only
+    RELAY_ONLY     // Force relay, skip direct attempts
+}
+
 @Entity(
     tableName = "enrolled_servers",
     indices = [
@@ -40,6 +46,7 @@ data class EnrolledServerEntity(
     val relayEnabled: Boolean = false,
     val relayUrl: String? = null,
     val relayToken: String? = null,
+    val connectionPreference: ConnectionPreference = ConnectionPreference.AUTO,
     val lastConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN,
 
     // Deprecated but kept for migration compatibility

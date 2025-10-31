@@ -27,6 +27,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -54,6 +55,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.core.model.ServerDetailInfo
 import com.handcontrol.core.model.ServerHealthStatus
 import com.handcontrol.data.database.ConnectionMode
+import com.handcontrol.data.database.ConnectionPreference
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -143,6 +145,7 @@ fun ServerDetailsScreen(
                 ServerDetailsContent(
                     serverInfo = state.serverInfo,
                     onTestConnection = { viewModel.checkHealth() },
+                    onConnectionPreferenceChanged = { viewModel.updateConnectionPreference(it) },
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(paddingValues)
@@ -183,6 +186,7 @@ fun ServerDetailsScreen(
 private fun ServerDetailsContent(
     serverInfo: ServerDetailInfo,
     onTestConnection: () -> Unit,
+    onConnectionPreferenceChanged: (ConnectionPreference) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -196,7 +200,10 @@ private fun ServerDetailsContent(
 
         // Connection Details Section
         InfoSection(title = "Connection Details") {
-            ConnectionDetailsContent(serverInfo)
+            ConnectionDetailsContent(
+                serverInfo = serverInfo,
+                onPreferenceChanged = onConnectionPreferenceChanged
+            )
         }
 
         // Server Identity Section
@@ -320,7 +327,10 @@ private fun InfoSection(
 }
 
 @Composable
-private fun ConnectionDetailsContent(serverInfo: ServerDetailInfo) {
+private fun ConnectionDetailsContent(
+    serverInfo: ServerDetailInfo,
+    onPreferenceChanged: (ConnectionPreference) -> Unit
+) {
     val context = LocalContext.current
 
     // Primary IP:Port
@@ -372,6 +382,56 @@ private fun ConnectionDetailsContent(serverInfo: ServerDetailInfo) {
             value = serverInfo.relayUrl,
             isCopyable = true,
             context = context
+        )
+    }
+
+    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+    Text(
+        text = "Connection Preference",
+        style = MaterialTheme.typography.labelMedium,
+        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+    )
+    Spacer(modifier = Modifier.height(8.dp))
+
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        FilterChip(
+            selected = serverInfo.connectionPreference == ConnectionPreference.AUTO,
+            onClick = { onPreferenceChanged(ConnectionPreference.AUTO) },
+            label = { Text("Auto") }
+        )
+
+        FilterChip(
+            selected = serverInfo.connectionPreference == ConnectionPreference.DIRECT_ONLY,
+            onClick = { onPreferenceChanged(ConnectionPreference.DIRECT_ONLY) },
+            label = { Text("Direct only") }
+        )
+
+        FilterChip(
+            selected = serverInfo.connectionPreference == ConnectionPreference.RELAY_ONLY,
+            onClick = { onPreferenceChanged(ConnectionPreference.RELAY_ONLY) },
+            label = { Text("Relay only") },
+            enabled = serverInfo.relayEnabled
+        )
+    }
+
+    Spacer(modifier = Modifier.height(4.dp))
+    val preferenceDescription = when (serverInfo.connectionPreference) {
+        ConnectionPreference.AUTO -> "Try direct first, fall back to relay if available."
+        ConnectionPreference.DIRECT_ONLY -> "Always use direct IPs and skip relay fallback."
+        ConnectionPreference.RELAY_ONLY -> "Connect exclusively through the relay tunnel."
+    }
+    Text(
+        text = preferenceDescription,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.7f)
+    )
+
+    if (!serverInfo.relayEnabled) {
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "Configure relay on the server to enable relay-only mode.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error.copy(alpha = 0.8f)
         )
     }
 }

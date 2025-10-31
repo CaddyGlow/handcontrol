@@ -1,6 +1,7 @@
 package com.handcontrol.core.model
 
 import com.handcontrol.data.database.ConnectionMode
+import com.handcontrol.data.database.ConnectionPreference
 
 /**
  * Represents the result of a health check on a server.
@@ -53,6 +54,7 @@ data class ServerDetailInfo(
     val enrolledAt: Long,
     val lastConnected: Long?,
     val lastConnectionMode: ConnectionMode,
+    val connectionPreference: ConnectionPreference,
     val relayEnabled: Boolean = false,
     val relayUrl: String? = null,
     val healthStatus: ServerHealthStatus = ServerHealthStatus.Unknown,

@@ -8,6 +8,7 @@ import com.handcontrol.core.discovery.NsdDiscoveryManager
 import com.handcontrol.core.model.ServerDetailInfo
 import com.handcontrol.core.model.ServerHealthStatus
 import com.handcontrol.core.network.ServerHealthChecker
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerEntity
 import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -118,6 +119,13 @@ class ServerDetailsViewModel @Inject constructor(
         }
     }
 
+    fun updateConnectionPreference(preference: ConnectionPreference) {
+        viewModelScope.launch {
+            Timber.i("Updating connection preference for server $serverId to $preference")
+            enrolledServerRepository.updateConnectionPreference(serverId, preference)
+        }
+    }
+
     override fun onCleared() {
         super.onCleared()
         healthCheckJob?.cancel()
@@ -169,6 +177,7 @@ class ServerDetailsViewModel @Inject constructor(
             enrolledAt = enrolledAt,
             lastConnected = lastConnected,
             lastConnectionMode = lastConnectionMode,
+            connectionPreference = connectionPreference,
             relayEnabled = relayEnabled,
             relayUrl = relayUrl,
             healthStatus = healthStatus,

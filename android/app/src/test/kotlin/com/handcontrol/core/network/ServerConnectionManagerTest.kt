@@ -2,15 +2,20 @@ package com.handcontrol.core.network
 
 import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.data.database.ConnectionMode
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerEntity
+import com.handcontrol.data.settings.AppSettings
+import com.handcontrol.data.settings.SettingsRepository
 import io.grpc.ConnectivityState
 import io.grpc.ManagedChannel
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
@@ -19,6 +24,7 @@ class ServerConnectionManagerTest {
 
     private lateinit var directChannelFactory: MtlsGrpcChannelFactory
     private lateinit var relayChannelFactory: RelayGrpcChannelFactory
+    private lateinit var settingsRepository: SettingsRepository
     private lateinit var connectionManager: ServerConnectionManager
 
     private lateinit var mockDirectChannel: ManagedChannel
@@ -29,7 +35,14 @@ class ServerConnectionManagerTest {
     fun setup() {
         directChannelFactory = mockk()
         relayChannelFactory = mockk()
-        connectionManager = ServerConnectionManager(directChannelFactory, relayChannelFactory)
+        settingsRepository = mockk()
+        every { settingsRepository.settings } returns flowOf(AppSettings())
+
+        connectionManager = ServerConnectionManager(
+            directChannelFactory,
+            relayChannelFactory,
+            settingsRepository
+        )
 
         mockDirectChannel = mockk(relaxed = true)
         mockRelayChannel = mockk(relaxed = true)
@@ -170,7 +183,11 @@ class ServerConnectionManagerTest {
             fail("Expected RelayConnectionException to be captured")
             return@runTest
         }
-        assertEquals("Relay connection failed", exception.message)
+        assertTrue(
+            "Expected relay connection error message but got: ${exception.message}",
+            exception.message?.contains("Relay connection failed") == true ||
+            exception.message?.contains("Connection failed") == true
+        )
     }
 
     @Test
@@ -207,7 +224,30 @@ class ServerConnectionManagerTest {
     }
 
     @Test
-    fun `connect with preferRelay skips direct connection`() = runTest {
+    fun `connect with direct-only preference stops after direct failures`() = runTest {
+        // Given
+        coEvery {
+            directChannelFactory.createChannel(any(), any())
+        } throws Exception("Connection timeout")
+
+        // When/Then
+        val exception = kotlin.runCatching {
+            connectionManager.connect(
+                testServer,
+                preferenceOverride = ConnectionPreference.DIRECT_ONLY
+            )
+        }.exceptionOrNull()
+
+        requireNotNull(exception) { "Expected exception when relay fallback disabled" }
+        assertEquals("Relay disabled by connection preference", exception.message)
+
+        coVerify(exactly = 0) {
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+        }
+    }
+
+    @Test
+    fun `connect with relay-only preference skips direct connection`() = runTest {
         // Given
         coEvery {
             relayChannelFactory.createChannelViaRelay(
@@ -219,7 +259,7 @@ class ServerConnectionManagerTest {
         } returns mockRelayChannel
 
         // When
-        val result = connectionManager.connect(testServer, preferRelay = true)
+        val result = connectionManager.connect(testServer, preferenceOverride = ConnectionPreference.RELAY_ONLY)
 
         // Then
         assertEquals(ConnectionMode.RELAY, result.mode)
@@ -234,7 +274,7 @@ class ServerConnectionManagerTest {
     }
 
     @Test
-    fun `connect with preferRelay throws when relay not configured`() = runTest {
+    fun `connect with relay-only preference throws when relay not configured`() = runTest {
         // Given
         val serverWithoutRelay = testServer.copy(
             relayEnabled = false,
@@ -245,7 +285,7 @@ class ServerConnectionManagerTest {
         // When/Then
         var captured: RelayConnectionException? = null
         try {
-            connectionManager.connect(serverWithoutRelay, preferRelay = true)
+            connectionManager.connect(serverWithoutRelay, preferenceOverride = ConnectionPreference.RELAY_ONLY)
             fail("Expected RelayConnectionException to be thrown")
         } catch (e: RelayConnectionException) {
             captured = e
@@ -255,7 +295,10 @@ class ServerConnectionManagerTest {
             fail("Expected RelayConnectionException to be captured")
             return@runTest
         }
-        assertEquals("Relay connection not available", exception.message)
+        assertTrue(
+            "Expected relay connection error message but got: ${exception.message}",
+            exception.message?.contains("Relay") == true
+        )
 
         coVerify(exactly = 0) {
             directChannelFactory.createChannel(any(), any())

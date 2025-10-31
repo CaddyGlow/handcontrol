@@ -25,7 +25,10 @@ object DatabaseModule {
             HandControlDatabase::class.java,
             "handcontrol_database"
         )
-            .addMigrations(HandControlDatabase.MIGRATION_1_2)
+            .addMigrations(
+                HandControlDatabase.MIGRATION_1_2,
+                HandControlDatabase.MIGRATION_2_3
+            )
             .build()
     }
 

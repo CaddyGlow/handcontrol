@@ -1,5 +1,6 @@
 package com.handcontrol.data.commands
 
+import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.network.ServerConnectionManager
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.ExecuteCommandRequest
@@ -51,6 +52,9 @@ class GrpcCommandRepository @Inject constructor(
                     os = response.os
                 )
             )
+        } catch (e: RelayConnectionException) {
+            Timber.e(e, "Relay connection failed: ${e.shortMessage}")
+            Result.failure(Exception(e.userMessage, e))
         } catch (e: StatusException) {
             Timber.e(e, "Failed to get server info")
             Result.failure(Exception(mapGrpcError(e.status)))
@@ -110,6 +114,9 @@ class GrpcCommandRepository @Inject constructor(
 
             Timber.i("Loaded ${commands.size} commands from server")
             Result.success(commands)
+        } catch (e: RelayConnectionException) {
+            Timber.e(e, "Relay connection failed: ${e.shortMessage}")
+            Result.failure(Exception(e.userMessage, e))
         } catch (e: StatusException) {
             Timber.e(e, "Failed to list commands")
             Result.failure(Exception(mapGrpcError(e.status)))

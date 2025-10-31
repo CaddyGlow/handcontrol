@@ -52,6 +52,7 @@ enum ControlMessage {
         client_id: String,
         preferred_protocol: String,
         expires_at: u64,
+        server_secret: String,
     },
     #[serde(rename = "ping")]
     Ping {},
@@ -71,6 +72,7 @@ pub struct RelayClient {
     token_issuer: Arc<TokenIssuer>,
     local_grpc_endpoint: SocketAddr,
     state: Arc<RwLock<RelayClientState>>,
+    tls_authority: String,
 }
 
 impl RelayClient {
@@ -86,6 +88,7 @@ impl RelayClient {
             token_issuer,
             local_grpc_endpoint,
             state: Arc::new(RwLock::new(RelayClientState::Disconnected)),
+            tls_authority: format!("handcontrol.local:{}", local_grpc_endpoint.port()),
         }
     }
 
@@ -185,6 +188,7 @@ impl RelayClient {
             "capabilities": ["relay.v1"],
             "public_key": public_key,
             "max_tunnels": self.config.max_relay_tunnels.unwrap_or(10),
+            "tls_authority": self.tls_authority,
         });
 
         {
@@ -291,13 +295,14 @@ impl RelayClient {
             ControlMessage::OpenTunnel {
                 tunnel_id,
                 client_id,
+                server_secret,
                 ..
             } => {
                 info!(
                     "Relay requested tunnel {} for client {}",
                     tunnel_id, client_id
                 );
-                self.spawn_tunnel_task(&tunnel_id).await?;
+                self.spawn_tunnel_task(&tunnel_id, &server_secret).await?;
             }
             ControlMessage::Ping {} => {
                 // Pong is handled by WebSocket library
@@ -310,14 +315,19 @@ impl RelayClient {
         Ok(())
     }
 
-    async fn spawn_tunnel_task(&self, tunnel_id: &str) -> Result<()> {
+    async fn spawn_tunnel_task(&self, tunnel_id: &str, server_secret: &str) -> Result<()> {
         let relay_url = self
             .config
             .relay_server_url
             .as_ref()
             .context("relay_server_url not configured")?;
 
-        let tunnel_url = format!("{}/tunnel/{}?role=server", relay_url, tunnel_id);
+        let encoded_secret: String =
+            url::form_urlencoded::byte_serialize(server_secret.as_bytes()).collect();
+        let tunnel_url = format!(
+            "{}/tunnel/{}?role=server&token={}",
+            relay_url, tunnel_id, encoded_secret
+        );
         let local_endpoint = self.local_grpc_endpoint;
         let tunnel_id = tunnel_id.to_string();
         let tls_options = self.tls_options()?;

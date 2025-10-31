@@ -34,6 +34,9 @@ interface EnrolledServerDao {
     @Query("UPDATE enrolled_servers SET last_connected = :timestamp, lastConnectionMode = :mode WHERE serverId = :serverId")
     suspend fun updateConnectionMode(serverId: String, timestamp: Long, mode: ConnectionMode)
 
+    @Query("UPDATE enrolled_servers SET connectionPreference = :preference WHERE serverId = :serverId")
+    suspend fun updateConnectionPreference(serverId: String, preference: ConnectionPreference)
+
     @Delete
     suspend fun deleteServer(server: EnrolledServerEntity)
 
@@ -69,6 +72,7 @@ interface EnrolledServerDao {
         val sanitized = (server.ips + discoveredIps)
             .map { it.trim() }
             .filter { it.isNotEmpty() }
+            .filterNot { it.equals("unknown", ignoreCase = true) }
             .distinct()
 
         if (sanitized.isEmpty() || sanitized == server.ips) {

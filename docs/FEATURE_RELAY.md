@@ -252,6 +252,7 @@ All control messages are UTF-8 JSON frames with `type` as the discriminator. The
   "status": "ok",
   "tunnel_id": "<uuid>",
   "relay_host": "relay.example.com",
+  "server_authority": "handcontrol.local:50051",
   "expires_at": 1735689600
 }
 
@@ -261,7 +262,8 @@ All control messages are UTF-8 JSON frames with `type` as the discriminator. The
   "tunnel_id": "<uuid>",
   "client_id": "<uuid>",
   "preferred_protocol": "binary",
-  "expires_at": 1735689600
+  "expires_at": 1735689600,
+  "server_secret": "<base64 token>"
 }
 
 // Server acknowledges readiness and switches to binary mode
@@ -510,6 +512,11 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         return Ok(());
     }
 
+    if claims.sub != client_id.to_string() {
+        send_error(&mut socket, "connect_ack", "client_mismatch").await?;
+        return Ok(());
+    }
+
     if !claims.permissions.iter().any(|p| p == "connect") {
         send_error(&mut socket, "connect_ack", "permission_denied").await?;
         return Ok(());
@@ -524,6 +531,8 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         .map(|dur| dur.as_secs())
         .unwrap_or(0);
 
+    let server_secret = generate_server_secret();
+
     if server_entry
         .control_tx
         .send(ServerCommand::OpenTunnel {
@@ -531,6 +540,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             client_id,
             preferred_protocol: "binary",
             expires_at,
+            server_secret: server_secret.clone(),
         })
         .await
         .is_err()
@@ -547,6 +557,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
                 "status": "ok",
                 "tunnel_id": tunnel_id.to_string(),
                 "relay_host": state.relay_host,
+                "server_authority": server_entry.tls_authority,
                 "expires_at": expires_at,
             })
             .to_string(),

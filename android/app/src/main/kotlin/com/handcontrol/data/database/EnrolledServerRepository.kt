@@ -38,7 +38,8 @@ class EnrolledServerRepository @Inject constructor(
             serverHost = serverHost,  // Keep for migration compatibility
             relayEnabled = relayEnabled,
             relayUrl = relayUrl,
-            relayToken = relayToken
+            relayToken = relayToken,
+            connectionPreference = ConnectionPreference.AUTO
         )
         enrolledServerDao.insertServer(server)
     }
@@ -49,6 +50,10 @@ class EnrolledServerRepository @Inject constructor(
 
     suspend fun updateConnectionMode(serverId: String, mode: ConnectionMode) {
         enrolledServerDao.updateConnectionMode(serverId, System.currentTimeMillis(), mode)
+    }
+
+    suspend fun updateConnectionPreference(serverId: String, preference: ConnectionPreference) {
+        enrolledServerDao.updateConnectionPreference(serverId, preference)
     }
 
     suspend fun removeServer(serverId: String) {

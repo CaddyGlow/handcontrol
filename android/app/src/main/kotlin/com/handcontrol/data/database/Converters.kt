@@ -26,4 +26,18 @@ class Converters {
             ConnectionMode.UNKNOWN
         }
     }
+
+    @TypeConverter
+    fun fromConnectionPreference(value: ConnectionPreference): String {
+        return value.name
+    }
+
+    @TypeConverter
+    fun toConnectionPreference(value: String): ConnectionPreference {
+        return try {
+            ConnectionPreference.valueOf(value)
+        } catch (e: IllegalArgumentException) {
+            ConnectionPreference.AUTO
+        }
+    }
 }

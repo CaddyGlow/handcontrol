@@ -5,7 +5,7 @@ use anyhow::{Context, Result, anyhow};
 use axum::{
     Router,
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     response::IntoResponse,
@@ -19,6 +19,7 @@ use futures_util::{
 };
 use handcontrol_relay::tunnel::state::TunnelState;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -151,6 +152,7 @@ struct AppState {
 struct RegisteredServer {
     control_tx: mpsc::Sender<ServerCommand>,
     decoding_key: Arc<DecodingKey>,
+    tls_authority: Option<String>,
 }
 
 enum ServerCommand {
@@ -159,6 +161,7 @@ enum ServerCommand {
         client_id: Uuid,
         preferred_protocol: &'static str,
         expires_at: u64,
+        server_secret: String,
     },
 }
 
@@ -170,6 +173,7 @@ impl ServerCommand {
                 client_id,
                 preferred_protocol,
                 expires_at,
+                server_secret,
             } => {
                 let payload = serde_json::json!({
                     "type": "open_tunnel",
@@ -177,6 +181,7 @@ impl ServerCommand {
                     "client_id": client_id.to_string(),
                     "preferred_protocol": preferred_protocol,
                     "expires_at": expires_at,
+                    "server_secret": server_secret,
                 });
                 Message::Text(payload.to_string())
             }
@@ -188,15 +193,17 @@ struct TunnelHandle {
     state: Mutex<TunnelState>,
     client_ws: Mutex<Option<WebSocket>>,
     server_ws: Mutex<Option<WebSocket>>,
+    server_secret: Mutex<Option<String>>,
     notify: Notify,
 }
 
 impl TunnelHandle {
-    fn new(now: Instant) -> Self {
+    fn new(now: Instant, server_secret: String) -> Self {
         Self {
             state: Mutex::new(TunnelState::new(now)),
             client_ws: Mutex::new(None),
             server_ws: Mutex::new(None),
+            server_secret: Mutex::new(Some(server_secret)),
             notify: Notify::new(),
         }
     }
@@ -250,6 +257,17 @@ impl TunnelHandle {
 
     async fn take_server_socket(&self) -> Option<WebSocket> {
         self.server_ws.lock().await.take()
+    }
+
+    async fn verify_server_secret(&self, provided: &str) -> bool {
+        let mut guard = self.server_secret.lock().await;
+        if let Some(expected) = guard.as_ref() {
+            if ConstantTimeEq::ct_eq(expected.as_bytes(), provided.as_bytes()).into() {
+                guard.take();
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -318,10 +336,14 @@ impl AppState {
         self.registered_servers.read().await.get(server_id).cloned()
     }
 
-    async fn create_tunnel(&self, tunnel_id: Uuid, now: Instant) -> Arc<TunnelHandle> {
-        let entry = Arc::new(TunnelHandle::new(now));
+    async fn create_tunnel(&self, tunnel_id: Uuid, now: Instant) -> (Arc<TunnelHandle>, String) {
+        let mut secret_bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut secret_bytes);
+        let server_secret = Base64.encode(secret_bytes);
+
+        let entry = Arc::new(TunnelHandle::new(now, server_secret.clone()));
         self.tunnels.write().await.insert(tunnel_id, entry.clone());
-        entry
+        (entry, server_secret)
     }
 
     async fn get_tunnel(&self, tunnel_id: &Uuid) -> Option<Arc<TunnelHandle>> {
@@ -429,12 +451,15 @@ async fn connect_handler(
 async fn tunnel_handler(
     ws: WebSocketUpgrade,
     Path(tunnel_id): Path<String>,
+    Query(query): Query<TunnelQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         match Uuid::parse_str(&tunnel_id) {
             Ok(tunnel_uuid) => {
-                if let Err(err) = handle_tunnel_socket(socket, state.clone(), tunnel_uuid).await {
+                if let Err(err) =
+                    handle_tunnel_socket(socket, state.clone(), tunnel_uuid, query).await
+                {
                     warn!("Tunnel socket error: {err:?}");
                     state.remove_tunnel(&tunnel_uuid).await;
                 }
@@ -455,6 +480,8 @@ struct RegisterPayload {
     capabilities: Vec<String>,
     public_key: String,
     max_tunnels: Option<u32>,
+    #[serde(default)]
+    tls_authority: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -484,6 +511,8 @@ struct ConnectAck {
     tunnel_id: String,
     relay_host: String,
     expires_at: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_authority: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -493,6 +522,12 @@ struct TunnelReadyPayload {
     r#type: String,
     tunnel_id: String,
     role: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TunnelQuery {
+    role: Option<String>,
+    token: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -521,6 +556,7 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     let msg: RegisterPayload =
         serde_json::from_str(&payload).context("Failed to parse register payload")?;
     trace!("Received register payload");
+    info!("Register payload tls_authority={:?}", msg.tls_authority);
 
     if msg.r#type != "register" {
         anyhow::bail!("unexpected message type {}", msg.r#type);
@@ -566,6 +602,13 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
         server_id, msg.capabilities
     );
 
+    let tls_authority = msg
+        .tls_authority
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
     let ack = RegisterAck {
         r#type: "register_ack",
         status: "ok",
@@ -581,6 +624,7 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     let server_entry = Arc::new(RegisteredServer {
         control_tx: tx.clone(),
         decoding_key,
+        tls_authority,
     });
 
     state.upsert_server(server_id, server_entry).await;
@@ -648,6 +692,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 
     let server_id = Uuid::parse_str(&msg.server_id).context("invalid server_id")?;
     let client_id = Uuid::parse_str(&msg.client_id).context("invalid client_id")?;
+    let client_id_str = client_id.to_string();
     Span::current().record("server_id", &field::display(&server_id));
     Span::current().record("client_id", &field::display(&client_id));
     debug!("Valid connect request parsed");
@@ -713,6 +758,25 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         return Ok(());
     }
 
+    if claims.sub != client_id_str {
+        warn!(
+            "Relay token subject {} did not match requested client {}",
+            claims.sub, client_id
+        );
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "connect_ack",
+                    "status": "error",
+                    "error": "client_mismatch"
+                })
+                .to_string(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return Ok(());
+    }
+
     let claims_server = match Uuid::parse_str(&claims.server_id) {
         Ok(uuid) => uuid,
         Err(_) => {
@@ -762,7 +826,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     }
 
     let tunnel_id = Uuid::new_v4();
-    let tunnel_entry = state.create_tunnel(tunnel_id, Instant::now()).await;
+    let (tunnel_entry, server_secret) = state.create_tunnel(tunnel_id, Instant::now()).await;
     Span::current().record("tunnel_id", &field::display(&tunnel_id));
     info!(
         "Issued tunnel {} for client {} via server {}",
@@ -782,6 +846,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             client_id,
             preferred_protocol: "binary",
             expires_at,
+            server_secret: server_secret.clone(),
         })
         .await
         .is_err()
@@ -808,7 +873,14 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         tunnel_id: tunnel_id.to_string(),
         relay_host: state.relay_host.clone(),
         expires_at,
+        server_authority: server_entry.tls_authority.clone(),
     };
+
+    if server_entry.tls_authority.is_none() {
+        warn!(
+            "No TLS authority registered for server {server_id}; clients must fall back to local default"
+        );
+    }
 
     socket
         .send(Message::Text(serde_json::to_string(&ack)?))
@@ -851,32 +923,55 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     let wait_result = timeout(state.handshake_timeout, async move {
         loop {
             handle_wait.notify.notified().await;
+
             if let Some((client_ws, server_ws)) = handle_wait.take_pair_if_ready().await {
                 info!("Tunnel {} is now active", tunnel_id);
                 spawn_forwarders(state_clone.clone(), tunnel_id, client_ws, server_ws);
                 break;
-            } else {
-                trace!("Notified but tunnel pair not ready yet");
             }
+
+            let already_active = {
+                let guard = handle_wait.state.lock().await;
+                guard.is_fully_ready()
+            };
+
+            if already_active {
+                trace!(
+                    "Tunnel {} already active; connect handler exiting",
+                    tunnel_id
+                );
+                break;
+            }
+
+            trace!("Notified but tunnel pair not ready yet");
         }
     })
     .await;
 
     if wait_result.is_err() {
-        warn!("Tunnel {} expired waiting for server", tunnel_id);
-        if let Some(mut client_ws) = handle_cleanup.take_client_socket().await {
-            let _ = client_ws
-                .send(Message::Text(
-                    serde_json::json!({
-                        "type": "tunnel_failed",
-                        "reason": "timeout"
-                    })
-                    .to_string(),
-                ))
-                .await;
-            let _ = client_ws.close().await;
+        let already_ready = {
+            let guard = tunnel_entry.state.lock().await;
+            guard.is_fully_ready()
+        };
+
+        if already_ready {
+            trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
+        } else {
+            warn!("Tunnel {} expired waiting for server", tunnel_id);
+            if let Some(mut client_ws) = handle_cleanup.take_client_socket().await {
+                let _ = client_ws
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "tunnel_failed",
+                            "reason": "timeout"
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                let _ = client_ws.close().await;
+            }
+            state.remove_tunnel(&tunnel_id).await;
         }
-        state.remove_tunnel(&tunnel_id).await;
     }
 
     Ok(())
@@ -887,6 +982,7 @@ async fn handle_tunnel_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
     tunnel_id: Uuid,
+    query: TunnelQuery,
 ) -> Result<()> {
     trace!("Server tunnel socket established");
     let Some(entry) = state.get_tunnel(&tunnel_id).await else {
@@ -899,6 +995,48 @@ async fn handle_tunnel_socket(
             .await;
         return Ok(());
     };
+
+    if query.role.as_deref() != Some("server") {
+        warn!(
+            "Tunnel {} missing or invalid role query parameter",
+            tunnel_id
+        );
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: u16::from(CloseCode::Policy),
+                reason: "invalid_role".into(),
+            })))
+            .await;
+        state.remove_tunnel(&tunnel_id).await;
+        return Ok(());
+    }
+
+    let Some(token) = query.token.as_ref() else {
+        warn!("Tunnel {} missing server authentication token", tunnel_id);
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: u16::from(CloseCode::Policy),
+                reason: "missing_token".into(),
+            })))
+            .await;
+        state.remove_tunnel(&tunnel_id).await;
+        return Ok(());
+    };
+
+    if !entry.verify_server_secret(token).await {
+        warn!(
+            "Tunnel {} received invalid server authentication token",
+            tunnel_id
+        );
+        let _ = socket
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: u16::from(CloseCode::Policy),
+                reason: "invalid_token".into(),
+            })))
+            .await;
+        state.remove_tunnel(&tunnel_id).await;
+        return Ok(());
+    }
 
     let Some(Ok(Message::Text(payload))) = socket.recv().await else {
         anyhow::bail!("server tunnel closed before tunnel_ready");
@@ -933,8 +1071,22 @@ async fn handle_tunnel_socket(
     let wait_result = timeout(state.handshake_timeout, async move {
         loop {
             handle_wait.notify.notified().await;
+
             if let Some((client_ws, server_ws)) = handle_wait.take_pair_if_ready().await {
                 spawn_forwarders(state_clone.clone(), tunnel_id, client_ws, server_ws);
+                break;
+            }
+
+            let already_active = {
+                let guard = handle_wait.state.lock().await;
+                guard.is_fully_ready()
+            };
+
+            if already_active {
+                trace!(
+                    "Tunnel {} already active; server handler exiting",
+                    tunnel_id
+                );
                 break;
             }
         }
@@ -942,17 +1094,26 @@ async fn handle_tunnel_socket(
     .await;
 
     if wait_result.is_err() {
-        warn!("Tunnel {} expired waiting for client", tunnel_id);
-        if let Some(mut server_ws) = handle_cleanup.take_server_socket().await {
-            trace!("Closing server websocket after timeout");
-            let _ = server_ws
-                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                    code: u16::from(CloseCode::Normal),
-                    reason: "timeout".into(),
-                })))
-                .await;
+        let already_ready = {
+            let guard = entry.state.lock().await;
+            guard.is_fully_ready()
+        };
+
+        if already_ready {
+            trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
+        } else {
+            warn!("Tunnel {} expired waiting for client", tunnel_id);
+            if let Some(mut server_ws) = handle_cleanup.take_server_socket().await {
+                trace!("Closing server websocket after timeout");
+                let _ = server_ws
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: u16::from(CloseCode::Normal),
+                        reason: "timeout".into(),
+                    })))
+                    .await;
+            }
+            state.remove_tunnel(&tunnel_id).await;
         }
-        state.remove_tunnel(&tunnel_id).await;
     }
 
     Ok(())
@@ -1063,7 +1224,7 @@ mod tests {
     #[derive(Serialize)]
     struct TestClaims {
         iss: &'static str,
-        sub: &'static str,
+        sub: String,
         aud: String,
         exp: u64,
         iat: u64,
@@ -1120,6 +1281,7 @@ mod tests {
             "capabilities": ["relay.v1"],
             "public_key": public_key_base64,
             "max_tunnels": 4,
+            "tls_authority": "handcontrol.local:50051",
         });
         control_sink
             .send(WsMessage::Text(register_msg.to_string().into()))
@@ -1133,8 +1295,13 @@ mod tests {
             ack_value["status"], "ok",
             "connect ack error: {ack_value:?}"
         );
+        match &ack_value["server_authority"] {
+            Value::String(value) => assert_eq!(value, "handcontrol.local:50051"),
+            Value::Null => (),
+            other => panic!("unexpected server_authority field: {other:?}"),
+        }
 
-        let (open_tunnel_tx, open_tunnel_rx) = oneshot::channel();
+        let (open_tunnel_tx, open_tunnel_rx) = oneshot::channel::<(Uuid, String)>();
         let control_task = tokio::spawn(async move {
             let mut open_tunnel_tx = Some(open_tunnel_tx);
             let mut control_sink = control_sink;
@@ -1145,11 +1312,13 @@ mod tests {
                         let owned = text.to_string();
                         if let Ok(value) = serde_json::from_str::<Value>(&owned) {
                             if value["type"] == "open_tunnel" {
-                                if let (Some(tx), Some(tunnel_id_str)) =
-                                    (open_tunnel_tx.take(), value["tunnel_id"].as_str())
-                                {
+                                if let (Some(tx), Some(tunnel_id_str), Some(secret_str)) = (
+                                    open_tunnel_tx.take(),
+                                    value["tunnel_id"].as_str(),
+                                    value["server_secret"].as_str(),
+                                ) {
                                     let tunnel_id = Uuid::parse_str(tunnel_id_str).unwrap();
-                                    let _ = tx.send(tunnel_id);
+                                    let _ = tx.send((tunnel_id, secret_str.to_string()));
                                 }
                             }
                         }
@@ -1167,13 +1336,15 @@ mod tests {
         let connect_url = format!("ws://{addr}/connect");
         let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
 
+        let client_id = Uuid::new_v4();
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let claims = TestClaims {
             iss: "handcontrol-server",
-            sub: "test-client",
+            sub: client_id.to_string(),
             aud: "127.0.0.1".to_string(),
             exp: now + 60,
             iat: now,
@@ -1185,7 +1356,6 @@ mod tests {
 
         // Token validation happens in the relay server; we trust the relay to validate correctly
 
-        let client_id = Uuid::new_v4();
         let connect_msg = json!({
             "type": "connect",
             "server_id": server_id.to_string(),
@@ -1201,10 +1371,16 @@ mod tests {
         let ack_msg = client_ws.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
         let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        assert_eq!(ack_value["type"], "connect_ack");
         assert_eq!(
             ack_value["status"], "ok",
             "connect ack error: {ack_value:?}"
         );
+        match &ack_value["server_authority"] {
+            Value::String(value) => assert_eq!(value, "handcontrol.local:50051"),
+            Value::Null => (),
+            other => panic!("unexpected server_authority field: {other:?}"),
+        }
         let tunnel_id = Uuid::parse_str(ack_value["tunnel_id"].as_str().unwrap()).unwrap();
 
         let ready_msg = json!({
@@ -1217,10 +1393,13 @@ mod tests {
             .await
             .unwrap();
 
-        let tunnel_id_notify = open_tunnel_rx.await.unwrap();
+        let (tunnel_id_notify, server_secret) = open_tunnel_rx.await.unwrap();
         assert_eq!(tunnel_id, tunnel_id_notify);
 
-        let server_tunnel_url = format!("ws://{addr}/tunnel/{tunnel_id}?role=server");
+        let secret_param: String =
+            url::form_urlencoded::byte_serialize(server_secret.as_bytes()).collect();
+        let server_tunnel_url =
+            format!("ws://{addr}/tunnel/{tunnel_id}?role=server&token={secret_param}");
         let (server_tunnel_ws, _) = connect_async(server_tunnel_url).await.unwrap();
         let (mut server_sink, mut server_stream) = server_tunnel_ws.split();
         let ready_msg = json!({
@@ -1302,6 +1481,7 @@ mod tests {
             "capabilities": ["relay.v1"],
             "public_key": public_key_base64,
             "max_tunnels": 1,
+            "tls_authority": "handcontrol.local:50051",
         });
         control_sink
             .send(WsMessage::Text(register_msg.to_string().into()))
@@ -1312,6 +1492,11 @@ mod tests {
         let ack_text = ack_msg.into_text().unwrap().to_string();
         let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
         assert_eq!(ack_value["status"], "ok");
+        match &ack_value["server_authority"] {
+            Value::String(value) => assert_eq!(value, "handcontrol.local:50051"),
+            Value::Null => (),
+            other => panic!("unexpected server_authority field: {other:?}"),
+        }
 
         let control_task = tokio::spawn(async move {
             while let Some(msg) = control_stream.next().await {
@@ -1329,13 +1514,15 @@ mod tests {
         let connect_url = format!("ws://{addr}/connect");
         let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
 
+        let client_id = Uuid::new_v4();
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
         let claims = TestClaims {
             iss: "handcontrol-server",
-            sub: "test-client",
+            sub: client_id.to_string(),
             aud: "127.0.0.1".to_string(),
             exp: now + 2,
             iat: now,
@@ -1349,7 +1536,7 @@ mod tests {
             "type": "connect",
             "server_id": server_id.to_string(),
             "relay_token": token,
-            "client_id": Uuid::new_v4().to_string(),
+            "client_id": client_id.to_string(),
             "client_version": "integration-test",
         });
         client_ws
@@ -1385,6 +1572,112 @@ mod tests {
 
         let _ = client_ws.close(None).await;
         control_task.abort(); // Control task runs infinite loop, must abort
+        server_handle.abort();
+        let _ = server_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_rejects_client_mismatch() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"relayed-secret".as_ref());
+        let config = test_config(server_id, &secret, 5);
+        let state = Arc::new(AppState::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app_state = state.clone();
+        let server_handle = tokio::spawn(async move {
+            axum::serve(listener, build_router(app_state).into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let signing_key = SigningKey::from_bytes(&[11u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_base64 = Base64.encode(verifying_key.to_bytes());
+        let private_der = signing_key.to_pkcs8_der().unwrap();
+        let encoding_key = EncodingKey::from_ed_der(private_der.as_bytes());
+
+        // Register server
+        let register_url = format!("ws://{addr}/register");
+        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (mut control_sink, mut control_stream) = control_ws.split();
+
+        let register_msg = json!({
+            "type": "register",
+            "server_id": server_id.to_string(),
+            "relay_secret": secret,
+            "server_version": "test",
+            "capabilities": ["relay.v1"],
+            "public_key": public_key_base64,
+            "max_tunnels": 1,
+            "tls_authority": "handcontrol.local:50051",
+        });
+        control_sink
+            .send(WsMessage::Text(register_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = control_stream.next().await.unwrap().unwrap();
+        let ack_text = ack_msg.into_text().unwrap().to_string();
+        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        assert_eq!(ack_value["status"], "ok");
+
+        let control_task = tokio::spawn(async move {
+            while let Some(msg) = control_stream.next().await {
+                match msg {
+                    Ok(WsMessage::Ping(data)) => {
+                        let _ = control_sink.send(WsMessage::Pong(data)).await;
+                    }
+                    Ok(WsMessage::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        // Client connects with mismatched client_id
+        let connect_url = format!("ws://{addr}/connect");
+        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+
+        let client_id_in_token = Uuid::new_v4();
+        let mismatched_client_id = Uuid::new_v4();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = TestClaims {
+            iss: "handcontrol-server",
+            sub: client_id_in_token.to_string(),
+            aud: "127.0.0.1".to_string(),
+            exp: now + 60,
+            iat: now,
+            server_id: server_id.to_string(),
+            permissions: vec!["connect"],
+        };
+        let token =
+            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key).unwrap();
+
+        let connect_msg = json!({
+            "type": "connect",
+            "server_id": server_id.to_string(),
+            "relay_token": token,
+            "client_id": mismatched_client_id.to_string(),
+            "client_version": "integration-test",
+        });
+        client_ws
+            .send(WsMessage::Text(connect_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = client_ws.next().await.unwrap().unwrap();
+        let ack_text = ack_msg.into_text().unwrap().to_string();
+        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        assert_eq!(ack_value["status"], "error");
+        assert_eq!(ack_value["error"], "client_mismatch");
+
+        let _ = client_ws.close(None).await;
+        control_task.abort();
         server_handle.abort();
         let _ = server_handle.await;
     }

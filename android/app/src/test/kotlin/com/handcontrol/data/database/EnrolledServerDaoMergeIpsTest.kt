@@ -126,11 +126,19 @@ class EnrolledServerDaoMergeIpsTest {
             throw NotImplementedError("Not needed for this test")
         }
 
+        override suspend fun updateConnectionPreference(serverId: String, preference: ConnectionPreference) {
+            throw NotImplementedError("Not needed for this test")
+        }
+
         override suspend fun deleteServer(server: EnrolledServerEntity) {
             throw NotImplementedError("Not needed for this test")
         }
 
         override suspend fun deleteServerById(serverId: String) {
+            throw NotImplementedError("Not needed for this test")
+        }
+
+        override suspend fun deleteAllServers() {
             throw NotImplementedError("Not needed for this test")
         }
 

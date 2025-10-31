@@ -4,6 +4,7 @@ import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.data.settings.IpPreference
 import com.handcontrol.data.settings.SettingsRepository
 import com.handcontrol.data.database.ConnectionMode
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerEntity
 import io.grpc.ConnectivityState
 import io.grpc.ManagedChannel
@@ -15,6 +16,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.flow.first
 import timber.log.Timber
+import java.io.IOException
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -53,17 +55,20 @@ class ServerConnectionManager @Inject constructor(
      * 3. Return the successful connection or throw exception
      *
      * @param server The enrolled server to connect to
-     * @param preferRelay If true, skip direct and go straight to relay
+     * @param preferenceOverride Optional override for the stored connection preference
      * @return ConnectionResult with the established channel and connection mode
      * @throws Exception if all connection attempts fail
      */
     suspend fun connect(
         server: EnrolledServerEntity,
-        preferRelay: Boolean = false
+        preferenceOverride: ConnectionPreference? = null
     ): ConnectionResult = withContext(Dispatchers.IO) {
         Timber.i("Connecting to server ${server.serverName} (${server.serverId})")
 
         val settings = settingsRepository.settings.first()
+        val preference = preferenceOverride ?: server.connectionPreference
+        val preferRelay = preference == ConnectionPreference.RELAY_ONLY
+        val allowRelayFallback = preference != ConnectionPreference.DIRECT_ONLY
         val directTimeoutMs = TimeUnit.SECONDS.toMillis(
             settings.directConnectionTimeoutSeconds
                 .coerceIn(1, 30)
@@ -74,7 +79,7 @@ class ServerConnectionManager @Inject constructor(
             "Connection preferences -> IPv6=%s, directTimeoutMs=%d, relayFallback=%s, candidateIps=%s",
             settings.ipv6Preference,
             directTimeoutMs,
-            settings.enableRelayFallback,
+            settings.enableRelayFallback && allowRelayFallback,
             orderedIps
         )
 
@@ -86,13 +91,23 @@ class ServerConnectionManager @Inject constructor(
                 Timber.i("Successfully connected via direct mode to ${directResult.connectedAddress}")
                 return@withContext directResult
             }
+
+            if (!allowRelayFallback) {
+                Timber.i("Connection preference set to direct-only; skipping relay fallback")
+                throw Exception("Relay disabled by connection preference")
+            }
         }
 
         // Direct connection failed or was skipped, try relay if available
         if (server.relayEnabled && server.relayUrl != null && server.relayToken != null) {
-            if (!settings.enableRelayFallback) {
-                Timber.i("Relay fallback disabled in settings; skipping relay attempt")
-                throw Exception("Relay fallback disabled by user preference")
+            if (!settings.enableRelayFallback || !allowRelayFallback) {
+                val reason = if (!settings.enableRelayFallback) {
+                    "user settings"
+                } else {
+                    "connection preference"
+                }
+                Timber.i("Relay fallback disabled by $reason; skipping relay attempt")
+                throw Exception("Relay fallback disabled by $reason")
             }
 
             Timber.i("Direct connection ${if (preferRelay) "skipped" else "failed"}, attempting relay connection")
@@ -206,6 +221,11 @@ class ServerConnectionManager @Inject constructor(
         }
     }
 
+    private fun defaultRelayAuthority(server: EnrolledServerEntity): String {
+        val preferredHost = server.serverHost?.trim()?.takeIf { it.isNotEmpty() }
+        return preferredHost ?: "handcontrol.local:${server.serverPort}"
+    }
+
     /**
      * Attempts connection through relay server
      *
@@ -214,7 +234,10 @@ class ServerConnectionManager @Inject constructor(
      */
     private suspend fun tryRelayConnection(server: EnrolledServerEntity): ConnectionResult {
         if (!server.relayEnabled || server.relayUrl == null || server.relayToken == null) {
-            throw RelayConnectionException("Relay not properly configured for server ${server.serverId}")
+            throw RelayConnectionException(
+                "Relay not configured",
+                "The server does not have relay support enabled or is missing relay configuration."
+            )
         }
 
         try {
@@ -225,7 +248,8 @@ class ServerConnectionManager @Inject constructor(
                     relayUrl = server.relayUrl,
                     serverId = server.serverId,
                     relayToken = server.relayToken,
-                    clientId = server.clientId
+                    clientId = server.clientId,
+                    defaultAuthority = defaultRelayAuthority(server)
                 )
             }
 
@@ -237,12 +261,28 @@ class ServerConnectionManager @Inject constructor(
 
         } catch (e: TimeoutCancellationException) {
             throw RelayConnectionException(
-                "Timed out after ${RELAY_CONNECT_TIMEOUT_MS}ms waiting for relay handshake",
+                "Connection timeout",
+                "Failed to establish relay connection within ${RELAY_CONNECT_TIMEOUT_MS / 1000} seconds. The relay server may be unreachable.",
                 e
             )
+        } catch (e: RelayConnectionException) {
+            // Re-throw with more context if needed
+            throw e
+        } catch (e: IOException) {
+            val errorMsg = when {
+                e.message?.contains("Software caused connection abort") == true ->
+                    "Network connection was interrupted or lost."
+                e.message?.contains("Failed to connect") == true ->
+                    "Unable to reach the relay server. Check your internet connection."
+                e.message?.contains("tunnel health check") == true ->
+                    "Relay connection became unresponsive and was closed."
+                else -> e.message ?: "Network error occurred during relay connection."
+            }
+            throw RelayConnectionException("Network error", errorMsg, e)
         } catch (e: Exception) {
             throw RelayConnectionException(
-                e.message ?: "Relay connection error (${e.javaClass.simpleName})",
+                "Connection failed",
+                e.message ?: "An unexpected error occurred: ${e.javaClass.simpleName}",
                 e
             )
         }
@@ -304,7 +344,18 @@ class ServerConnectionManager @Inject constructor(
     }
 }
 
+/**
+ * Exception thrown when relay connection fails
+ *
+ * @param shortMessage Brief error description for logging
+ * @param userMessage Detailed, user-friendly error message
+ * @param cause The underlying cause of the error
+ */
 class RelayConnectionException(
-    message: String,
+    val shortMessage: String,
+    val userMessage: String = shortMessage,
     cause: Throwable? = null
-) : Exception(message, cause)
+) : Exception("$shortMessage: $userMessage", cause) {
+    // Convenience constructor for backwards compatibility
+    constructor(message: String, cause: Throwable? = null) : this(message, message, cause)
+}

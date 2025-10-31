@@ -3,9 +3,11 @@ package com.handcontrol.data.database
 import io.mockk.Runs
 import io.mockk.coEvery
 import io.mockk.coVerify
+import io.mockk.every
 import io.mockk.just
 import io.mockk.mockk
 import io.mockk.slot
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -20,6 +22,9 @@ class EnrolledServerRepositoryTest {
     @Before
     fun setup() {
         enrolledServerDao = mockk()
+        every { enrolledServerDao.getAllServers() } returns flowOf(emptyList())
+        every { enrolledServerDao.observeLastConnectedServer() } returns flowOf(null)
+
         repository = EnrolledServerRepository(enrolledServerDao)
     }
 
@@ -113,6 +118,25 @@ class EnrolledServerRepositoryTest {
             "Second timestamp should be after first",
             timestamps[1] > timestamps[0]
         )
+    }
+
+    @Test
+    fun `updateConnectionPreference delegates to DAO`() = runTest {
+        // Given
+        val serverId = "test-server-id"
+        val preference = ConnectionPreference.RELAY_ONLY
+
+        coEvery {
+            enrolledServerDao.updateConnectionPreference(serverId, preference)
+        } just Runs
+
+        // When
+        repository.updateConnectionPreference(serverId, preference)
+
+        // Then
+        coVerify(exactly = 1) {
+            enrolledServerDao.updateConnectionPreference(serverId, preference)
+        }
     }
 
     @Test

@@ -8,7 +8,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
     entities = [EnrolledServerEntity::class],
-    version = 2,
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(Converters::class)
@@ -28,6 +28,12 @@ abstract class HandControlDatabase : RoomDatabase() {
 
                 // Migrate existing serverHost values to ips (backward compatibility)
                 database.execSQL("UPDATE enrolled_servers SET ips = serverHost WHERE serverHost IS NOT NULL AND serverHost != ''")
+            }
+        }
+
+        val MIGRATION_2_3 = object : Migration(2, 3) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE enrolled_servers ADD COLUMN connectionPreference TEXT NOT NULL DEFAULT 'AUTO'")
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.handcontrol.core.network.relay
 
 import com.handcontrol.core.security.ClientCertificateManager
+import com.handcontrol.core.security.VerificationCodeGenerator
 import io.grpc.ManagedChannel
 import io.grpc.okhttp.OkHttpChannelBuilder
 import kotlinx.coroutines.CoroutineScope
@@ -47,7 +48,8 @@ class RelayGrpcChannelFactory @Inject constructor(
         relayUrl: String,
         serverId: String,
         relayToken: String,
-        clientId: String
+        clientId: String,
+        defaultAuthority: String
     ): ManagedChannel = withContext(Dispatchers.IO) {
         Timber.i("Creating gRPC channel via relay for server $serverId")
 
@@ -60,18 +62,27 @@ class RelayGrpcChannelFactory @Inject constructor(
             clientVersion = "0.1.0"
         )
 
-        Timber.d("Relay tunnel established, tunnel_id=${tunnel.tunnelId}")
+        Timber.d(
+            "Relay tunnel established, tunnel_id=${tunnel.tunnelId}, relay_host=${tunnel.relayHost}, server_authority=${tunnel.serverAuthority}"
+        )
 
         // Create local TCP bridge
         val bridge = startLocalBridge(tunnel)
 
         Timber.d("Local bridge started on port ${bridge.localPort}")
 
+        val authority = tunnel.serverAuthority ?: defaultAuthority
+        if (tunnel.serverAuthority == null) {
+            Timber.w(
+                "Relay connect_ack omitted server authority; falling back to default '$defaultAuthority'"
+            )
+        }
+
         // Create mTLS gRPC channel to localhost (which forwards to relay)
         val channel = createMtlsChannel(
             host = "localhost",
             port = bridge.localPort,
-            authority = tunnel.authority
+            authority = authority
         )
 
         activeBridges[channel] = bridge
@@ -147,6 +158,17 @@ class RelayGrpcChannelFactory @Inject constructor(
     private suspend fun bridgeSocketToTunnel(socket: Socket, tunnel: RelayTunnel) {
         Timber.d("Starting bidirectional bridge for socket ${socket.remoteSocketAddress}")
 
+        // Check tunnel health before starting
+        if (!tunnel.isHealthy()) {
+            Timber.e("Refusing to bridge socket - tunnel is unhealthy")
+            try {
+                socket.close()
+            } catch (e: IOException) {
+                Timber.w(e, "Error closing socket for unhealthy tunnel")
+            }
+            return
+        }
+
         try {
             val inputStream = socket.getInputStream()
             val outputStream = socket.getOutputStream()
@@ -162,11 +184,21 @@ class RelayGrpcChannelFactory @Inject constructor(
                             break
                         }
 
+                        // Check tunnel health before sending
+                        if (!tunnel.isHealthy()) {
+                            Timber.w("Tunnel became unhealthy, stopping socket → tunnel forwarding")
+                            break
+                        }
+
                         val data = buffer.copyOfRange(0, bytesRead)
                         tunnel.sendData(data)
                     }
                 } catch (e: IOException) {
-                    Timber.d("Socket read error: ${e.message}")
+                    if (tunnel.isHealthy()) {
+                        Timber.d("Socket read error: ${e.message}")
+                    } else {
+                        Timber.w("Socket read error (tunnel unhealthy): ${e.message}")
+                    }
                 } catch (e: Exception) {
                     Timber.e(e, "Error forwarding socket → tunnel")
                 }
@@ -181,7 +213,11 @@ class RelayGrpcChannelFactory @Inject constructor(
                     }
                     Timber.d("Tunnel incoming channel closed")
                 } catch (e: IOException) {
-                    Timber.d("Socket write error: ${e.message}")
+                    if (tunnel.isHealthy()) {
+                        Timber.d("Socket write error: ${e.message}")
+                    } else {
+                        Timber.w("Socket write error (tunnel unhealthy): ${e.message}")
+                    }
                 } catch (e: Exception) {
                     Timber.e(e, "Error forwarding tunnel → socket")
                 }
@@ -211,7 +247,11 @@ class RelayGrpcChannelFactory @Inject constructor(
         authority: String
     ): ManagedChannel {
         val clientCert = certificateManager.loadOrCreate()
-        val sslContext = createMtlsSslContext(clientCert.privateKeyAlias)
+        val pinnedFingerprint = certificateManager.getPinnedServerFingerprint()
+        if (pinnedFingerprint == null) {
+            Timber.w("No pinned server fingerprint available; relay connection will trust first certificate")
+        }
+        val sslContext = createMtlsSslContext(pinnedFingerprint)
 
         return OkHttpChannelBuilder
             .forAddress(host, port)
@@ -227,7 +267,9 @@ class RelayGrpcChannelFactory @Inject constructor(
     /**
      * Creates SSL context for mTLS
      */
-    private suspend fun createMtlsSslContext(clientKeyAlias: String): SSLContext {
+    private suspend fun createMtlsSslContext(
+        pinnedFingerprint: String?
+    ): SSLContext {
         // Load Android Keystore
         val androidKeyStore = KeyStore.getInstance("AndroidKeyStore").apply {
             load(null)
@@ -239,7 +281,7 @@ class RelayGrpcChannelFactory @Inject constructor(
         )
         keyManagerFactory.init(androidKeyStore, null)
 
-        // Create trust manager that accepts the server certificate
+        // Create trust manager that enforces the pinned fingerprint when available
         val trustManager = object : X509TrustManager {
             override fun checkClientTrusted(
                 chain: Array<out java.security.cert.X509Certificate>?,
@@ -252,14 +294,29 @@ class RelayGrpcChannelFactory @Inject constructor(
                 chain: Array<out java.security.cert.X509Certificate>?,
                 authType: String?
             ) {
-                // For relay connections, trust verification is handled by the pinned cert
-                // The relay only sees encrypted bytes, so server cert is still validated end-to-end
                 if (chain == null || chain.isEmpty()) {
                     throw javax.net.ssl.SSLException("Server certificate chain is empty")
                 }
 
+                val serverCert = chain[0]
+
+                if (pinnedFingerprint != null) {
+                    val currentFingerprint = VerificationCodeGenerator.computeFingerprint(
+                        serverCert.encoded
+                    )
+
+                    if (currentFingerprint != pinnedFingerprint) {
+                        Timber.e("Relay TLS fingerprint mismatch: expected=$pinnedFingerprint actual=$currentFingerprint")
+                        throw javax.net.ssl.SSLException("Server certificate fingerprint does not match pinned value")
+                    }
+
+                    Timber.d("Relay TLS fingerprint verified via pinned certificate")
+                } else {
+                    Timber.w("Relay TLS connection without pinned fingerprint; treating certificate as first trust")
+                }
+
                 try {
-                    chain[0].checkValidity()
+                    serverCert.checkValidity()
                 } catch (e: Exception) {
                     throw javax.net.ssl.SSLException("Server certificate is not valid", e)
                 }

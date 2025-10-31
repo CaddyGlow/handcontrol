@@ -208,6 +208,7 @@ reconnect_delay_seconds = 30
 - ✅ Utf8Payload handling - properly dereferences to `&str` using `.as_str()` method
 - ✅ TokenIssuer lifecycle - integrated into server startup with proper Arc wrapping
 - ✅ Enrollment flow integration - relay tokens generated on-demand during enrollment
+- ✅ Relay client enforces pinned TLS fingerprints for relay tunnels
 
 ## Open Issues
 
@@ -219,7 +220,6 @@ reconnect_delay_seconds = 30
 ### Server Integration
 - Token TTL currently hardcoded to 24 hours; should be configurable
 - No token refresh mechanism (clients must re-enroll after expiry)
-- Relay client doesn't handle relay server certificate validation (accepts any TLS cert)
 - No metrics/telemetry for relay usage
 
 ### Android Integration (Complete)

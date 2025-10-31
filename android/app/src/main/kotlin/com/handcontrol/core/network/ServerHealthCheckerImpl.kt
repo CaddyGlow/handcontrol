@@ -54,6 +54,12 @@ class ServerHealthCheckerImpl @Inject constructor(
                     connectionManager.disconnect(connectionResult)
                 }
             }
+        } catch (e: RelayConnectionException) {
+            Timber.w("Health check relay error for ${server.serverName}: ${e.shortMessage}")
+            HealthCheckResult(
+                isReachable = false,
+                error = e.userMessage
+            )
         } catch (e: StatusException) {
             val errorMsg = when (e.status.code) {
                 io.grpc.Status.Code.UNAVAILABLE -> "Server unavailable"

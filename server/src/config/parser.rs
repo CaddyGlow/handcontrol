@@ -108,6 +108,9 @@ pub struct RelayConfig {
     pub allow_self_signed_tls: bool,
     /// Optional SHA-256 fingerprint used to pin the relay certificate
     pub pinned_cert_sha256: Option<String>,
+    /// Enable debug mode for detailed relay connection logging
+    #[serde(default)]
+    pub debug_mode: bool,
 }
 
 impl Default for RelayConfig {
@@ -122,6 +125,7 @@ impl Default for RelayConfig {
             reconnect_delay_seconds: default_relay_reconnect_delay(),
             allow_self_signed_tls: false,
             pinned_cert_sha256: None,
+            debug_mode: false,
         }
     }
 }

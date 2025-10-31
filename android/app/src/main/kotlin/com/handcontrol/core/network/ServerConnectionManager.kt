@@ -1,6 +1,8 @@
 package com.handcontrol.core.network
 
 import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
+import com.handcontrol.data.settings.IpPreference
+import com.handcontrol.data.settings.SettingsRepository
 import com.handcontrol.data.database.ConnectionMode
 import com.handcontrol.data.database.EnrolledServerEntity
 import io.grpc.ConnectivityState
@@ -11,10 +13,12 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.flow.first
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
+import java.util.concurrent.TimeUnit
 
 /**
  * Result of a connection attempt
@@ -31,11 +35,12 @@ data class ConnectionResult(
 @Singleton
 class ServerConnectionManager @Inject constructor(
     private val directChannelFactory: MtlsGrpcChannelFactory,
-    private val relayChannelFactory: RelayGrpcChannelFactory
+    private val relayChannelFactory: RelayGrpcChannelFactory,
+    private val settingsRepository: SettingsRepository
 ) {
 
     private companion object {
-        private const val DIRECT_CONNECT_TIMEOUT_MS = 5000L
+        private const val DEFAULT_DIRECT_CONNECT_TIMEOUT_MS = 5000L
         private const val RELAY_CONNECT_TIMEOUT_MS = 15000L
     }
 
@@ -58,10 +63,25 @@ class ServerConnectionManager @Inject constructor(
     ): ConnectionResult = withContext(Dispatchers.IO) {
         Timber.i("Connecting to server ${server.serverName} (${server.serverId})")
 
+        val settings = settingsRepository.settings.first()
+        val directTimeoutMs = TimeUnit.SECONDS.toMillis(
+            settings.directConnectionTimeoutSeconds
+                .coerceIn(1, 30)
+                .toLong()
+        ).coerceAtLeast(DEFAULT_DIRECT_CONNECT_TIMEOUT_MS / 5) // safety floor
+        val orderedIps = prioritizeIps(server, settings.ipv6Preference)
+        Timber.d(
+            "Connection preferences -> IPv6=%s, directTimeoutMs=%d, relayFallback=%s, candidateIps=%s",
+            settings.ipv6Preference,
+            directTimeoutMs,
+            settings.enableRelayFallback,
+            orderedIps
+        )
+
         // If preferRelay is true and relay is available, skip direct
         if (!preferRelay) {
             // Try direct connections first
-            val directResult = tryDirectConnection(server)
+            val directResult = tryDirectConnection(server, orderedIps, directTimeoutMs)
             if (directResult != null) {
                 Timber.i("Successfully connected via direct mode to ${directResult.connectedAddress}")
                 return@withContext directResult
@@ -70,6 +90,11 @@ class ServerConnectionManager @Inject constructor(
 
         // Direct connection failed or was skipped, try relay if available
         if (server.relayEnabled && server.relayUrl != null && server.relayToken != null) {
+            if (!settings.enableRelayFallback) {
+                Timber.i("Relay fallback disabled in settings; skipping relay attempt")
+                throw Exception("Relay fallback disabled by user preference")
+            }
+
             Timber.i("Direct connection ${if (preferRelay) "skipped" else "failed"}, attempting relay connection")
 
             try {
@@ -95,13 +120,11 @@ class ServerConnectionManager @Inject constructor(
      *
      * @return ConnectionResult if successful, null if all attempts fail
      */
-    private suspend fun tryDirectConnection(server: EnrolledServerEntity): ConnectionResult? {
-        val ipAddresses = if (server.ips.isNotEmpty()) {
-            server.ips
-        } else {
-            // Fallback to serverHost for backward compatibility
-            server.serverHost?.let { listOf(it) } ?: emptyList()
-        }
+    private suspend fun tryDirectConnection(
+        server: EnrolledServerEntity,
+        ipAddresses: List<String>,
+        timeoutMs: Long
+    ): ConnectionResult? {
 
         if (ipAddresses.isEmpty()) {
             Timber.w("No IP addresses available for direct connection")
@@ -112,7 +135,7 @@ class ServerConnectionManager @Inject constructor(
         for ((index, ip) in ipAddresses.withIndex()) {
             val channel = try {
                 Timber.d("Direct connection attempt ${index + 1}/${ipAddresses.size} to $ip:${server.serverPort}")
-                withTimeout(DIRECT_CONNECT_TIMEOUT_MS) {
+                withTimeout(timeoutMs) {
                     directChannelFactory.createChannel(ip, server.serverPort)
                 }
             } catch (e: Exception) {
@@ -124,7 +147,7 @@ class ServerConnectionManager @Inject constructor(
             }
 
             val ready = try {
-                awaitChannelReady(channel, DIRECT_CONNECT_TIMEOUT_MS)
+                awaitChannelReady(channel, timeoutMs)
             } catch (e: Exception) {
                 Timber.d(e, "Direct channel for $ip failed to reach READY state")
                 false
@@ -152,6 +175,35 @@ class ServerConnectionManager @Inject constructor(
         }
 
         return null
+    }
+
+    private fun prioritizeIps(
+        server: EnrolledServerEntity,
+        preference: IpPreference
+    ): List<String> {
+        val rawIps = when {
+            server.ips.isNotEmpty() -> server.ips
+            server.serverHost != null -> listOf(server.serverHost)
+            else -> emptyList()
+        }
+
+        if (rawIps.isEmpty()) {
+            return emptyList()
+        }
+
+        val sanitized = rawIps
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+
+        val (ipv6, ipv4) = sanitized.partition { it.contains(':') }
+
+        return when (preference) {
+            IpPreference.IPV6_PREFERRED -> ipv6 + ipv4
+            IpPreference.IPV4_PREFERRED -> ipv4 + ipv6
+            IpPreference.IPV6_ONLY -> ipv6
+            IpPreference.IPV4_ONLY -> ipv4
+        }
     }
 
     /**

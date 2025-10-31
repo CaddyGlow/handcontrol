@@ -72,6 +72,9 @@ fun HandControlNavHost(
                 },
                 onNavigateToServerDetails = { serverId ->
                     navController.navigate(Route.ServerDetails(serverId))
+                },
+                onNavigateToSettings = {
+                    navController.navigate(Route.Settings)
                 }
             )
         }
@@ -142,6 +145,14 @@ fun HandControlNavHost(
             com.handcontrol.feature.commands.CommandExecutionScreen(
                 serverId = route.serverId,
                 commandId = route.commandId,
+                onNavigateBack = {
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        composable<Route.Settings> {
+            com.handcontrol.feature.settings.SettingsScreen(
                 onNavigateBack = {
                     navController.popBackStack()
                 }

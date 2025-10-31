@@ -55,6 +55,10 @@ class EnrolledServerRepository @Inject constructor(
         enrolledServerDao.deleteServerById(serverId)
     }
 
+    suspend fun deleteAllServers() {
+        enrolledServerDao.deleteAllServers()
+    }
+
     suspend fun getServerById(serverId: String): EnrolledServerEntity? {
         return enrolledServerDao.getServerById(serverId)
     }

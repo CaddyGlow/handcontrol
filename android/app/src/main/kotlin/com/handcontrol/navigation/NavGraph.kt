@@ -42,4 +42,7 @@ sealed interface Route {
         val serverId: String,
         val commandId: String
     ) : Route
+
+    @Serializable
+    data object Settings : Route
 }

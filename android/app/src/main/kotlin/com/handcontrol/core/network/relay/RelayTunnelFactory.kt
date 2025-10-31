@@ -77,7 +77,11 @@ data class RelayTunnel(
 @Singleton
 class RelayTunnelFactory @Inject constructor() {
 
-    private val json = Json { ignoreUnknownKeys = true }
+    // encodeDefaults ensures we transmit required control fields like "type" even when defaults are used
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
 
     private val okHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)

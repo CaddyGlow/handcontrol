@@ -1,6 +1,7 @@
 use crate::config::parser::RelayConfig;
 use crate::relay::tokens::TokenIssuer;
 use anyhow::{Context, Result, anyhow, bail};
+use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,16 +10,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
-use tokio::time::sleep;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
+use tokio::time::{interval, sleep};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, protocol::frame::Payload},
 };
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 use uuid::Uuid;
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+const CONTROL_PING_INTERVAL_SECS: u64 = 30;
 
 #[derive(Debug, Clone, Copy)]
 struct RelayTlsOptions {
@@ -161,7 +165,8 @@ impl RelayClient {
                 .context("Failed to connect to relay server")?
         };
 
-        let (mut sink, mut stream) = ws_stream.split();
+        let (sink, mut stream) = ws_stream.split();
+        let sink = Arc::new(Mutex::new(sink));
 
         // Send register message
         let relay_secret = self
@@ -182,9 +187,13 @@ impl RelayClient {
             "max_tunnels": self.config.max_relay_tunnels.unwrap_or(10),
         });
 
-        sink.send(Message::Text(register_msg.to_string().into()))
-            .await
-            .context("Failed to send register message")?;
+        {
+            let mut sink_guard = sink.lock().await;
+            sink_guard
+                .send(Message::Text(register_msg.to_string().into()))
+                .await
+                .context("Failed to send register message")?;
+        }
 
         // Wait for register_ack
         match stream.next().await {
@@ -209,8 +218,15 @@ impl RelayClient {
 
         *self.state.write().await = RelayClientState::Connected;
 
+        let keepalive_handle = self.spawn_control_keepalive(sink.clone());
+
         // Listen for control messages
-        self.listen_control_channel(&mut stream).await
+        let result = self.listen_control_channel(&mut stream).await;
+
+        keepalive_handle.abort();
+        let _ = keepalive_handle.await;
+
+        result
     }
 
     async fn listen_control_channel(
@@ -241,6 +257,30 @@ impl RelayClient {
         }
 
         Ok(())
+    }
+
+    fn spawn_control_keepalive(
+        &self,
+        sink: Arc<Mutex<SplitSink<WsStream, Message>>>,
+    ) -> JoinHandle<()> {
+        let server_id = self.server_id;
+        tokio::spawn(async move {
+            let mut ticker = interval(Duration::from_secs(CONTROL_PING_INTERVAL_SECS));
+            loop {
+                ticker.tick().await;
+
+                let mut guard = sink.lock().await;
+                match guard.send(Message::Ping(Vec::new().into())).await {
+                    Ok(_) => {
+                        trace!(%server_id, "Sent relay control ping");
+                    }
+                    Err(err) => {
+                        warn!(%server_id, "Relay control ping failed: {err}");
+                        break;
+                    }
+                }
+            }
+        })
     }
 
     async fn handle_control_message(&self, payload: &str) -> Result<()> {

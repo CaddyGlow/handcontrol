@@ -40,6 +40,9 @@ interface EnrolledServerDao {
     @Query("DELETE FROM enrolled_servers WHERE serverId = :serverId")
     suspend fun deleteServerById(serverId: String)
 
+    @Query("DELETE FROM enrolled_servers")
+    suspend fun deleteAllServers()
+
     @Query("SELECT certFingerprint FROM enrolled_servers WHERE serverId = :serverId")
     suspend fun getServerFingerprint(serverId: String): String?
 

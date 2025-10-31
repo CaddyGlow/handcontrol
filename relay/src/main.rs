@@ -29,7 +29,8 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{Span, field, instrument};
+use tracing::{debug, info, trace, warn};
 use tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
 use uuid::Uuid;
@@ -506,19 +507,27 @@ struct RelayClaims {
     permissions: Vec<String>,
 }
 
+#[instrument(
+    level = "trace",
+    skip(socket, state),
+    fields(server_id = tracing::field::Empty)
+)]
 async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> Result<()> {
+    trace!("Register control socket established");
     let Some(Ok(Message::Text(payload))) = socket.recv().await else {
         anyhow::bail!("register socket closed before payload");
     };
 
     let msg: RegisterPayload =
         serde_json::from_str(&payload).context("Failed to parse register payload")?;
+    trace!("Received register payload");
 
     if msg.r#type != "register" {
         anyhow::bail!("unexpected message type {}", msg.r#type);
     }
 
     let server_id = Uuid::parse_str(&msg.server_id).context("invalid server_id")?;
+    Span::current().record("server_id", &field::display(&server_id));
 
     if !state.validate_secret(&server_id, &msg.relay_secret).await {
         warn!("Server {} failed relay secret validation", server_id);
@@ -566,6 +575,7 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     socket
         .send(Message::Text(serde_json::to_string(&ack)?))
         .await?;
+    trace!("Sent register acknowledgement");
 
     let (tx, mut rx) = mpsc::channel(32);
     let server_entry = Arc::new(RegisteredServer {
@@ -580,6 +590,7 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
             maybe_cmd = rx.recv() => {
                 match maybe_cmd {
                     Some(cmd) => {
+                        trace!("Dispatching control command to server");
                         if let Err(err) = socket.send(cmd.into_message()).await {
                             warn!("Control channel send failed for {server_id}: {err}");
                             break;
@@ -592,9 +603,12 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
                 match message {
                     Some(Ok(Message::Ping(ping))) => {
                         let _ = socket.send(Message::Pong(ping)).await;
+                        trace!("Control channel ping handled");
                     }
                     Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {
+                        trace!("Ignoring non-text control channel frame");
+                    }
                     Some(Err(err)) => {
                         warn!("Control channel read failed for {server_id}: {err}");
                         break;
@@ -605,16 +619,28 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     }
 
     state.remove_server(&server_id).await;
+    trace!("Removed server registration");
     Ok(())
 }
 
+#[instrument(
+    level = "trace",
+    skip(socket, state),
+    fields(
+        server_id = tracing::field::Empty,
+        client_id = tracing::field::Empty,
+        tunnel_id = tracing::field::Empty
+    )
+)]
 async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> Result<()> {
+    trace!("Client connect socket established");
     let Some(Ok(Message::Text(payload))) = socket.recv().await else {
         anyhow::bail!("connect socket closed before payload");
     };
 
     let msg: ConnectPayload =
         serde_json::from_str(&payload).context("Failed to parse connect payload")?;
+    trace!("Received connect payload");
 
     if msg.r#type != "connect" {
         anyhow::bail!("unexpected message type {}", msg.r#type);
@@ -622,6 +648,9 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 
     let server_id = Uuid::parse_str(&msg.server_id).context("invalid server_id")?;
     let client_id = Uuid::parse_str(&msg.client_id).context("invalid client_id")?;
+    Span::current().record("server_id", &field::display(&server_id));
+    Span::current().record("client_id", &field::display(&client_id));
+    debug!("Valid connect request parsed");
 
     let Some(server_entry) = state.server_entry(&server_id).await else {
         warn!("Connect rejected for unregistered server {server_id}");
@@ -639,7 +668,8 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         return Ok(());
     };
 
-    let validation = Validation::new(Algorithm::EdDSA);
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_aud = false;
     let claims = match decode::<RelayClaims>(
         &msg.relay_token,
         server_entry.decoding_key.as_ref(),
@@ -663,6 +693,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         }
     };
 
+    trace!("Relay token validated");
     if !state.is_allowed_audience(&claims.aud) {
         warn!(
             "Relay token audience '{}' did not match expected host '{}'",
@@ -715,6 +746,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     }
 
     if !claims.permissions.iter().any(|p| p == "connect") {
+        trace!("Relay token missing connect permission");
         let _ = socket
             .send(Message::Text(
                 serde_json::json!({
@@ -731,6 +763,11 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 
     let tunnel_id = Uuid::new_v4();
     let tunnel_entry = state.create_tunnel(tunnel_id, Instant::now()).await;
+    Span::current().record("tunnel_id", &field::display(&tunnel_id));
+    info!(
+        "Issued tunnel {} for client {} via server {}",
+        tunnel_id, client_id, server_id
+    );
 
     let expires_at = SystemTime::now()
         .checked_add(state.handshake_timeout)
@@ -776,6 +813,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     socket
         .send(Message::Text(serde_json::to_string(&ack)?))
         .await?;
+    trace!("Sent connect acknowledgement to client");
 
     // Wait for tunnel_ready from client
     let Some(Ok(Message::Text(ready_payload))) = socket.recv().await else {
@@ -794,6 +832,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         guard.mark_client_ready(Instant::now());
     }
     tunnel_entry.notify.notify_waiters();
+    trace!("Client readiness recorded");
 
     info!(
         "Client {} waiting for server tunnel {}",
@@ -816,6 +855,8 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
                 info!("Tunnel {} is now active", tunnel_id);
                 spawn_forwarders(state_clone.clone(), tunnel_id, client_ws, server_ws);
                 break;
+            } else {
+                trace!("Notified but tunnel pair not ready yet");
             }
         }
     })
@@ -841,11 +882,13 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     Ok(())
 }
 
+#[instrument(level = "trace", skip(socket, state))]
 async fn handle_tunnel_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
     tunnel_id: Uuid,
 ) -> Result<()> {
+    trace!("Server tunnel socket established");
     let Some(entry) = state.get_tunnel(&tunnel_id).await else {
         warn!("Received tunnel for unknown id {}", tunnel_id);
         let _ = socket
@@ -863,6 +906,7 @@ async fn handle_tunnel_socket(
 
     let ready: TunnelReadyPayload =
         serde_json::from_str(&payload).context("Failed to parse tunnel_ready from server")?;
+    trace!("Received server tunnel_ready payload");
 
     if ready.role != "server" || ready.tunnel_id != tunnel_id.to_string() {
         anyhow::bail!("invalid tunnel_ready payload from server");
@@ -873,10 +917,12 @@ async fn handle_tunnel_socket(
         guard.mark_server_ready(Instant::now());
     }
     entry.notify.notify_waiters();
+    trace!("Server readiness recorded");
 
     info!("Server confirmed tunnel {}", tunnel_id);
 
     if let Some((client_ws, server_ws)) = entry.attach_server(socket).await {
+        trace!("Attached server socket; tunnel active immediately");
         spawn_forwarders(state.clone(), tunnel_id, client_ws, server_ws);
         return Ok(());
     }
@@ -898,6 +944,7 @@ async fn handle_tunnel_socket(
     if wait_result.is_err() {
         warn!("Tunnel {} expired waiting for client", tunnel_id);
         if let Some(mut server_ws) = handle_cleanup.take_server_socket().await {
+            trace!("Closing server websocket after timeout");
             let _ = server_ws
                 .send(Message::Close(Some(axum::extract::ws::CloseFrame {
                     code: u16::from(CloseCode::Normal),
@@ -911,58 +958,79 @@ async fn handle_tunnel_socket(
     Ok(())
 }
 
+#[instrument(level = "trace", skip(state, client_ws, server_ws))]
 fn spawn_forwarders(
     state: Arc<AppState>,
     tunnel_id: Uuid,
     client_ws: WebSocket,
     server_ws: WebSocket,
 ) {
+    trace!("Spawning forwarders for tunnel {}", tunnel_id);
     tokio::spawn(async move {
-        if let Err(err) = forward_bidirectional(client_ws, server_ws).await {
+        if let Err(err) = forward_bidirectional(tunnel_id, client_ws, server_ws).await {
             warn!("Tunnel {tunnel_id} forwarding error: {err:?}");
         }
+        trace!("Tunnel {tunnel_id} forwarding task finished");
         state.remove_tunnel(&tunnel_id).await;
     });
 }
 
-async fn forward_bidirectional(client_ws: WebSocket, server_ws: WebSocket) -> Result<()> {
+#[instrument(level = "trace", skip(client_ws, server_ws))]
+async fn forward_bidirectional(
+    tunnel_id: Uuid,
+    client_ws: WebSocket,
+    server_ws: WebSocket,
+) -> Result<()> {
+    trace!("Starting bidirectional forwarding for tunnel {}", tunnel_id);
     let (client_sink, client_stream) = client_ws.split();
     let (server_sink, server_stream) = server_ws.split();
 
     let client_to_server =
-        tokio::spawn(async move { forward_stream(client_stream, server_sink).await });
+        tokio::spawn(
+            async move { forward_stream("client->server", client_stream, server_sink).await },
+        );
     let server_to_client =
-        tokio::spawn(async move { forward_stream(server_stream, client_sink).await });
+        tokio::spawn(
+            async move { forward_stream("server->client", server_stream, client_sink).await },
+        );
 
     let (c_res, s_res) = tokio::join!(client_to_server, server_to_client);
     c_res??;
     s_res??;
+    trace!("Finished bidirectional forwarding for tunnel {}", tunnel_id);
     Ok(())
 }
 
+#[instrument(level = "trace", skip(inbound, outbound))]
 async fn forward_stream(
+    direction: &'static str,
     mut inbound: SplitStream<WebSocket>,
     mut outbound: SplitSink<WebSocket, Message>,
 ) -> Result<()> {
+    trace!("{direction} stream started");
     while let Some(msg) = inbound.next().await {
         match msg {
             Ok(Message::Binary(bytes)) => {
+                trace!("{direction} forwarding {} bytes", bytes.len());
                 outbound
                     .send(Message::Binary(bytes))
                     .await
                     .map_err(|err| anyhow!(err))?;
             }
             Ok(Message::Close(frame)) => {
+                trace!("{direction} received close frame");
                 let _ = outbound.send(Message::Close(frame.clone())).await;
                 break;
             }
             Ok(Message::Ping(data)) => {
+                trace!("{direction} forwarding ping frame");
                 outbound
                     .send(Message::Ping(data))
                     .await
                     .map_err(|err| anyhow!(err))?;
             }
             Ok(Message::Pong(data)) => {
+                trace!("{direction} forwarding pong frame");
                 outbound
                     .send(Message::Pong(data))
                     .await
@@ -970,6 +1038,7 @@ async fn forward_stream(
             }
             Ok(Message::Text(_)) => {
                 // Ignore text frames; relay tunnels only forward binary gRPC frames.
+                trace!("{direction} ignoring unexpected text frame");
             }
             Err(err) => return Err(anyhow!(err)),
         }
@@ -1011,6 +1080,8 @@ mod tests {
             handshake_timeout_seconds: timeout_secs,
             public_hostname: Some("127.0.0.1".to_string()),
             registration_secrets: secrets,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 

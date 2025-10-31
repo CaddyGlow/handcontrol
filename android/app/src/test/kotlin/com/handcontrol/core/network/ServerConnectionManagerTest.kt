@@ -3,6 +3,7 @@ package com.handcontrol.core.network
 import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.data.database.ConnectionMode
 import com.handcontrol.data.database.EnrolledServerEntity
+import io.grpc.ConnectivityState
 import io.grpc.ManagedChannel
 import io.mockk.coEvery
 import io.mockk.coVerify
@@ -10,7 +11,7 @@ import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertThrows
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 
@@ -32,6 +33,9 @@ class ServerConnectionManagerTest {
 
         mockDirectChannel = mockk(relaxed = true)
         mockRelayChannel = mockk(relaxed = true)
+
+        every { mockDirectChannel.getState(any()) } returns ConnectivityState.READY
+        coEvery { directChannelFactory.forceShutdownChannel(any()) } returns Unit
 
         testServer = EnrolledServerEntity(
             serverId = "test-server-id",
@@ -154,12 +158,18 @@ class ServerConnectionManagerTest {
         } throws Exception("Relay connection failed")
 
         // When/Then
-        val exception = assertThrows(Exception::class.java) {
-            runTest {
-                connectionManager.connect(testServer)
-            }
+        var captured: RelayConnectionException? = null
+        try {
+            connectionManager.connect(testServer)
+            fail("Expected RelayConnectionException to be thrown")
+        } catch (e: RelayConnectionException) {
+            captured = e
         }
 
+        val exception = captured ?: run {
+            fail("Expected RelayConnectionException to be captured")
+            return@runTest
+        }
         assertEquals("Relay connection failed", exception.message)
     }
 
@@ -177,12 +187,18 @@ class ServerConnectionManagerTest {
         } throws Exception("Connection timeout")
 
         // When/Then
-        val exception = assertThrows(Exception::class.java) {
-            runTest {
-                connectionManager.connect(serverWithoutRelay)
-            }
+        var captured: Exception? = null
+        try {
+            connectionManager.connect(serverWithoutRelay)
+            fail("Expected exception to be thrown")
+        } catch (e: Exception) {
+            captured = e
         }
 
+        val exception = captured ?: run {
+            fail("Expected exception to be captured")
+            return@runTest
+        }
         assertEquals("All connection attempts failed", exception.message)
 
         coVerify(exactly = 0) {
@@ -227,12 +243,18 @@ class ServerConnectionManagerTest {
         )
 
         // When/Then
-        val exception = assertThrows(Exception::class.java) {
-            runTest {
-                connectionManager.connect(serverWithoutRelay, preferRelay = true)
-            }
+        var captured: RelayConnectionException? = null
+        try {
+            connectionManager.connect(serverWithoutRelay, preferRelay = true)
+            fail("Expected RelayConnectionException to be thrown")
+        } catch (e: RelayConnectionException) {
+            captured = e
         }
 
+        val exception = captured ?: run {
+            fail("Expected RelayConnectionException to be captured")
+            return@runTest
+        }
         assertEquals("Relay connection not available", exception.message)
 
         coVerify(exactly = 0) {

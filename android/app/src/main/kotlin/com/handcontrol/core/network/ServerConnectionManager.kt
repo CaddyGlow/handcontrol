@@ -3,13 +3,18 @@ package com.handcontrol.core.network
 import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.data.database.ConnectionMode
 import com.handcontrol.data.database.EnrolledServerEntity
+import io.grpc.ConnectivityState
 import io.grpc.ManagedChannel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.suspendCancellableCoroutine
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.coroutines.resume
 
 /**
  * Result of a connection attempt
@@ -29,8 +34,13 @@ class ServerConnectionManager @Inject constructor(
     private val relayChannelFactory: RelayGrpcChannelFactory
 ) {
 
+    private companion object {
+        private const val DIRECT_CONNECT_TIMEOUT_MS = 5000L
+        private const val RELAY_CONNECT_TIMEOUT_MS = 15000L
+    }
+
     /**
-     * Connects to a server using the best available method
+     * Connects to a server using the best available method.
      *
      * Strategy:
      * 1. Try direct connection to each server IP
@@ -62,17 +72,22 @@ class ServerConnectionManager @Inject constructor(
         if (server.relayEnabled && server.relayUrl != null && server.relayToken != null) {
             Timber.i("Direct connection ${if (preferRelay) "skipped" else "failed"}, attempting relay connection")
 
-            val relayResult = tryRelayConnection(server)
-            if (relayResult != null) {
+            try {
+                val relayResult = tryRelayConnection(server)
                 Timber.i("Successfully connected via relay mode")
                 return@withContext relayResult
+            } catch (e: RelayConnectionException) {
+                Timber.e(e, "Relay connection failed for ${server.serverName}")
+                throw e
             }
-
-            throw Exception("Relay connection failed")
         }
 
         // No relay available or relay failed
-        throw Exception(if (preferRelay) "Relay connection not available" else "All connection attempts failed")
+        if (preferRelay) {
+            throw RelayConnectionException("Relay connection not available")
+        } else {
+            throw Exception("All connection attempts failed")
+        }
     }
 
     /**
@@ -95,27 +110,44 @@ class ServerConnectionManager @Inject constructor(
 
         // Try each IP address until one succeeds
         for ((index, ip) in ipAddresses.withIndex()) {
-            try {
+            val channel = try {
                 Timber.d("Direct connection attempt ${index + 1}/${ipAddresses.size} to $ip:${server.serverPort}")
-
-                val channel = withTimeout(5000L) {
+                withTimeout(DIRECT_CONNECT_TIMEOUT_MS) {
                     directChannelFactory.createChannel(ip, server.serverPort)
                 }
+            } catch (e: Exception) {
+                Timber.d("Direct connection to $ip failed during channel creation: ${e.message}")
+                if (index == ipAddresses.size - 1) {
+                    Timber.w("All direct connection attempts failed")
+                }
+                continue
+            }
 
-                // Connection successful
+            val ready = try {
+                awaitChannelReady(channel, DIRECT_CONNECT_TIMEOUT_MS)
+            } catch (e: Exception) {
+                Timber.d(e, "Direct channel for $ip failed to reach READY state")
+                false
+            }
+
+            if (ready) {
+                Timber.d("Direct channel to $ip reached READY state")
                 return ConnectionResult(
                     channel = channel,
                     mode = ConnectionMode.DIRECT,
                     connectedAddress = "$ip:${server.serverPort}"
                 )
-
-            } catch (e: Exception) {
-                Timber.d("Direct connection to $ip failed: ${e.message}")
+            } else {
+                Timber.d("Direct channel to $ip did not become ready within timeout, closing")
+                try {
+                    directChannelFactory.forceShutdownChannel(channel)
+                } catch (closeError: Exception) {
+                    Timber.d(closeError, "Ignored error while force shutting down channel for $ip")
+                }
 
                 if (index == ipAddresses.size - 1) {
                     Timber.w("All direct connection attempts failed")
                 }
-                // Try next IP
             }
         }
 
@@ -125,18 +157,18 @@ class ServerConnectionManager @Inject constructor(
     /**
      * Attempts connection through relay server
      *
-     * @return ConnectionResult if successful, null if relay connection fails
+     * @return ConnectionResult if successful
+     * @throws RelayConnectionException when the relay connection cannot be established
      */
-    private suspend fun tryRelayConnection(server: EnrolledServerEntity): ConnectionResult? {
+    private suspend fun tryRelayConnection(server: EnrolledServerEntity): ConnectionResult {
         if (!server.relayEnabled || server.relayUrl == null || server.relayToken == null) {
-            Timber.w("Relay not properly configured for server ${server.serverId}")
-            return null
+            throw RelayConnectionException("Relay not properly configured for server ${server.serverId}")
         }
 
-        return try {
+        try {
             Timber.d("Attempting relay connection to ${server.relayUrl}")
 
-            val channel = withTimeout(10000L) {
+            val channel = withTimeout(RELAY_CONNECT_TIMEOUT_MS) {
                 relayChannelFactory.createChannelViaRelay(
                     relayUrl = server.relayUrl,
                     serverId = server.serverId,
@@ -145,15 +177,22 @@ class ServerConnectionManager @Inject constructor(
                 )
             }
 
-            ConnectionResult(
+            return ConnectionResult(
                 channel = channel,
                 mode = ConnectionMode.RELAY,
                 connectedAddress = null
             )
 
+        } catch (e: TimeoutCancellationException) {
+            throw RelayConnectionException(
+                "Timed out after ${RELAY_CONNECT_TIMEOUT_MS}ms waiting for relay handshake",
+                e
+            )
         } catch (e: Exception) {
-            Timber.e(e, "Relay connection failed")
-            null
+            throw RelayConnectionException(
+                e.message ?: "Relay connection error (${e.javaClass.simpleName})",
+                e
+            )
         }
     }
 
@@ -183,4 +222,37 @@ class ServerConnectionManager @Inject constructor(
         directChannelFactory.shutdown()
         relayChannelFactory.shutdown()
     }
+
+    private suspend fun awaitChannelReady(
+        channel: ManagedChannel,
+        timeoutMs: Long
+    ): Boolean {
+        return withTimeoutOrNull(timeoutMs) {
+            var state = channel.getState(true)
+            var result: Boolean? = null
+            while (result == null) {
+                result = when (state) {
+                    ConnectivityState.READY -> true
+                    ConnectivityState.SHUTDOWN -> false
+                    else -> {
+                        suspendCancellableCoroutine { cont ->
+                            channel.notifyWhenStateChanged(state) {
+                                if (!cont.isCompleted) {
+                                    cont.resume(Unit)
+                                }
+                            }
+                        }
+                        state = channel.getState(true)
+                        null
+                    }
+                }
+            }
+            result
+        } ?: false
+    }
 }
+
+class RelayConnectionException(
+    message: String,
+    cause: Throwable? = null
+) : Exception(message, cause)

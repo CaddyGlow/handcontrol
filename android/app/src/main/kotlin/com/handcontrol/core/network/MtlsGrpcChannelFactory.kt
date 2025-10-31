@@ -81,6 +81,22 @@ class MtlsGrpcChannelFactory @Inject constructor(
     }
 
     /**
+     * Immediately shuts down a channel without waiting for graceful termination.
+     * Used when a connection attempt fails before the channel becomes usable.
+     */
+    suspend fun forceShutdownChannel(channel: ManagedChannel) = withContext(Dispatchers.IO) {
+        Timber.d("Force shutting down gRPC channel")
+
+        try {
+            channel.shutdownNow()
+        } catch (e: Exception) {
+            Timber.d(e, "Ignoring force shutdown error")
+        } finally {
+            activeChannels.remove(channel)
+        }
+    }
+
+    /**
      * Get the last server certificate encountered during TLS handshake.
      * This is needed for verification code generation in approval mode.
      */

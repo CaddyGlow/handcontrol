@@ -266,6 +266,8 @@ impl RemoteControl for RemoteControlService {
                 relay_url: info.relay_url.clone(),
                 relay_token: info.relay_token.clone(),
                 relay_required: info.relay_required,
+                allow_self_signed_tls: config.relay.allow_self_signed_tls,
+                pinned_cert_sha256: config.relay.pinned_cert_sha256.clone(),
             });
 
         let payload = crate::utils::qr::EnrollmentQrPayload::new(

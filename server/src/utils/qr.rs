@@ -20,6 +20,9 @@ pub struct RelayQrInfo {
     pub relay_url: String,
     pub relay_token: String,
     pub relay_required: bool,
+    pub allow_self_signed_tls: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_cert_sha256: Option<String>,
 }
 
 impl EnrollmentQrPayload {
@@ -75,6 +78,13 @@ impl EnrollmentQrPayload {
             println!("\nRelay URL: {}", relay.relay_url);
             println!("Relay Required: {}", relay.relay_required);
             println!("Relay Token: {}", relay.relay_token);
+            println!(
+                "Relay Allow Self-Signed TLS: {}",
+                relay.allow_self_signed_tls
+            );
+            if let Some(fingerprint) = &relay.pinned_cert_sha256 {
+                println!("Relay Pinned Cert SHA256: {}", fingerprint);
+            }
         }
         println!("\n======================================\n");
 
@@ -147,5 +157,36 @@ mod tests {
         assert_eq!(deserialized.cert_fingerprint, payload.cert_fingerprint);
         assert_eq!(deserialized.enrollment_token, payload.enrollment_token);
         assert_eq!(deserialized.server_id, payload.server_id);
+    }
+
+    #[test]
+    fn test_qr_payload_with_relay_info_serialization() {
+        let server_id = Uuid::new_v4();
+        let relay_info = RelayQrInfo {
+            relay_url: "https://relay.example.com".to_string(),
+            relay_token: "relay-token".to_string(),
+            relay_required: false,
+            allow_self_signed_tls: true,
+            pinned_cert_sha256: Some(
+                "08503D93CEA2108035CAE5FA0BAC837B5401FCB743D4C5E5AD0CB4A800D8A044".to_string(),
+            ),
+        };
+
+        let payload = EnrollmentQrPayload::new(
+            vec!["192.168.1.100".to_string()],
+            50051,
+            "SHA256:abc123".to_string(),
+            "token-uuid".to_string(),
+            server_id,
+            Some(relay_info),
+        );
+
+        let json = payload.to_json().unwrap();
+
+        assert!(json.contains("\"relay_required\":false"));
+        assert!(json.contains("\"allow_self_signed_tls\":true"));
+        assert!(json.contains(
+            "\"pinned_cert_sha256\":\"08503D93CEA2108035CAE5FA0BAC837B5401FCB743D4C5E5AD0CB4A800D8A044\""
+        ));
     }
 }

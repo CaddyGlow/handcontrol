@@ -77,36 +77,52 @@ fun ServerDiscoveryScreen(
                 .padding(paddingValues)
                 .padding(16.dp)
         ) {
-            when {
-                uiState.isDiscovering && uiState.servers.isEmpty() -> {
-                    DiscoveringView()
-                }
+            Column(
+                modifier = Modifier.weight(1f)
+            ) {
+                when {
+                    uiState.isDiscovering && uiState.servers.isEmpty() -> {
+                        DiscoveringView()
+                    }
 
-                uiState.error != null -> {
-                    ErrorView(
-                        message = uiState.error!!,
-                        onRetry = { viewModel.startDiscovery() },
-                        onScanQr = onNavigateToQrEnrollment
-                    )
-                }
+                    uiState.error != null -> {
+                        ErrorView(
+                            message = uiState.error!!,
+                            onRetry = { viewModel.startDiscovery() }
+                        )
+                    }
 
-                uiState.servers.isEmpty() -> {
-                    EmptyServersView(
-                        onRetry = { viewModel.startDiscovery() },
-                        onScanQr = onNavigateToQrEnrollment
-                    )
-                }
+                    uiState.servers.isEmpty() -> {
+                        EmptyServersView(
+                            onRetry = { viewModel.startDiscovery() }
+                        )
+                    }
 
-                else -> {
-                    ServerListView(
-                        servers = uiState.servers,
-                        enrolledServerIds = uiState.enrolledServerIds,
-                        onServerSelected = { server ->
-                            onNavigateToApprovalEnrollment(server.host, server.port, server.serverId)
-                        },
-                        onScanQr = onNavigateToQrEnrollment
-                    )
+                    else -> {
+                        ServerListView(
+                            servers = uiState.servers,
+                            enrolledServerIds = uiState.enrolledServerIds,
+                            onServerSelected = { server ->
+                                onNavigateToApprovalEnrollment(server.host, server.port, server.serverId)
+                            }
+                        )
+                    }
                 }
+            }
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedButton(
+                onClick = onNavigateToQrEnrollment,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(
+                    imageVector = Icons.Default.QrCodeScanner,
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text("Scan QR Code")
             }
         }
     }
@@ -137,7 +153,6 @@ private fun ServerListView(
     servers: List<DiscoveredServer>,
     enrolledServerIds: Set<String>,
     onServerSelected: (DiscoveredServer) -> Unit,
-    onScanQr: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxSize()) {
@@ -149,7 +164,6 @@ private fun ServerListView(
         )
 
         LazyColumn(
-            modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             items(servers, key = { "${it.host}:${it.port}" }) { server ->
@@ -164,21 +178,6 @@ private fun ServerListView(
                     }
                 )
             }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        OutlinedButton(
-            onClick = onScanQr,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(
-                imageVector = Icons.Default.QrCodeScanner,
-                contentDescription = null,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Scan QR Code Instead")
         }
     }
 }
@@ -256,7 +255,6 @@ private fun ServerCard(
 @Composable
 private fun EmptyServersView(
     onRetry: () -> Unit,
-    onScanQr: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -295,18 +293,6 @@ private fun EmptyServersView(
         Button(onClick = onRetry) {
             Text("Retry")
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        OutlinedButton(onClick = onScanQr) {
-            Icon(
-                imageVector = Icons.Default.QrCodeScanner,
-                contentDescription = null,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Scan QR Code Instead")
-        }
     }
 }
 
@@ -314,7 +300,6 @@ private fun EmptyServersView(
 private fun ErrorView(
     message: String,
     onRetry: () -> Unit,
-    onScanQr: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -344,18 +329,6 @@ private fun ErrorView(
         Button(onClick = onRetry) {
             Text("Retry")
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        OutlinedButton(onClick = onScanQr) {
-            Icon(
-                imageVector = Icons.Default.QrCodeScanner,
-                contentDescription = null,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Scan QR Code Instead")
-        }
     }
 }
 
@@ -369,8 +342,7 @@ private fun ServerListPreview() {
                 DiscoveredServer("laptop", "192.168.1.101", 8443, "SHA256:efgh5678", "server-2", null)
             ),
             enrolledServerIds = setOf("server-1"),
-            onServerSelected = {},
-            onScanQr = {}
+            onServerSelected = {}
         )
     }
 }
@@ -380,8 +352,7 @@ private fun ServerListPreview() {
 private fun EmptyServersPreview() {
     HandControlTheme {
         EmptyServersView(
-            onRetry = {},
-            onScanQr = {}
+            onRetry = {}
         )
     }
 }

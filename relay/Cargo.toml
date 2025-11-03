@@ -40,3 +40,14 @@ ed25519-dalek = { workspace = true }
 subtle = "2.5"
 url = { workspace = true }
 rand = "0.9"
+
+[dev-dependencies]
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+rcgen = "0.14"
+prost = { workspace = true }
+tonic-prost = { workspace = true }
+hyper-util = "0.1"
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

@@ -85,8 +85,9 @@ impl RemoteControlService {
 
         let token_issuer = self.token_issuer.as_ref()?;
         let relay_url = config.relay.relay_server_url.as_ref()?;
+        let ttl_hours = config.relay.relay_token_ttl_hours;
 
-        match token_issuer.generate_relay_token(client_id, relay_url, 24) {
+        match token_issuer.generate_relay_token(client_id, relay_url, ttl_hours) {
             Ok(token) => Some(super::proto::RelayInfo {
                 relay_url: relay_url.clone(),
                 relay_token: token,

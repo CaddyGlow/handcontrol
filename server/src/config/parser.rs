@@ -103,6 +103,9 @@ pub struct RelayConfig {
     pub include_in_enrollment: bool,
     #[serde(default = "default_relay_reconnect_delay")]
     pub reconnect_delay_seconds: u64,
+    /// Token TTL in hours for relay JWT tokens issued to clients
+    #[serde(default = "default_relay_token_ttl_hours")]
+    pub relay_token_ttl_hours: u64,
     /// Allow the relay client to accept self-signed TLS certificates
     #[serde(default)]
     pub allow_self_signed_tls: bool,
@@ -123,6 +126,7 @@ impl Default for RelayConfig {
             auto_connect: true,
             include_in_enrollment: true,
             reconnect_delay_seconds: default_relay_reconnect_delay(),
+            relay_token_ttl_hours: default_relay_token_ttl_hours(),
             allow_self_signed_tls: false,
             pinned_cert_sha256: None,
             debug_mode: false,
@@ -216,6 +220,10 @@ fn default_excluded_interfaces() -> Vec<String> {
 
 fn default_relay_reconnect_delay() -> u64 {
     30
+}
+
+fn default_relay_token_ttl_hours() -> u64 {
+    2160 // 90 days
 }
 
 /// Load configuration from a TOML file

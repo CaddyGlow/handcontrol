@@ -15,6 +15,19 @@ approval_enabled = true
 approval_notification = true
 approval_timeout_seconds = 120  # 2 minutes
 
+# Optional relay configuration for connections through a relay server
+# Uncomment and configure if you need relay support for clients behind NAT
+# [relay]
+# enabled = true
+# relay_server_url = "wss://relay.example.com:8443"
+# relay_auth_secret = "your-secret-key-here"
+# auto_connect = true
+# include_in_enrollment = true
+# reconnect_delay_seconds = 30
+# relay_token_ttl_hours = 2160  # 90 days - JWT token lifetime for client connections
+# allow_self_signed_tls = false
+# pinned_cert_sha256 = "optional-certificate-fingerprint"
+
 [commands]
 timeout_seconds = 60
 

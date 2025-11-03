@@ -150,6 +150,7 @@ struct AppState {
 }
 
 struct RegisteredServer {
+    registration_id: Uuid,
     control_tx: mpsc::Sender<ServerCommand>,
     decoding_key: Arc<DecodingKey>,
     tls_authority: Option<String>,
@@ -271,6 +272,39 @@ impl TunnelHandle {
     }
 }
 
+struct TunnelCleanupGuard {
+    state: Arc<AppState>,
+    tunnel_id: Uuid,
+    disarmed: bool,
+}
+
+impl TunnelCleanupGuard {
+    fn new(state: Arc<AppState>, tunnel_id: Uuid) -> Self {
+        Self {
+            state,
+            tunnel_id,
+            disarmed: false,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for TunnelCleanupGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        let state = self.state.clone();
+        let tunnel_id = self.tunnel_id;
+        tokio::spawn(async move {
+            state.remove_tunnel(&tunnel_id).await;
+        });
+    }
+}
+
 impl AppState {
     fn new(config: RelayConfig) -> Self {
         let RelayConfig {
@@ -283,7 +317,17 @@ impl AppState {
             tls_key_path: _,
         } = config;
 
-        let listen_addr = format!("{}:{}", bind_address, port);
+        let listen_addr = match bind_address.parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => format!("[{}]:{}", bind_address, port),
+            Ok(_) => format!("{}:{}", bind_address, port),
+            Err(_) => {
+                if bind_address.contains(':') && !bind_address.contains('[') {
+                    format!("[{}]:{}", bind_address, port)
+                } else {
+                    format!("{}:{}", bind_address, port)
+                }
+            }
+        };
         let relay_host = public_hostname
             .and_then(|host| {
                 let trimmed = host.trim();
@@ -328,8 +372,19 @@ impl AppState {
             .insert(server_id, server);
     }
 
-    async fn remove_server(&self, server_id: &Uuid) {
-        self.registered_servers.write().await.remove(server_id);
+    pub(crate) async fn remove_server_if_current(
+        &self,
+        server_id: &Uuid,
+        registration_id: &Uuid,
+    ) {
+        let mut guard = self.registered_servers.write().await;
+        let should_remove = guard
+            .get(server_id)
+            .map(|entry| &entry.registration_id == registration_id)
+            .unwrap_or(false);
+        if should_remove {
+            guard.remove(server_id);
+        }
     }
 
     async fn server_entry(&self, server_id: &Uuid) -> Option<Arc<RegisteredServer>> {
@@ -621,13 +676,15 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
     trace!("Sent register acknowledgement");
 
     let (tx, mut rx) = mpsc::channel(32);
+    let registration_id = Uuid::new_v4();
     let server_entry = Arc::new(RegisteredServer {
+        registration_id,
         control_tx: tx.clone(),
         decoding_key,
         tls_authority,
     });
 
-    state.upsert_server(server_id, server_entry).await;
+    state.upsert_server(server_id, server_entry.clone()).await;
 
     loop {
         tokio::select! {
@@ -662,7 +719,9 @@ async fn handle_register_socket(mut socket: WebSocket, state: Arc<AppState>) -> 
         }
     }
 
-    state.remove_server(&server_id).await;
+    state
+        .remove_server_if_current(&server_id, &registration_id)
+        .await;
     trace!("Removed server registration");
     Ok(())
 }
@@ -827,6 +886,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 
     let tunnel_id = Uuid::new_v4();
     let (tunnel_entry, server_secret) = state.create_tunnel(tunnel_id, Instant::now()).await;
+    let mut tunnel_guard = TunnelCleanupGuard::new(state.clone(), tunnel_id);
     Span::current().record("tunnel_id", &field::display(&tunnel_id));
     info!(
         "Issued tunnel {} for client {} via server {}",
@@ -864,6 +924,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             .await;
         let _ = socket.close().await;
         state.remove_tunnel(&tunnel_id).await;
+        tunnel_guard.disarm();
         return Ok(());
     }
 
@@ -895,7 +956,10 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     let ready: TunnelReadyPayload =
         serde_json::from_str(&ready_payload).context("Failed to parse tunnel_ready")?;
 
-    if ready.role != "client" || ready.tunnel_id != tunnel_id.to_string() {
+    if ready.r#type != "tunnel_ready"
+        || ready.role != "client"
+        || ready.tunnel_id != tunnel_id.to_string()
+    {
         anyhow::bail!("invalid tunnel_ready payload from client");
     }
 
@@ -913,6 +977,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 
     if let Some((client_ws, server_ws)) = tunnel_entry.attach_client(socket).await {
         info!("Tunnel {} became active immediately", tunnel_id);
+        tunnel_guard.disarm();
         spawn_forwarders(state.clone(), tunnel_id, client_ws, server_ws);
         return Ok(());
     }
@@ -971,7 +1036,16 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
                 let _ = client_ws.close().await;
             }
             state.remove_tunnel(&tunnel_id).await;
+            tunnel_guard.disarm();
         }
+    }
+
+    let became_active = {
+        let guard = tunnel_entry.state.lock().await;
+        guard.is_fully_ready()
+    };
+    if became_active {
+        tunnel_guard.disarm();
     }
 
     Ok(())
@@ -1046,7 +1120,10 @@ async fn handle_tunnel_socket(
         serde_json::from_str(&payload).context("Failed to parse tunnel_ready from server")?;
     trace!("Received server tunnel_ready payload");
 
-    if ready.role != "server" || ready.tunnel_id != tunnel_id.to_string() {
+    if ready.r#type != "tunnel_ready"
+        || ready.role != "server"
+        || ready.tunnel_id != tunnel_id.to_string()
+    {
         anyhow::bail!("invalid tunnel_ready payload from server");
     }
 
@@ -1214,12 +1291,37 @@ mod tests {
     use super::*;
     use crate::config::RelayConfig;
     use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
+    use http::Uri;
+    use hyper_util::rt::TokioIo;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use serde::Serialize;
     use serde_json::{Value, json};
     use std::collections::HashMap;
-    use tokio::{net::TcpListener, sync::oneshot, time::Duration};
-    use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+    use std::sync::Arc;
+    use anyhow::{Result, anyhow};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::{mpsc, oneshot},
+        time::Duration,
+    };
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tokio_tungstenite::{
+        MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
+    };
+    use tonic::{
+        Request, Response, Status,
+        transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig},
+    };
+    use tower::service_fn;
+    use url::form_urlencoded;
+
+    mod proto {
+        tonic::include_proto!("relay.test");
+    }
+    use proto::echo_service_client::EchoServiceClient;
+    use proto::echo_service_server::{EchoService, EchoServiceServer};
+    use proto::{EchoRequest, EchoResponse};
 
     #[derive(Serialize)]
     struct TestClaims {
@@ -1230,6 +1332,120 @@ mod tests {
         iat: u64,
         server_id: String,
         permissions: Vec<&'static str>,
+    }
+
+    #[derive(Clone)]
+    struct TestCertificate {
+        pem_cert: String,
+        pem_key: String,
+    }
+
+    fn generate_test_certificate() -> TestCertificate {
+        let rcgen::CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![
+            "handcontrol.local".to_string(),
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("failed to generate test certificate");
+        let pem_cert = cert.pem();
+        let pem_key = signing_key.serialize_pem();
+        TestCertificate { pem_cert, pem_key }
+    }
+
+    #[derive(Default)]
+    struct TestEchoService;
+
+    #[tonic::async_trait]
+    impl EchoService for TestEchoService {
+        async fn echo(
+            &self,
+            request: Request<EchoRequest>,
+        ) -> Result<Response<EchoResponse>, Status> {
+            let message = request.into_inner().message;
+            Ok(Response::new(EchoResponse {
+                message: format!("echo: {message}"),
+            }))
+        }
+    }
+
+    async fn start_test_grpc_server(
+        cert: &TestCertificate,
+    ) -> Result<(SocketAddr, oneshot::Sender<()>), anyhow::Error> {
+        let identity = Identity::from_pem(cert.pem_cert.clone(), cert.pem_key.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let server = EchoServiceServer::new(TestEchoService::default());
+            let tls_config = ServerTlsConfig::new().identity(identity);
+            let result = tonic::transport::Server::builder()
+                .tls_config(tls_config)
+                .expect("configure TLS")
+                .add_service(server)
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+            if let Err(err) = result {
+                tracing::error!("gRPC test server error: {err:?}");
+            }
+        });
+
+        Ok((addr, shutdown_tx))
+    }
+
+    async fn relay_between_ws_and_tcp(
+        ws: WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tcp_stream: TcpStream,
+    ) -> Result<()> {
+        let (ws_sink, mut ws_stream) = ws.split();
+        let sink = Arc::new(tokio::sync::Mutex::new(ws_sink));
+        let (mut tcp_reader, mut tcp_writer) = tcp_stream.into_split();
+
+        let sink_for_stream = sink.clone();
+        let ws_to_tcp = async move {
+            while let Some(msg) = ws_stream.next().await {
+                match msg? {
+                    WsMessage::Binary(data) => {
+                        tcp_writer.write_all(data.as_slice()).await?;
+                    }
+                    WsMessage::Close(_) => break,
+                    WsMessage::Ping(payload) => {
+                        sink_for_stream
+                            .lock()
+                            .await
+                            .send(WsMessage::Pong(payload))
+                            .await?;
+                    }
+                    WsMessage::Pong(_) => {}
+                    WsMessage::Text(_) => {}
+                    _ => {}
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        let sink_for_tcp = sink.clone();
+        let tcp_to_ws = async move {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                let read = tcp_reader.read(&mut buf).await?;
+                if read == 0 {
+                    break;
+                }
+                sink_for_tcp
+                    .lock()
+                    .await
+                    .send(WsMessage::Binary(buf[..read].to_vec().into()))
+                    .await?;
+            }
+            Ok::<(), anyhow::Error>(())
+        };
+
+        tokio::try_join!(ws_to_tcp, tcp_to_ws)?;
+
+        Ok(())
     }
 
     fn test_config(server_id: Uuid, secret: &str, timeout_secs: u64) -> RelayConfig {
@@ -1244,6 +1460,77 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
         }
+    }
+
+    #[test]
+    fn ipv6_bind_address_formats_with_brackets() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"ipv6-secret".as_ref());
+        let mut config = test_config(server_id, &secret, 5);
+        config.bind_address = "::1".to_string();
+        config.port = 8443;
+        let state = AppState::new(config);
+        assert_eq!(state.listen_addr, "[::1]:8443");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn re_register_does_not_remove_new_entry() {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"re-register-secret".as_ref());
+        let config = test_config(server_id, &secret, 5);
+        let state = Arc::new(AppState::new(config));
+
+        let signing_key = SigningKey::from_bytes(&[5u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_b64url = URL_SAFE_NO_PAD.encode(verifying_key.to_bytes());
+        let decoding_key = Arc::new(
+            DecodingKey::from_ed_components(&public_key_b64url)
+                .expect("failed to construct decoding key"),
+        );
+
+        let (tx_old, _rx_old) = mpsc::channel(1);
+        let first_entry = Arc::new(RegisteredServer {
+            registration_id: Uuid::new_v4(),
+            control_tx: tx_old,
+            decoding_key: decoding_key.clone(),
+            tls_authority: Some("first".to_string()),
+        });
+        state
+            .upsert_server(server_id, first_entry.clone())
+            .await;
+
+        let (tx_new, _rx_new) = mpsc::channel(1);
+        let second_entry = Arc::new(RegisteredServer {
+            registration_id: Uuid::new_v4(),
+            control_tx: tx_new,
+            decoding_key,
+            tls_authority: Some("second".to_string()),
+        });
+        state
+            .upsert_server(server_id, second_entry.clone())
+            .await;
+
+        state
+            .remove_server_if_current(&server_id, &first_entry.registration_id)
+            .await;
+        let current = state
+            .server_entry(&server_id)
+            .await
+            .expect("new registration should remain");
+        assert!(
+            Arc::ptr_eq(&current, &second_entry),
+            "stale control connection removed active registration"
+        );
+
+        state
+            .remove_server_if_current(&server_id, &second_entry.registration_id)
+            .await;
+        assert!(
+            state.server_entry(&server_id).await.is_none(),
+            "active registration should be removable"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1290,7 +1577,7 @@ mod tests {
 
         let ack_msg = control_stream.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(
             ack_value["status"], "ok",
             "connect ack error: {ack_value:?}"
@@ -1370,7 +1657,7 @@ mod tests {
 
         let ack_msg = client_ws.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(ack_value["type"], "connect_ack");
         assert_eq!(
             ack_value["status"], "ok",
@@ -1490,7 +1777,7 @@ mod tests {
 
         let ack_msg = control_stream.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(ack_value["status"], "ok");
         match &ack_value["server_authority"] {
             Value::String(value) => assert_eq!(value, "handcontrol.local:50051"),
@@ -1546,7 +1833,7 @@ mod tests {
 
         let ack_msg = client_ws.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(ack_value["status"], "ok");
         let tunnel_id = ack_value["tunnel_id"].as_str().unwrap();
 
@@ -1620,7 +1907,7 @@ mod tests {
 
         let ack_msg = control_stream.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(ack_value["status"], "ok");
 
         let control_task = tokio::spawn(async move {
@@ -1672,7 +1959,7 @@ mod tests {
 
         let ack_msg = client_ws.next().await.unwrap().unwrap();
         let ack_text = ack_msg.into_text().unwrap().to_string();
-        let ack_value: Value = serde_json::from_str(&ack_text).unwrap();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
         assert_eq!(ack_value["status"], "error");
         assert_eq!(ack_value["error"], "client_mismatch");
 
@@ -1680,5 +1967,586 @@ mod tests {
         control_task.abort();
         server_handle.abort();
         let _ = server_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn grpc_tunnel_forwards_grpc_response() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"relayed-secret".as_ref());
+        let config = test_config(server_id, &secret, 10);
+        let state = Arc::new(AppState::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let app_state = state.clone();
+        let relay_handle = tokio::spawn(async move {
+            axum::serve(listener, build_router(app_state).into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let cert = generate_test_certificate();
+        let (grpc_addr, grpc_shutdown) = start_test_grpc_server(&cert).await.unwrap();
+        let server_authority = format!("handcontrol.local:{}", grpc_addr.port());
+
+        let signing_key = SigningKey::from_bytes(&[13u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_base64 = Base64.encode(verifying_key.to_bytes());
+        let private_der = signing_key.to_pkcs8_der().unwrap();
+        let encoding_key = EncodingKey::from_ed_der(private_der.as_bytes());
+
+        // Register server with relay
+        let register_url = format!("ws://{relay_addr}/register");
+        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (mut control_sink, mut control_stream) = control_ws.split();
+
+        let register_msg = json!({
+            "type": "register",
+            "server_id": server_id.to_string(),
+            "relay_secret": secret,
+            "server_version": "test",
+            "capabilities": ["relay.v1"],
+            "public_key": public_key_base64,
+            "max_tunnels": 2,
+            "tls_authority": server_authority,
+        });
+        control_sink
+            .send(WsMessage::Text(register_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = control_stream.next().await.unwrap().unwrap();
+        let ack_text = ack_msg.into_text().unwrap().to_string();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
+        assert_eq!(ack_value["status"], "ok");
+        if let Some(authority) = ack_value["server_authority"].as_str() {
+            assert_eq!(authority, server_authority);
+        }
+
+        let (open_tunnel_tx, open_tunnel_rx) = oneshot::channel::<(Uuid, String)>();
+        let control_task = tokio::spawn(async move {
+            let mut open_tunnel_tx = Some(open_tunnel_tx);
+            while let Some(msg) = control_stream.next().await {
+                match msg {
+                    Ok(WsMessage::Text(text)) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text.to_string()) {
+                            if value["type"] == "open_tunnel" {
+                                if let (Some(tx), Some(tunnel_id), Some(secret)) = (
+                                    open_tunnel_tx.take(),
+                                    value["tunnel_id"].as_str(),
+                                    value["server_secret"].as_str(),
+                                ) {
+                                    let tunnel_id = Uuid::parse_str(tunnel_id).unwrap();
+                                    let _ = tx.send((tunnel_id, secret.to_string()));
+                                }
+                            }
+                        }
+                    }
+                    Ok(WsMessage::Ping(payload)) => {
+                        if control_sink.send(WsMessage::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(WsMessage::Close(_)) | Err(_) => break,
+                    _ => {}
+                }
+            }
+        });
+
+        // Client initiates relay tunnel
+        let connect_url = format!("ws://{relay_addr}/connect");
+        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+        let client_id = Uuid::new_v4();
+
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = TestClaims {
+            iss: "handcontrol-server",
+            sub: client_id.to_string(),
+            aud: "127.0.0.1".to_string(),
+            exp: now + 60,
+            iat: now,
+            server_id: server_id.to_string(),
+            permissions: vec!["connect"],
+        };
+        let token =
+            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key).unwrap();
+
+        let connect_msg = json!({
+            "type": "connect",
+            "server_id": server_id.to_string(),
+            "relay_token": token,
+            "client_id": client_id.to_string(),
+            "client_version": "integration-test",
+        });
+        client_ws
+            .send(WsMessage::Text(connect_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = client_ws.next().await.unwrap().unwrap();
+        let ack_text = ack_msg.into_text().unwrap().to_string();
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
+        assert_eq!(ack_value["status"], "ok");
+        let tunnel_id = Uuid::parse_str(ack_value["tunnel_id"].as_str().unwrap()).unwrap();
+
+        let ready_msg = json!({
+            "type": "tunnel_ready",
+            "tunnel_id": tunnel_id.to_string(),
+            "role": "client",
+        });
+        client_ws
+            .send(WsMessage::Text(ready_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let (opened_tunnel_id, server_secret) = open_tunnel_rx.await.unwrap();
+        assert_eq!(opened_tunnel_id, tunnel_id);
+
+        let server_tunnel_task = {
+            let server_secret = server_secret.clone();
+            let relay_addr = relay_addr;
+            tokio::spawn(async move {
+                let secret_param: String =
+                    url::form_urlencoded::byte_serialize(server_secret.as_bytes()).collect();
+                let server_tunnel_url = format!(
+                    "ws://{relay_addr}/tunnel/{tunnel_id}?role=server&token={secret_param}"
+                );
+                let (mut server_ws, _) = connect_async(server_tunnel_url).await?;
+                let ready_msg = json!({
+                    "type": "tunnel_ready",
+                    "tunnel_id": tunnel_id.to_string(),
+                    "role": "server",
+                });
+                server_ws
+                    .send(WsMessage::Text(ready_msg.to_string().into()))
+                    .await?;
+                let tcp = TcpStream::connect(grpc_addr).await?;
+                relay_between_ws_and_tcp(server_ws, tcp).await
+            })
+        };
+
+        let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bridge_addr = local_listener.local_addr().unwrap();
+        let client_tunnel_task = tokio::spawn(async move {
+            let (socket, _) = local_listener.accept().await?;
+            relay_between_ws_and_tcp(client_ws, socket).await
+        });
+
+        let client_tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(cert.pem_cert.clone()))
+            .domain_name("handcontrol.local");
+        let endpoint =
+            Endpoint::from_shared(format!("https://handcontrol.local:{}", bridge_addr.port()))
+                .unwrap()
+                .tls_config(client_tls)
+                .unwrap();
+        let bridge_target = bridge_addr;
+        let connector = service_fn(move |_: Uri| {
+            let addr = bridge_target;
+            async move {
+                let stream = TcpStream::connect(addr).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }
+        });
+        let channel = endpoint.connect_with_connector(connector).await.unwrap();
+        let mut client = EchoServiceClient::new(channel.clone());
+
+        let response = client
+            .echo(Request::new(EchoRequest {
+                message: "hello".to_string(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(response.into_inner().message, "echo: hello");
+
+        drop(client);
+        drop(channel);
+
+        client_tunnel_task.abort();
+        let _ = client_tunnel_task.await;
+        server_tunnel_task.abort();
+        let _ = server_tunnel_task.await;
+
+        grpc_shutdown.send(()).ok();
+        control_task.abort();
+        let _ = control_task.await;
+        relay_handle.abort();
+        let _ = relay_handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn control_connection_stays_connected_after_tunnel_close() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"relayed-secret".as_ref());
+        let config = test_config(server_id, &secret, 5);
+        let state = Arc::new(AppState::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let app_state = state.clone();
+        let relay_handle = tokio::spawn(async move {
+            axum::serve(listener, build_router(app_state).into_make_service())
+                .await
+                .unwrap();
+        });
+
+        // Prepare signing key for test server (acts like TokenIssuer)
+        let signing_key_bytes = [42u8; 32];
+        let signing_key = SigningKey::from_bytes(&signing_key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_base64 = Base64.encode(verifying_key.to_bytes());
+
+        let base_ws_url = format!("ws://{}", relay_addr);
+        let register_url = format!("{}/register", base_ws_url);
+
+        let (control_closed_tx, control_closed_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_test_server_control(
+            register_url,
+            base_ws_url.clone(),
+            server_id,
+            secret.clone(),
+            public_key_base64.clone(),
+            control_closed_tx,
+        ));
+
+        // Wait for server registration to be visible
+        let mut attempts = 0;
+        loop {
+            if state.server_entry(&server_id).await.is_some() {
+                break;
+            }
+            attempts += 1;
+            if attempts > 200 {
+                panic!("Server did not register with relay");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client_id = Uuid::new_v4();
+        let relay_token =
+            create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
+
+        let connect_url = format!("{}/connect", base_ws_url);
+        let (client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let connect_msg = json!({
+            "type": "connect",
+            "server_id": server_id.to_string(),
+            "relay_token": relay_token,
+            "client_id": client_id.to_string(),
+            "client_version": "integration-test",
+        });
+        client_sink
+            .send(WsMessage::Text(connect_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = client_stream.next().await.unwrap().unwrap();
+        let ack_text = match ack_msg {
+            WsMessage::Text(text) => text,
+            other => panic!("Expected text ack, got {:?}", other),
+        };
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
+        assert_eq!(ack_value["status"], "ok");
+        let tunnel_id = ack_value["tunnel_id"]
+            .as_str()
+            .expect("missing tunnel_id in ack")
+            .to_string();
+
+        let ready_msg = json!({
+            "type": "tunnel_ready",
+            "tunnel_id": tunnel_id,
+            "role": "client",
+        });
+        client_sink
+            .send(WsMessage::Text(ready_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        client_sink.send(WsMessage::Close(None)).await.unwrap();
+        let _ = client_stream.next().await;
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = control_closed_rx => panic!("Control connection closed unexpectedly"),
+        }
+
+        relay_handle.abort();
+        let _ = relay_handle.await;
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn control_connection_handles_abrupt_tunnel_close() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"relayed-secret".as_ref());
+        let config = test_config(server_id, &secret, 5);
+        let state = Arc::new(AppState::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let app_state = state.clone();
+        let relay_handle = tokio::spawn(async move {
+            axum::serve(listener, build_router(app_state).into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let signing_key_bytes = [84u8; 32];
+        let signing_key = SigningKey::from_bytes(&signing_key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_base64 = Base64.encode(verifying_key.to_bytes());
+
+        let base_ws_url = format!("ws://{}", relay_addr);
+        let register_url = format!("{}/register", base_ws_url);
+
+        let (control_closed_tx, control_closed_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_test_server_control(
+            register_url,
+            base_ws_url.clone(),
+            server_id,
+            secret.clone(),
+            public_key_base64.clone(),
+            control_closed_tx,
+        ));
+
+        let mut attempts = 0;
+        loop {
+            if state.server_entry(&server_id).await.is_some() {
+                break;
+            }
+            attempts += 1;
+            if attempts > 200 {
+                panic!("Server did not register with relay");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client_id = Uuid::new_v4();
+        let relay_token =
+            create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
+
+        let connect_url = format!("{}/connect", base_ws_url);
+        let (client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let connect_msg = json!({
+            "type": "connect",
+            "server_id": server_id.to_string(),
+            "relay_token": relay_token,
+            "client_id": client_id.to_string(),
+            "client_version": "integration-test",
+        });
+        client_sink
+            .send(WsMessage::Text(connect_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = client_stream.next().await.unwrap().unwrap();
+        let ack_text = match ack_msg {
+            WsMessage::Text(text) => text,
+            other => panic!("Expected text ack, got {:?}", other),
+        };
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
+        assert_eq!(ack_value["status"], "ok");
+
+        let tunnel_id = ack_value["tunnel_id"]
+            .as_str()
+            .expect("missing tunnel_id in ack")
+            .to_string();
+
+        let ready_msg = json!({
+            "type": "tunnel_ready",
+            "tunnel_id": tunnel_id,
+            "role": "client",
+        });
+        client_sink
+            .send(WsMessage::Text(ready_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        drop(client_sink);
+        drop(client_stream);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = control_closed_rx => {
+                panic!("Control connection terminated after abrupt client drop");
+            }
+        }
+
+        relay_handle.abort();
+        let _ = relay_handle.await;
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    async fn run_test_server_control(
+        register_url: String,
+        base_ws_url: String,
+        server_id: Uuid,
+        relay_secret: String,
+        public_key_base64: String,
+        control_closed_tx: oneshot::Sender<()>,
+    ) -> Result<()> {
+        let (ws_stream, _) = connect_async(register_url).await?;
+        let (mut sink, mut stream) = ws_stream.split();
+
+        let register_msg = json!({
+            "type": "register",
+            "server_id": server_id.to_string(),
+            "relay_secret": relay_secret,
+            "server_version": "test",
+            "capabilities": ["relay.v1"],
+            "public_key": public_key_base64,
+            "max_tunnels": 2,
+            "tls_authority": "handcontrol.local:50051",
+        });
+        sink.send(WsMessage::Text(register_msg.to_string().into()))
+            .await?;
+
+        let ack_msg = stream
+            .next()
+            .await
+            .ok_or_else(|| anyhow!("Missing register ack"))??;
+        let ack_text = match ack_msg {
+            WsMessage::Text(text) => text,
+            other => anyhow::bail!("Unexpected register ack frame: {:?}", other),
+        };
+        let ack_value: Value = serde_json::from_str(ack_text.as_str())?;
+        if ack_value["status"] != "ok" {
+            anyhow::bail!("Register failed: {:?}", ack_value);
+        }
+
+        let mut tunnel_tasks = Vec::new();
+
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(WsMessage::Text(text)) => {
+                    if let Ok(value) = serde_json::from_str::<Value>(text.as_str()) {
+                        if value["type"] == "open_tunnel" {
+                            if let (Some(tunnel_id), Some(server_secret)) = (
+                                value["tunnel_id"].as_str(),
+                                value["server_secret"].as_str(),
+                            ) {
+                                let tunnel_url = format!(
+                                    "{}/tunnel/{}?role=server&token={}",
+                                    base_ws_url,
+                                    tunnel_id,
+                                    form_urlencoded::byte_serialize(server_secret.as_bytes())
+                                        .collect::<String>()
+                                );
+                                let tunnel_id_string = tunnel_id.to_string();
+                                let handle = tokio::spawn(async move {
+                                    if let Err(err) =
+                                        handle_test_server_tunnel(tunnel_url, tunnel_id_string).await
+                                    {
+                                        tracing::error!("Test tunnel failed: {:?}", err);
+                                    }
+                                });
+                                tunnel_tasks.push(handle);
+                            }
+                        }
+                    }
+                }
+                Ok(WsMessage::Ping(payload)) => {
+                    sink.send(WsMessage::Pong(payload)).await?;
+                }
+                Ok(WsMessage::Close(_)) => break,
+                Ok(_) => {}
+                Err(err) => {
+                    return Err(anyhow!(err));
+                }
+            }
+        }
+
+        for handle in tunnel_tasks {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        let _ = control_closed_tx.send(());
+        Ok(())
+    }
+
+    async fn handle_test_server_tunnel(tunnel_url: String, tunnel_id: String) -> Result<()> {
+        let (ws_stream, _) = connect_async(tunnel_url).await?;
+        let (mut sink, mut stream) = ws_stream.split();
+
+        let ready_msg = json!({
+            "type": "tunnel_ready",
+            "tunnel_id": tunnel_id,
+            "role": "server",
+        });
+        sink.send(WsMessage::Text(ready_msg.to_string().into())).await?;
+
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Ok(WsMessage::Binary(_)) => {}
+                Ok(WsMessage::Ping(payload)) => {
+                    sink.send(WsMessage::Pong(payload)).await?;
+                }
+                Ok(WsMessage::Close(_)) => break,
+                Ok(_) => {}
+                Err(err) => return Err(anyhow!(err)),
+            }
+        }
+
+        Ok(())
+    }
+
+    fn create_client_token(
+        signing_key: &SigningKey,
+        server_id: Uuid,
+        client_id: Uuid,
+        audience: &str,
+    ) -> Result<String> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        #[derive(Serialize)]
+        struct RelayTokenClaims<'a> {
+            iss: &'static str,
+            sub: String,
+            aud: &'a str,
+            exp: u64,
+            iat: u64,
+            server_id: String,
+            permissions: Vec<&'static str>,
+        }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system time before unix epoch")?
+            .as_secs();
+        let exp = now + 3600;
+
+        let claims = RelayTokenClaims {
+            iss: "handcontrol-server",
+            sub: client_id.to_string(),
+            aud: audience,
+            exp,
+            iat: now,
+            server_id: server_id.to_string(),
+            permissions: vec!["connect"],
+        };
+
+        let der = signing_key
+            .to_pkcs8_der()
+            .context("encode signing key to DER")?;
+        let encoding_key = EncodingKey::from_ed_der(der.as_bytes());
+
+        let token =
+            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key)
+                .context("encode token")?;
+        Ok(token)
     }
 }

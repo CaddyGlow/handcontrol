@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-pub use client::RelayClient;
+pub use client::{RelayClient, create_mtls_client_config, load_or_create_relay_client_cert};
 pub use tokens::TokenIssuer;
 
 /// Payload sent over the control WebSocket immediately after `/register`.

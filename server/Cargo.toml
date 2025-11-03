@@ -28,6 +28,7 @@ tonic-prost = { workspace = true }
 regex = "1.11"
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

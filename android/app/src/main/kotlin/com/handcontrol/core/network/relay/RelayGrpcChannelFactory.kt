@@ -78,12 +78,15 @@ class RelayGrpcChannelFactory @Inject constructor(
             )
         }
 
-        // Create mTLS gRPC channel to localhost (which forwards to relay)
-        val channel = createMtlsChannel(
-            host = "localhost",
-            port = bridge.localPort,
-            authority = authority
-        )
+        // Create plain gRPC channel to localhost bridge (server handles mTLS)
+        val channel = OkHttpChannelBuilder
+            .forAddress("localhost", bridge.localPort)
+            .usePlaintext()
+            .overrideAuthority(authority)
+            .keepAliveTime(30, TimeUnit.SECONDS)
+            .keepAliveTimeout(10, TimeUnit.SECONDS)
+            .keepAliveWithoutCalls(true)
+            .build()
 
         activeBridges[channel] = bridge
         Timber.i("Relay gRPC channel created successfully")

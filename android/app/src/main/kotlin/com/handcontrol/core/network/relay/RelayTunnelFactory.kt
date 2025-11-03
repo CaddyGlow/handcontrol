@@ -20,11 +20,15 @@ import okhttp3.WebSocketListener
 import okio.ByteString
 import timber.log.Timber
 import java.io.IOException
+import java.security.cert.X509Certificate
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /**
  * Message sent by client to initiate tunnel connection
@@ -73,6 +77,7 @@ data class RelayTunnel(
     val healthMonitor: TunnelHealthMonitor
 ) {
     suspend fun sendData(data: ByteArray) {
+        healthMonitor.recordActivity()
         webSocket.send(ByteString.of(*data))
     }
 
@@ -97,8 +102,11 @@ class TunnelHealthMonitor(
     private var monitorJob: Job? = null
 
     companion object {
-        private const val HEALTH_CHECK_INTERVAL_MS = 5000L // Check every 5 seconds
-        private const val MAX_IDLE_TIME_MS = 60000L // 60 seconds without any activity
+        private const val HEALTH_CHECK_INTERVAL_MS = 10000L // Check every 10 seconds
+        private const val MAX_IDLE_TIME_MS = 120000L // 120 seconds without any activity (2 minutes)
+        // Note: OkHttp sends automatic pings every 20s, but those don't trigger recordActivity()
+        // Server also sends pings every 20s which DO trigger recordActivity()
+        // So we should see activity at least every 20-40s from pong responses
     }
 
     fun start() {
@@ -107,8 +115,10 @@ class TunnelHealthMonitor(
                 delay(HEALTH_CHECK_INTERVAL_MS)
 
                 val idleTime = System.currentTimeMillis() - lastActivityTime.get()
+                Timber.v("Tunnel health check: idle for ${idleTime}ms (max: ${MAX_IDLE_TIME_MS}ms)")
+
                 if (idleTime > MAX_IDLE_TIME_MS) {
-                    Timber.w("Tunnel health check failed: no activity for ${idleTime}ms")
+                    Timber.w("Tunnel health check failed: no activity for ${idleTime}ms (max: ${MAX_IDLE_TIME_MS}ms)")
                     isRunning.set(false)
                     onUnhealthy()
                     break
@@ -143,12 +153,30 @@ class RelayTunnelFactory @Inject constructor() {
         encodeDefaults = true
     }
 
-    private val okHttpClient = OkHttpClient.Builder()
-        .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS) // No read timeout for persistent connection
-        .writeTimeout(10, TimeUnit.SECONDS)
-        .pingInterval(20, TimeUnit.SECONDS) // WebSocket ping every 20 seconds
-        .build()
+    private val okHttpClient by lazy {
+        createOkHttpClient()
+    }
+
+    private fun createOkHttpClient(): OkHttpClient {
+        // Create a trust manager that accepts all certificates (for self-signed relay certs)
+        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        })
+
+        val sslContext = SSLContext.getInstance("TLS")
+        sslContext.init(null, trustAllCerts, java.security.SecureRandom())
+
+        return OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(0, TimeUnit.SECONDS) // No read timeout for persistent connection
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .pingInterval(20, TimeUnit.SECONDS) // WebSocket ping every 20 seconds
+            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
+            .hostnameVerifier { _, _ -> true } // Accept all hostnames for self-signed certs
+            .build()
+    }
 
     /**
      * Opens a relay tunnel to the specified server
@@ -195,6 +223,7 @@ class RelayTunnelFactory @Inject constructor() {
 
             override fun onMessage(webSocket: WebSocket, text: String) {
                 healthMonitor?.recordActivity()
+                Timber.v("Tunnel $tunnelId received text message, activity recorded")
 
                 if (dataMode) {
                     Timber.w("Received unexpected text message in data mode: ${text.take(100)}")
@@ -270,6 +299,7 @@ class RelayTunnelFactory @Inject constructor() {
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
                 healthMonitor?.recordActivity()
+                Timber.v("Tunnel $tunnelId received ${bytes.size} bytes, activity recorded")
 
                 if (!dataMode) {
                     Timber.w("Received binary data before tunnel ready")
@@ -277,9 +307,12 @@ class RelayTunnelFactory @Inject constructor() {
                 }
 
                 // Forward binary data from relay to gRPC
-                val success = incomingData.trySend(bytes.toByteArray())
-                if (!success.isSuccess) {
-                    Timber.w("Failed to forward binary data, channel full or closed")
+                scope.launch {
+                    try {
+                        incomingData.send(bytes.toByteArray())
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to forward binary data, channel closed")
+                    }
                 }
             }
 

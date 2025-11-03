@@ -105,6 +105,13 @@ impl TokenIssuer {
     ) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
+        tracing::debug!(
+            client_id = %client_id,
+            relay_url = %relay_url,
+            ttl_hours = %ttl_hours,
+            "Generating relay JWT token"
+        );
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("System time is before UNIX_EPOCH")?
@@ -124,6 +131,13 @@ impl TokenIssuer {
             permissions: vec!["connect".to_string()],
         };
 
+        tracing::trace!(
+            server_id = %self.server_id,
+            iat = %now,
+            exp = %exp,
+            "JWT claims prepared"
+        );
+
         let pem = self
             .signing_key
             .to_pkcs8_pem(base64ct::LineEnding::LF)
@@ -134,6 +148,12 @@ impl TokenIssuer {
 
         let token = encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key)
             .context("Failed to encode JWT token")?;
+
+        tracing::debug!(
+            client_id = %client_id,
+            token_length = %token.len(),
+            "JWT token generated successfully"
+        );
 
         Ok(token)
     }

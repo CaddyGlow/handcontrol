@@ -10,7 +10,9 @@ use handcontrol::grpc::proto::{
 use handcontrol::grpc::server::{RemoteControlService, start_server};
 use handcontrol::mdns::service::MdnsService;
 use handcontrol::notifications::NotificationManager;
-use handcontrol::relay::{RelayClient, TokenIssuer};
+use handcontrol::relay::{
+    RelayClient, TokenIssuer, create_mtls_client_config, load_or_create_relay_client_cert,
+};
 use handcontrol::security::certificates::ensure_server_certificate;
 use handcontrol::security::enrollment::EnrollmentTokenManager;
 use handcontrol::security::pairing::PairingRequestManager;
@@ -518,6 +520,37 @@ async fn start_handcontrol_server() -> Result<()> {
         None
     };
 
+    let relay_client_mtls_config = if config.relay.enabled {
+        info!("Loading relay client certificate for relay mTLS");
+        let config_dir = paths::config_dir().context("Failed to determine config directory")?;
+        let relay_client_cert = load_or_create_relay_client_cert(&config_dir)
+            .context("Failed to initialize relay client certificate")?;
+        info!(
+            "Relay client certificate ready: {}",
+            relay_client_cert.fingerprint_display()
+        );
+
+        {
+            let mut store = client_store.lock().unwrap();
+            use handcontrol::security::certificates::ClientCertificate;
+            let relay_fp = relay_client_cert.fingerprint_display();
+            if store.get_client_by_fingerprint(&relay_fp).is_none() {
+                let client_cert = ClientCertificate::from_der(relay_client_cert.cert_der.clone());
+                store
+                    .add_client(&client_cert, "relay-internal".to_string(), None)
+                    .context("Failed to register relay client certificate")?;
+                info!("Relay client certificate registered in client store");
+            }
+        }
+
+        Some(
+            create_mtls_client_config(&relay_client_cert, &server_cert.cert_der)
+                .context("Failed to create relay mTLS client configuration")?,
+        )
+    } else {
+        None
+    };
+
     // Get values needed for networking/mDNS before moving into Arc
     let mdns_instance_name = config.server.mdns_instance_name.clone();
     let server_port = config.server.port;
@@ -612,6 +645,7 @@ async fn start_handcontrol_server() -> Result<()> {
                 server_id,
                 issuer.clone(),
                 addr,
+                relay_client_mtls_config.clone(),
             ));
 
             // Spawn relay client task

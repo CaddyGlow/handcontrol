@@ -4,6 +4,12 @@
 
 set -e # Exit on error
 
+# Ensure the script runs relative to the Android project directory
+ORIGINAL_DIR=$(pwd)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+trap 'cd "$ORIGINAL_DIR"' EXIT
+cd "$SCRIPT_DIR"
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,7 +32,7 @@ echo -e "${GREEN}Found $DEVICE_COUNT device(s) connected${NC}"
 
 # Build the APK
 echo -e "\n${YELLOW}Building debug APK...${NC}"
-./gradlew assembleDebug
+$SCRIPT_DIR/gradlew assembleDebug
 
 if [ $? -eq 0 ]; then
   echo -e "${GREEN}Build successful!${NC}"
@@ -37,7 +43,7 @@ fi
 
 # Install the APK
 echo -e "\n${YELLOW}Installing APK to device...${NC}"
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -r "$SCRIPT_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
 if [ $? -eq 0 ]; then
   echo -e "${GREEN}Installation successful!${NC}"

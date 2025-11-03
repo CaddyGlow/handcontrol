@@ -1,8 +1,14 @@
 package com.handcontrol.core.network.relay
 
+import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.security.ClientCertificateManager
 import com.handcontrol.core.security.VerificationCodeGenerator
+import io.grpc.Attributes
+import io.grpc.EquivalentAddressGroup
 import io.grpc.ManagedChannel
+import io.grpc.NameResolver
+import io.grpc.NameResolver.ResolutionResult
+import io.grpc.Status
 import io.grpc.okhttp.OkHttpChannelBuilder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -13,8 +19,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.IOException
+import java.net.InetAddress
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketAddress
+import java.net.URI
 import java.security.KeyStore
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -78,15 +88,16 @@ class RelayGrpcChannelFactory @Inject constructor(
             )
         }
 
-        // Create plain gRPC channel to localhost bridge (server handles mTLS)
-        val channel = OkHttpChannelBuilder
-            .forAddress("localhost", bridge.localPort)
-            .usePlaintext()
-            .overrideAuthority(authority)
-            .keepAliveTime(30, TimeUnit.SECONDS)
-            .keepAliveTimeout(10, TimeUnit.SECONDS)
-            .keepAliveWithoutCalls(true)
-            .build()
+        if (extractAuthorityHost(authority) == null) {
+            Timber.e("Unable to determine TLS authority host from '$authority'")
+            bridge.shutdown()
+            throw RelayConnectionException(
+                "Invalid relay authority",
+                "The relay returned an invalid TLS authority."
+            )
+        }
+
+        val channel = createMtlsChannel(authority = authority, loopbackPort = bridge.localPort)
 
         activeBridges[channel] = bridge
         Timber.i("Relay gRPC channel created successfully")
@@ -245,9 +256,8 @@ class RelayGrpcChannelFactory @Inject constructor(
      * Creates an mTLS-enabled gRPC channel to a specific host/port with authority override
      */
     private suspend fun createMtlsChannel(
-        host: String,
-        port: Int,
-        authority: String
+        authority: String,
+        loopbackPort: Int
     ): ManagedChannel {
         val clientCert = certificateManager.loadOrCreate()
         val pinnedFingerprint = certificateManager.getPinnedServerFingerprint()
@@ -256,15 +266,16 @@ class RelayGrpcChannelFactory @Inject constructor(
         }
         val sslContext = createMtlsSslContext(pinnedFingerprint)
 
-        return OkHttpChannelBuilder
-            .forAddress(host, port)
+        val builder = OkHttpChannelBuilder
+            .forTarget("loopback:///$authority")
+            .nameResolverFactory(LoopbackNameResolverFactory(loopbackPort))
             .sslSocketFactory(sslContext.socketFactory)
             .hostnameVerifier { _, _ -> true }
             .overrideAuthority(authority)
             .keepAliveTime(30, TimeUnit.SECONDS)
             .keepAliveTimeout(10, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
-            .build()
+        return builder.build()
     }
 
     /**
@@ -346,6 +357,70 @@ class RelayGrpcChannelFactory @Inject constructor(
         activeBridges.keys.toList().forEach { channel ->
             shutdownChannel(channel)
         }
+    }
+}
+
+private fun extractAuthorityHost(authority: String): String? {
+    if (authority.isBlank()) {
+        return null
+    }
+
+    return if (authority.startsWith("[")) {
+        authority.substringAfter('[').substringBefore(']').takeIf { it.isNotBlank() }
+    } else {
+        authority.substringBefore(':').ifEmpty { authority }
+    }
+}
+
+private class LoopbackNameResolverFactory(
+    private val loopbackPort: Int
+) : NameResolver.Factory() {
+    override fun newNameResolver(targetUri: URI, args: NameResolver.Args): NameResolver? {
+        return if (targetUri.scheme == getDefaultScheme()) {
+            LoopbackNameResolver(loopbackPort)
+        } else {
+            null
+        }
+    }
+
+    override fun getDefaultScheme(): String = "loopback"
+}
+
+private class LoopbackNameResolver(
+    private val loopbackPort: Int
+) : NameResolver() {
+    override fun getServiceAuthority(): String = "loopback"
+
+    override fun start(listener: Listener2) {
+        val addresses = mutableListOf<SocketAddress>()
+        try {
+            addresses.add(InetSocketAddress(InetAddress.getByName("127.0.0.1"), loopbackPort))
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to resolve IPv4 loopback address")
+        }
+        try {
+            addresses.add(InetSocketAddress(InetAddress.getByName("::1"), loopbackPort))
+        } catch (e: Exception) {
+            Timber.d("IPv6 loopback not available: ${e.message}")
+        }
+        if (addresses.isEmpty()) {
+            listener.onError(Status.UNAVAILABLE.withDescription("Loopback addresses unavailable"))
+            return
+        }
+        val addressGroup = EquivalentAddressGroup(addresses)
+        val result = ResolutionResult.newBuilder()
+            .setAddresses(listOf(addressGroup))
+            .setAttributes(Attributes.EMPTY)
+            .build()
+        listener.onResult(result)
+    }
+
+    override fun refresh() {
+        // No dynamic data to refresh; resolution is static.
+    }
+
+    override fun shutdown() {
+        // Nothing to release.
     }
 }
 

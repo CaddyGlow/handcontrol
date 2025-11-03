@@ -1,28 +1,21 @@
 use crate::config::parser::RelayConfig;
 use crate::relay::tokens::TokenIssuer;
-use crate::security::certificates::ServerCertificate;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::DigitallySignedStruct;
-use rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
-};
-use rustls::ClientConfig;
-use rustls::RootCertStore;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
-use tokio_rustls::TlsConnector;
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{Message, protocol::frame::Payload},
@@ -85,7 +78,6 @@ pub struct RelayClient {
     local_grpc_endpoint: SocketAddr,
     state: Arc<RwLock<RelayClientState>>,
     tls_authority: String,
-    mtls_client_config: Option<Arc<ClientConfig>>,
 }
 
 impl RelayClient {
@@ -94,7 +86,6 @@ impl RelayClient {
         server_id: Uuid,
         token_issuer: Arc<TokenIssuer>,
         local_grpc_endpoint: SocketAddr,
-        mtls_client_config: Option<Arc<ClientConfig>>,
     ) -> Self {
         Self {
             config,
@@ -103,7 +94,6 @@ impl RelayClient {
             local_grpc_endpoint,
             state: Arc::new(RwLock::new(RelayClientState::Disconnected)),
             tls_authority: format!("handcontrol.local:{}", local_grpc_endpoint.port()),
-            mtls_client_config,
         }
     }
 
@@ -346,19 +336,9 @@ impl RelayClient {
         let local_endpoint = self.local_grpc_endpoint;
         let tunnel_id = tunnel_id.to_string();
         let tls_options = self.tls_options()?;
-        let mtls_client_config = self.mtls_client_config.clone();
-        let tls_authority = self.tls_authority.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_tunnel(
-                tunnel_url,
-                tunnel_id,
-                local_endpoint,
-                tls_options,
-                mtls_client_config,
-                tls_authority,
-            )
-            .await
+            if let Err(e) = handle_tunnel(tunnel_url, tunnel_id, local_endpoint, tls_options).await
             {
                 error!("Tunnel task failed: {:#}", e);
             }
@@ -374,8 +354,6 @@ async fn handle_tunnel(
     tunnel_id: String,
     local_endpoint: SocketAddr,
     tls_options: RelayTlsOptions,
-    mtls_client_config: Option<Arc<ClientConfig>>,
-    tls_authority: String,
 ) -> Result<()> {
     info!(tunnel_id = %tunnel_id, "Opening tunnel to relay");
 
@@ -417,39 +395,12 @@ async fn handle_tunnel(
 
     info!(tunnel_id = %tunnel_id, "Tunnel ready, connecting to local gRPC");
 
-    let (mut local_read, mut local_write): (LocalReadHalf, LocalWriteHalf) =
-        if let Some(client_config) = mtls_client_config {
-            info!(tunnel_id = %tunnel_id, "Using mTLS for local gRPC connection");
-            let tcp_stream = TcpStream::connect(local_endpoint)
-                .await
-                .context("Failed to connect to local gRPC server")?;
-
-            let connector = TlsConnector::from(client_config);
-            let authority_host = tls_authority
-                .split(':')
-                .next()
-                .unwrap_or("handcontrol.local")
-                .to_owned();
-            let server_name = ServerName::try_from(authority_host)
-                .context("Invalid TLS server name for relay client")?;
-            let tls_stream = connector
-                .connect(server_name, tcp_stream)
-                .await
-                .context("Failed to establish mTLS connection to local gRPC server")?;
-            info!(tunnel_id = %tunnel_id, "mTLS handshake completed successfully");
-            let (read_half, write_half) = io::split(tls_stream);
-            (Box::new(read_half), Box::new(write_half))
-        } else {
-            warn!(
-                tunnel_id = %tunnel_id,
-                "mTLS not configured for relay client; falling back to plain TCP"
-            );
-            let tcp_stream = TcpStream::connect(local_endpoint)
-                .await
-                .context("Failed to connect to local gRPC server")?;
-            let (read_half, write_half) = tcp_stream.into_split();
-            (Box::new(read_half), Box::new(write_half))
-        };
+    let tcp_stream = TcpStream::connect(local_endpoint)
+        .await
+        .context("Failed to connect to local gRPC server")?;
+    let (read_half, write_half) = tcp_stream.into_split();
+    let mut local_read: LocalReadHalf = Box::new(read_half);
+    let mut local_write: LocalWriteHalf = Box::new(write_half);
 
     info!(tunnel_id = %tunnel_id, "Bridge established, forwarding data");
 
@@ -617,58 +568,6 @@ fn build_tls_connector(tls_options: RelayTlsOptions) -> Result<Option<Connector>
     client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(Some(Connector::Rustls(std::sync::Arc::new(client_config))))
-}
-
-/// Load or generate the relay client certificate used for mTLS connections back into the
-/// local gRPC server.
-pub fn load_or_create_relay_client_cert(config_dir: &Path) -> Result<ServerCertificate> {
-    let cert_path = config_dir.join("relay-client.crt");
-    let key_path = config_dir.join("relay-client.key");
-
-    if cert_path.exists() && key_path.exists() {
-        info!(
-            path = %cert_path.display(),
-            "Loading existing relay client certificate"
-        );
-        ServerCertificate::load_from_files(&cert_path, &key_path)
-            .context("Failed to load relay client certificate")
-    } else {
-        info!(
-            path = %cert_path.display(),
-            "Generating new relay client certificate for relay mTLS"
-        );
-        let cert = ServerCertificate::generate()
-            .context("Failed to generate relay client certificate")?;
-        cert.save_to_files(&cert_path, &key_path)
-            .context("Failed to save relay client certificate")?;
-        info!(
-            "Relay client certificate created with fingerprint {}",
-            cert.fingerprint_display()
-        );
-        Ok(cert)
-    }
-}
-
-/// Create the rustls client configuration used by the relay to connect to the local gRPC server
-/// with mutual TLS.
-pub fn create_mtls_client_config(
-    relay_client_cert: &ServerCertificate,
-    server_cert_der: &[u8],
-) -> Result<Arc<ClientConfig>> {
-    let mut root_store = RootCertStore::empty();
-    root_store
-        .add(CertificateDer::from(server_cert_der.to_vec()))
-        .context("Failed to add server certificate to root store")?;
-
-    let client_cert = CertificateDer::from(relay_client_cert.cert_der.clone());
-    let client_key = PrivatePkcs8KeyDer::from(relay_client_cert.key_der.clone());
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_client_auth_cert(vec![client_cert], PrivateKeyDer::from(client_key))
-        .context("Failed to build relay client mTLS configuration")?;
-    config.alpn_protocols = vec![b"h2".to_vec()];
-
-    Ok(Arc::new(config))
 }
 
 #[cfg(test)]

@@ -372,11 +372,7 @@ impl AppState {
             .insert(server_id, server);
     }
 
-    pub(crate) async fn remove_server_if_current(
-        &self,
-        server_id: &Uuid,
-        registration_id: &Uuid,
-    ) {
+    pub(crate) async fn remove_server_if_current(&self, server_id: &Uuid, registration_id: &Uuid) {
         let mut guard = self.registered_servers.write().await;
         let should_remove = guard
             .get(server_id)
@@ -1290,6 +1286,7 @@ async fn forward_stream(
 mod tests {
     use super::*;
     use crate::config::RelayConfig;
+    use anyhow::{Result, anyhow};
     use ed25519_dalek::{SigningKey, pkcs8::EncodePrivateKey};
     use http::Uri;
     use hyper_util::rt::TokioIo;
@@ -1298,7 +1295,6 @@ mod tests {
     use serde_json::{Value, json};
     use std::collections::HashMap;
     use std::sync::Arc;
-    use anyhow::{Result, anyhow};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream},
@@ -1497,9 +1493,7 @@ mod tests {
             decoding_key: decoding_key.clone(),
             tls_authority: Some("first".to_string()),
         });
-        state
-            .upsert_server(server_id, first_entry.clone())
-            .await;
+        state.upsert_server(server_id, first_entry.clone()).await;
 
         let (tx_new, _rx_new) = mpsc::channel(1);
         let second_entry = Arc::new(RegisteredServer {
@@ -1508,9 +1502,7 @@ mod tests {
             decoding_key,
             tls_authority: Some("second".to_string()),
         });
-        state
-            .upsert_server(server_id, second_entry.clone())
-            .await;
+        state.upsert_server(server_id, second_entry.clone()).await;
 
         state
             .remove_server_if_current(&server_id, &first_entry.registration_id)
@@ -2434,10 +2426,9 @@ mod tests {
                 Ok(WsMessage::Text(text)) => {
                     if let Ok(value) = serde_json::from_str::<Value>(text.as_str()) {
                         if value["type"] == "open_tunnel" {
-                            if let (Some(tunnel_id), Some(server_secret)) = (
-                                value["tunnel_id"].as_str(),
-                                value["server_secret"].as_str(),
-                            ) {
+                            if let (Some(tunnel_id), Some(server_secret)) =
+                                (value["tunnel_id"].as_str(), value["server_secret"].as_str())
+                            {
                                 let tunnel_url = format!(
                                     "{}/tunnel/{}?role=server&token={}",
                                     base_ws_url,
@@ -2448,7 +2439,8 @@ mod tests {
                                 let tunnel_id_string = tunnel_id.to_string();
                                 let handle = tokio::spawn(async move {
                                     if let Err(err) =
-                                        handle_test_server_tunnel(tunnel_url, tunnel_id_string).await
+                                        handle_test_server_tunnel(tunnel_url, tunnel_id_string)
+                                            .await
                                     {
                                         tracing::error!("Test tunnel failed: {:?}", err);
                                     }
@@ -2487,7 +2479,8 @@ mod tests {
             "tunnel_id": tunnel_id,
             "role": "server",
         });
-        sink.send(WsMessage::Text(ready_msg.to_string().into())).await?;
+        sink.send(WsMessage::Text(ready_msg.to_string().into()))
+            .await?;
 
         while let Some(msg) = stream.next().await {
             match msg {
@@ -2544,9 +2537,8 @@ mod tests {
             .context("encode signing key to DER")?;
         let encoding_key = EncodingKey::from_ed_der(der.as_bytes());
 
-        let token =
-            jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key)
-                .context("encode token")?;
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::EdDSA), &claims, &encoding_key)
+            .context("encode token")?;
         Ok(token)
     }
 }

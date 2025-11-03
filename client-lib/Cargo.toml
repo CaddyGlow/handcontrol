@@ -16,6 +16,9 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 sha2 = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+tower = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true }

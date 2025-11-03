@@ -1240,6 +1240,8 @@ dependencies = [
  "base64",
  "directories",
  "hex",
+ "http",
+ "hyper-util",
  "mdns-sd",
  "prost",
  "rcgen",
@@ -1254,6 +1256,7 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+ "tower",
  "tracing",
  "uuid",
 ]

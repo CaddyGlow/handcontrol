@@ -51,7 +51,7 @@ class ServerHealthCheckerImpl @Inject constructor(
                     )
                 } finally {
                     // Always disconnect the channel
-                    connectionManager.disconnect(connectionResult)
+                    connectionManager.disconnect(connectionResult, forceClose = true)
                 }
             }
         } catch (e: RelayConnectionException) {

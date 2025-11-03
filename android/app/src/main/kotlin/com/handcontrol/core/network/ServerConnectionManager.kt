@@ -8,13 +8,21 @@ import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerEntity
 import io.grpc.ConnectivityState
 import io.grpc.ManagedChannel
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlinx.coroutines.flow.first
 import timber.log.Timber
 import java.io.IOException
 import javax.inject.Inject
@@ -26,6 +34,7 @@ import java.util.concurrent.TimeUnit
  * Result of a connection attempt
  */
 data class ConnectionResult(
+    val serverId: String,
     val channel: ManagedChannel,
     val mode: ConnectionMode,
     val connectedAddress: String? = null  // For direct mode, which IP was used
@@ -40,10 +49,14 @@ class ServerConnectionManager @Inject constructor(
     private val relayChannelFactory: RelayGrpcChannelFactory,
     private val settingsRepository: SettingsRepository
 ) {
+    private val relayScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val relayLock = Mutex()
+    private val cachedRelayConnections = mutableMapOf<String, CachedRelayConnection>()
 
     private companion object {
         private const val DEFAULT_DIRECT_CONNECT_TIMEOUT_MS = 5000L
         private const val RELAY_CONNECT_TIMEOUT_MS = 15000L
+        private const val RELAY_IDLE_SHUTDOWN_DELAY_MS = 60_000L
     }
 
     /**
@@ -171,6 +184,7 @@ class ServerConnectionManager @Inject constructor(
             if (ready) {
                 Timber.d("Direct channel to $ip reached READY state")
                 return ConnectionResult(
+                    serverId = server.serverId,
                     channel = channel,
                     mode = ConnectionMode.DIRECT,
                     connectedAddress = "$ip:${server.serverPort}"
@@ -240,6 +254,28 @@ class ServerConnectionManager @Inject constructor(
             )
         }
 
+        var reusedConnection: ConnectionResult? = null
+        relayLock.withLock {
+            val cached = cachedRelayConnections[server.serverId]
+            if (cached != null) {
+                val channel = cached.result.channel
+                if (!channel.isShutdown && !channel.isTerminated) {
+                    cached.refCount += 1
+                    cached.shutdownJob?.cancel()
+                    cached.shutdownJob = null
+                    reusedConnection = cached.result
+                } else {
+                    cached.shutdownJob?.cancel()
+                    cachedRelayConnections.remove(server.serverId)
+                }
+            }
+        }
+
+        reusedConnection?.let {
+            Timber.d("Reusing cached relay connection for ${server.serverName}")
+            return it
+        }
+
         try {
             Timber.d("Attempting relay connection to ${server.relayUrl}")
 
@@ -253,11 +289,21 @@ class ServerConnectionManager @Inject constructor(
                 )
             }
 
-            return ConnectionResult(
+            val result = ConnectionResult(
+                serverId = server.serverId,
                 channel = channel,
                 mode = ConnectionMode.RELAY,
                 connectedAddress = null
             )
+
+            relayLock.withLock {
+                cachedRelayConnections[server.serverId] = CachedRelayConnection(
+                    result = result,
+                    refCount = 1
+                )
+            }
+
+            return result
 
         } catch (e: TimeoutCancellationException) {
             throw RelayConnectionException(
@@ -291,16 +337,15 @@ class ServerConnectionManager @Inject constructor(
     /**
      * Shuts down a connection based on its mode
      */
-    suspend fun disconnect(result: ConnectionResult) {
+    suspend fun disconnect(result: ConnectionResult, forceClose: Boolean = false) {
         when (result.mode) {
             ConnectionMode.DIRECT -> {
                 directChannelFactory.shutdownChannel(result.channel)
             }
             ConnectionMode.RELAY -> {
-                relayChannelFactory.shutdownChannel(result.channel)
+                disconnectRelay(result, forceClose)
             }
             ConnectionMode.UNKNOWN -> {
-                // Should not happen, but shutdown anyway
                 Timber.w("Disconnecting channel with UNKNOWN mode")
                 directChannelFactory.shutdownChannel(result.channel)
             }
@@ -312,7 +357,74 @@ class ServerConnectionManager @Inject constructor(
      */
     suspend fun shutdown() {
         directChannelFactory.shutdown()
+
+        val cached = relayLock.withLock {
+            val entries = cachedRelayConnections.values.toList()
+            cachedRelayConnections.clear()
+            entries
+        }
+        cached.forEach { it.shutdownJob?.cancel() }
+
         relayChannelFactory.shutdown()
+        relayScope.coroutineContext.cancelChildren()
+    }
+
+    private suspend fun disconnectRelay(result: ConnectionResult, forceClose: Boolean) {
+        var action = RelayDisconnectAction.None
+
+        relayLock.withLock {
+            val cached = cachedRelayConnections[result.serverId]
+            if (cached == null || cached.result.channel !== result.channel) {
+                action = RelayDisconnectAction.CloseNow
+                return@withLock
+            }
+
+            cached.shutdownJob?.cancel()
+            cached.shutdownJob = null
+
+            if (cached.refCount > 0) {
+                cached.refCount--
+            }
+
+            if (forceClose) {
+                cached.refCount = 0
+                action = RelayDisconnectAction.CloseNow
+                return@withLock
+            }
+
+            if (cached.refCount > 0) {
+                action = RelayDisconnectAction.None
+                return@withLock
+            }
+
+            val job = relayScope.launch {
+                delay(RELAY_IDLE_SHUTDOWN_DELAY_MS)
+                performRelayShutdown(result)
+            }
+            cached.shutdownJob = job
+            action = RelayDisconnectAction.Scheduled
+        }
+
+        if (action == RelayDisconnectAction.CloseNow) {
+            performRelayShutdown(result)
+        }
+    }
+
+    private suspend fun performRelayShutdown(result: ConnectionResult) {
+        val shouldClose = relayLock.withLock {
+            val cached = cachedRelayConnections[result.serverId]
+            if (cached != null && cached.result.channel === result.channel) {
+                cached.shutdownJob = null
+                cachedRelayConnections.remove(result.serverId)
+                true
+            } else {
+                false
+            }
+        }
+
+        if (shouldClose) {
+            relayChannelFactory.shutdownChannel(result.channel)
+        }
     }
 
     private suspend fun awaitChannelReady(
@@ -342,6 +454,18 @@ class ServerConnectionManager @Inject constructor(
             result
         } ?: false
     }
+}
+
+private data class CachedRelayConnection(
+    val result: ConnectionResult,
+    var refCount: Int = 0,
+    var shutdownJob: Job? = null
+)
+
+private enum class RelayDisconnectAction {
+    None,
+    Scheduled,
+    CloseNow
 }
 
 /**

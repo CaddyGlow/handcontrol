@@ -1,8 +1,8 @@
 package com.handcontrol.core.network.relay
 
+import com.handcontrol.core.network.MtlsSslContextFactory
 import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.security.ClientCertificateManager
-import com.handcontrol.core.security.VerificationCodeGenerator
 import io.grpc.Attributes
 import io.grpc.EquivalentAddressGroup
 import io.grpc.ManagedChannel
@@ -25,13 +25,9 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketAddress
 import java.net.URI
-import java.security.KeyStore
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
-import javax.net.ssl.KeyManagerFactory
-import javax.net.ssl.SSLContext
-import javax.net.ssl.X509TrustManager
 
 /**
  * Creates gRPC channels over relay tunnels by establishing a local TCP bridge
@@ -88,7 +84,8 @@ class RelayGrpcChannelFactory @Inject constructor(
             )
         }
 
-        if (extractAuthorityHost(authority) == null) {
+        val authorityHost = parseAuthorityHost(authority)
+        if (authorityHost == null) {
             Timber.e("Unable to determine TLS authority host from '$authority'")
             bridge.shutdown()
             throw RelayConnectionException(
@@ -96,6 +93,8 @@ class RelayGrpcChannelFactory @Inject constructor(
                 "The relay returned an invalid TLS authority."
             )
         }
+
+        Timber.d("Relay authority host resolved to '$authorityHost'; installing loopback resolver")
 
         val channel = createMtlsChannel(authority = authority, loopbackPort = bridge.localPort)
 
@@ -259,12 +258,7 @@ class RelayGrpcChannelFactory @Inject constructor(
         authority: String,
         loopbackPort: Int
     ): ManagedChannel {
-        val clientCert = certificateManager.loadOrCreate()
-        val pinnedFingerprint = certificateManager.getPinnedServerFingerprint()
-        if (pinnedFingerprint == null) {
-            Timber.w("No pinned server fingerprint available; relay connection will trust first certificate")
-        }
-        val sslContext = createMtlsSslContext(pinnedFingerprint)
+        val sslContext = MtlsSslContextFactory.createSslContext(certificateManager)
 
         val builder = OkHttpChannelBuilder
             .forTarget("loopback:///$authority")
@@ -278,80 +272,6 @@ class RelayGrpcChannelFactory @Inject constructor(
         return builder.build()
     }
 
-    /**
-     * Creates SSL context for mTLS
-     */
-    private suspend fun createMtlsSslContext(
-        pinnedFingerprint: String?
-    ): SSLContext {
-        // Load Android Keystore
-        val androidKeyStore = KeyStore.getInstance("AndroidKeyStore").apply {
-            load(null)
-        }
-
-        // Create key manager with client certificate
-        val keyManagerFactory = KeyManagerFactory.getInstance(
-            KeyManagerFactory.getDefaultAlgorithm()
-        )
-        keyManagerFactory.init(androidKeyStore, null)
-
-        // Create trust manager that enforces the pinned fingerprint when available
-        val trustManager = object : X509TrustManager {
-            override fun checkClientTrusted(
-                chain: Array<out java.security.cert.X509Certificate>?,
-                authType: String?
-            ) {
-                // Not used on client side
-            }
-
-            override fun checkServerTrusted(
-                chain: Array<out java.security.cert.X509Certificate>?,
-                authType: String?
-            ) {
-                if (chain == null || chain.isEmpty()) {
-                    throw javax.net.ssl.SSLException("Server certificate chain is empty")
-                }
-
-                val serverCert = chain[0]
-
-                if (pinnedFingerprint != null) {
-                    val currentFingerprint = VerificationCodeGenerator.computeFingerprint(
-                        serverCert.encoded
-                    )
-
-                    if (currentFingerprint != pinnedFingerprint) {
-                        Timber.e("Relay TLS fingerprint mismatch: expected=$pinnedFingerprint actual=$currentFingerprint")
-                        throw javax.net.ssl.SSLException("Server certificate fingerprint does not match pinned value")
-                    }
-
-                    Timber.d("Relay TLS fingerprint verified via pinned certificate")
-                } else {
-                    Timber.w("Relay TLS connection without pinned fingerprint; treating certificate as first trust")
-                }
-
-                try {
-                    serverCert.checkValidity()
-                } catch (e: Exception) {
-                    throw javax.net.ssl.SSLException("Server certificate is not valid", e)
-                }
-            }
-
-            override fun getAcceptedIssuers(): Array<java.security.cert.X509Certificate> {
-                return arrayOf()
-            }
-        }
-
-        // Create SSL context
-        val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(
-            keyManagerFactory.keyManagers,
-            arrayOf(trustManager),
-            null
-        )
-
-        return sslContext
-    }
-
     suspend fun shutdown() = withContext(Dispatchers.IO) {
         Timber.i("Shutting down all relay channels")
         activeBridges.keys.toList().forEach { channel ->
@@ -360,7 +280,7 @@ class RelayGrpcChannelFactory @Inject constructor(
     }
 }
 
-private fun extractAuthorityHost(authority: String): String? {
+private fun parseAuthorityHost(authority: String): String? {
     if (authority.isBlank()) {
         return null
     }
@@ -392,17 +312,16 @@ private class LoopbackNameResolver(
     override fun getServiceAuthority(): String = "loopback"
 
     override fun start(listener: Listener2) {
-        val addresses = mutableListOf<SocketAddress>()
-        try {
-            addresses.add(InetSocketAddress(InetAddress.getByName("127.0.0.1"), loopbackPort))
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to resolve IPv4 loopback address")
+        val addresses = buildList<SocketAddress> {
+            runCatching { InetAddress.getByName("127.0.0.1") }
+                .onSuccess { add(InetSocketAddress(it, loopbackPort)) }
+                .onFailure { Timber.e(it, "Failed to resolve IPv4 loopback address") }
+
+            runCatching { InetAddress.getByName("::1") }
+                .onSuccess { add(InetSocketAddress(it, loopbackPort)) }
+                .onFailure { Timber.d("IPv6 loopback not available: ${it.message}") }
         }
-        try {
-            addresses.add(InetSocketAddress(InetAddress.getByName("::1"), loopbackPort))
-        } catch (e: Exception) {
-            Timber.d("IPv6 loopback not available: ${e.message}")
-        }
+
         if (addresses.isEmpty()) {
             listener.onError(Status.UNAVAILABLE.withDescription("Loopback addresses unavailable"))
             return

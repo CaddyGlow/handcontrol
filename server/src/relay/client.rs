@@ -404,22 +404,13 @@ async fn handle_tunnel(
 
     info!(tunnel_id = %tunnel_id, "Bridge established, forwarding data");
 
-    fn payload_into_vec(payload: Payload) -> Vec<u8> {
-        match payload {
-            Payload::Vec(data) => data,
-            Payload::Owned(bytes) => bytes.to_vec(),
-            Payload::Shared(bytes) => bytes.to_vec(),
-        }
-    }
-
     // Task 1: WebSocket -> Local TCP
     let ws_to_local = async {
         while let Some(msg) = ws_stream.next().await {
             match msg {
                 Ok(Message::Binary(payload)) => {
-                    let data = payload_into_vec(payload);
                     local_write
-                        .write_all(&data[..])
+                        .write_all(payload.as_slice())
                         .await
                         .context("Failed to write to local TCP")?;
                 }

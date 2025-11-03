@@ -11,7 +11,7 @@ HandControl CLI/TUI Client extends the HandControl remote command execution syst
 - **CLI (Command-Line Interface)**: Non-interactive commands for scripting, automation, and integration with shell workflows
 - **TUI (Terminal User Interface)**: Interactive terminal application for power users who prefer keyboard-driven workflows
 
-Both clients communicate with HandControl servers using the same gRPC protocol and security model as the Android client.
+Both clients communicate with HandControl servers using the same gRPC protocol and **end-to-end encryption model** as the Android client: TLS is negotiated directly between the CLI/TUI client and the managed server, while intermediate relays forward opaque bytes.
 
 ## Goals
 
@@ -88,7 +88,7 @@ handcontrol/
 | `tokio` | 1.48.0 | Async runtime |
 | `tonic` | 0.14.2 | gRPC client |
 | `prost` | 0.14.1 | Protobuf encoding |
-| `rustls` | 0.23.34 | mTLS implementation |
+| `rustls` | 0.23.34 | mTLS implementation (end-to-end TLS; relays never decrypt data) |
 | `rcgen` | 0.14.5 | Client certificate generation (ECDSA P-256) |
 | `mdns-sd` | 0.15.1 | mDNS discovery |
 | `serde` | 1.0.228 | Config serialization |
@@ -117,25 +117,29 @@ handcontrol/
 
 ## Security Model
 
-### Certificate Management
+### End-to-End TLS & Certificate Management
+
+**TLS Termination: End-to-End.**
+- CLI/TUI establishes a mutually-authenticated TLS session directly with the managed server.
+- Relay tunnels forward the encrypted byte stream without decrypting or re-encrypting traffic.
+- Relay access to telemetry only includes tunnel metadata (sizes, timing), never plaintext RPC payloads.
 
 **Client Certificates:**
 - Algorithm: ECDSA P-256 (same as Android)
 - Generation: Using `rcgen` crate
 - Storage: `~/.config/handcontrol/client-certs/<server_id>/`
-  - `client.crt` - Certificate (PEM format)
-  - `client.key` - Private key (PEM format, permissions 0600)
-  - `server.crt.pinned` - Pinned server certificate fingerprint
+  - `client.crt` - Certificate (PEM)
+  - `client.key` - Private key (0600)
+  - `server.crt.pinned` - SHA256 fingerprint of server cert
 - Permissions: 0600 for private keys, 0644 for certificates
 
 **Server Certificate Pinning:**
-- First connection: TOFU (Trust On First Use)
-- Store SHA256 fingerprint of server certificate
-- Validate on every subsequent connection
-- Reject if fingerprint changes (prevents MITM)
+- Trust On First Use: first connection records the SHA256 fingerprint.
+- Every handshake re-validates against the pinned fingerprint before completing.
+- Any mismatch aborts the session and surfaces an actionable error (prevents MITM or relay tampering).
 
 **Verification Code:**
-- Same algorithm as Android:
+- Algorithm matches Android:
   ```
   code = SHA256(
     SHA256(client_cert) ||
@@ -146,8 +150,8 @@ handcontrol/
   first_6_digits(code) formatted as "XXX-XXX"
   ```
 
-- Server returns the 32-byte `verification_nonce` in every pairing response.
-- Client recomputes its verification code locally using that nonce **before** presenting it to the user, ensuring both sides display the same time-bounded code.
+- Server includes the 32-byte `verification_nonce` in pairing responses.
+- CLI/TUI recomputes the displayed code using that nonce, ensuring both sides show the same value while all sensitive material remains inside the end-to-end TLS channel.
 
 ### Enrollment Modes
 

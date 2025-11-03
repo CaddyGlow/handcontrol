@@ -53,6 +53,27 @@ impl CertificatePaths {
         self.client_cert.exists() && self.client_key.exists()
     }
 
+    /// Persist freshly generated client credentials to disk.
+    pub fn write_client_credentials(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
+        fs::write(&self.client_cert, cert_pem)
+            .with_context(|| format!("Failed to write {}", self.client_cert.display()))?;
+        apply_file_permissions(&self.client_cert, 0o644)?;
+
+        fs::write(&self.client_key, key_pem)
+            .with_context(|| format!("Failed to write {}", self.client_key.display()))?;
+        apply_file_permissions(&self.client_key, 0o600)?;
+        Ok(())
+    }
+
+    /// Load stored client credentials (PEM-encoded certificate and private key).
+    pub fn load_client_credentials(&self) -> Result<(Vec<u8>, Vec<u8>)> {
+        let cert = fs::read(&self.client_cert)
+            .with_context(|| format!("Failed to read {}", self.client_cert.display()))?;
+        let key = fs::read(&self.client_key)
+            .with_context(|| format!("Failed to read {}", self.client_key.display()))?;
+        Ok((cert, key))
+    }
+
     /// Apply recommended permissions to key/cert files if they already exist.
     pub fn apply_file_permissions(&self) -> Result<()> {
         if self.client_key.exists() {

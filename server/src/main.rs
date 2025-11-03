@@ -41,6 +41,9 @@ enum Commands {
         /// Generate QR code for enrollment
         #[arg(long)]
         qr: bool,
+        /// Output raw QR JSON payload instead of ASCII QR code
+        #[arg(long)]
+        json: bool,
     },
     /// Start the HandControl server
     Serve,
@@ -68,9 +71,9 @@ async fn main() -> Result<()> {
 
     // Handle commands
     match cli.command {
-        Some(Commands::Enroll { qr }) => {
+        Some(Commands::Enroll { qr, json }) => {
             if qr {
-                handle_enroll_command().await?;
+                handle_enroll_command(json).await?;
             } else {
                 eprintln!("Please specify --qr for QR code enrollment");
                 std::process::exit(1);
@@ -94,7 +97,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn handle_enroll_command() -> Result<()> {
+async fn handle_enroll_command(output_json: bool) -> Result<()> {
     info!("Starting enrollment command...");
 
     // Load configuration
@@ -185,6 +188,11 @@ async fn handle_enroll_command() -> Result<()> {
     let payload: handcontrol::utils::qr::EnrollmentQrPayload =
         serde_json::from_str(&response.qr_payload)
             .context("Failed to parse QR payload from server")?;
+
+    if output_json {
+        println!("{}", payload.to_json()?);
+        return Ok(());
+    }
 
     // Display QR code
     payload.display_qr()?;

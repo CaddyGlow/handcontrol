@@ -1230,6 +1230,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -1250,6 +1251,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "time",
  "tokio",
  "tokio-rustls",
  "toml",

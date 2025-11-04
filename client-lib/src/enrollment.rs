@@ -460,11 +460,27 @@ fn compute_verification_code(
 
 fn resolve_device_name(explicit: Option<String>) -> String {
     if let Some(name) = explicit {
-        if !name.trim().is_empty() {
-            return name;
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
     }
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "HandControl CLI".to_string())
+
+    for key in ["HANDCONTROL_DEVICE_NAME", "USER", "USERNAME"] {
+        if let Ok(value) = std::env::var(key) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+
+    if let Ok(host) = hostname::get() {
+        let host_str = host.to_string_lossy().trim().to_string();
+        if !host_str.is_empty() {
+            return host_str;
+        }
+    }
+
+    "HandControl CLI".to_string()
 }

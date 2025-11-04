@@ -42,6 +42,7 @@ hex = "0.4"
 hyper-util = { version = "0.1", features = ["client", "http1", "http2"] }
 http = "1"
 time = { version = "0.3", features = ["formatting"] }
+regex = "1.11"
 
 [workspace.dependencies.prost-build]
 version = "0.14"

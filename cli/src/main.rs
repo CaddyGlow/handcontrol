@@ -1,12 +1,15 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use handcontrol_client_lib::{
-    config::{self, ClientConfig},
-    discover_servers, enroll_via_approval, enroll_via_qr,
+    config::{self, ClientConfig, DeviceConfig},
+    discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
+    list_commands as fetch_command_list,
     storage::{ServerRegistry, ServerRegistryEntry},
-    ApprovalEnrollmentInput, DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CommandList, CommandStreamEvent, CommandSummary,
+    DiscoveredServer, QrEnrollmentInput,
 };
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
@@ -34,6 +37,14 @@ enum Command {
     Discover(DiscoverCommand),
     /// List enrolled servers
     ListServers(ListServersCommand),
+    /// Show detailed information about a server
+    Info(InfoCommand),
+    /// List commands available on an enrolled server
+    List(ListCommand),
+    /// Execute a command on an enrolled server
+    Exec(ExecCommand),
+    /// Remove stored enrollment for a server
+    Remove(RemoveCommand),
     /// Manage client configuration
     Config {
         #[command(subcommand)]
@@ -63,6 +74,59 @@ struct ListServersCommand {
     json: bool,
 }
 
+#[derive(Parser)]
+struct InfoCommand {
+    /// Server identifier (UUID, instance name, or hostname)
+    server: String,
+    /// Direct server address if discovery is unavailable (host or host:port)
+    #[arg(long)]
+    address: Option<String>,
+    /// Override port (defaults to 50051 or discovery result)
+    #[arg(long)]
+    port: Option<u16>,
+    /// Output JSON instead of human-readable text
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct ListCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Filter commands by tag (repeatable)
+    #[arg(long = "tag", value_name = "TAG")]
+    tags: Vec<String>,
+    /// Output JSON instead of TSV
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct ExecCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Command ID to execute
+    command_id: String,
+    /// Parameter key=value pairs
+    #[arg(value_name = "key=value")]
+    parameters: Vec<String>,
+    /// Stream output as it arrives
+    #[arg(long)]
+    stream: bool,
+    /// Suppress command output
+    #[arg(long)]
+    quiet: bool,
+}
+
+#[derive(Parser)]
+struct RemoveCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Skip confirmation prompt
+    #[arg(long, alias = "yes")]
+    confirm: bool,
+}
+
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Show the current configuration
@@ -73,6 +137,13 @@ enum ConfigCommand {
     },
     /// Print the configuration file path
     Path,
+    /// Update a configuration value using dotted keys (e.g. discovery.timeout_seconds)
+    Set {
+        /// Configuration key path (section.key)
+        key: String,
+        /// New value to assign
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +208,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Discover(cmd) => run_discover(cmd),
         Command::ListServers(cmd) => run_list_servers(cmd),
+        Command::Info(cmd) => run_info(cmd).await,
+        Command::List(cmd) => run_list_commands(cmd).await,
+        Command::Exec(cmd) => run_exec_command(cmd).await,
+        Command::Remove(cmd) => run_remove(cmd),
         Command::Config { command } => run_config(command),
         Command::Enroll { command } => run_enroll(command).await,
     }
@@ -193,6 +268,218 @@ fn run_list_servers(cmd: ListServersCommand) -> Result<()> {
     Ok(())
 }
 
+async fn run_info(cmd: InfoCommand) -> Result<()> {
+    let InfoCommand {
+        server,
+        address,
+        port,
+        json,
+    } = cmd;
+
+    let cfg = config::load()?;
+    let resolved = resolve_server_targets(&server, address, port, &cfg)?;
+    let ResolvedServer {
+        addresses,
+        port: resolved_port,
+        server_id_hint,
+    } = resolved;
+
+    let port = resolved_port.unwrap_or(50051);
+    let info = fetch_server_info(&addresses, port, server_id_hint).await?;
+
+    let registry = ServerRegistry::load()?;
+    let entry = registry.find_by_id(&info.server_id);
+    let enrolled = entry.is_some();
+    let client_id = entry.and_then(|e| e.client_id);
+
+    let output = InfoOutput {
+        server_id: info.server_id,
+        hostname: if info.hostname.is_empty() {
+            None
+        } else {
+            Some(info.hostname)
+        },
+        version: if info.version.is_empty() {
+            None
+        } else {
+            Some(info.version)
+        },
+        os: if info.os.is_empty() {
+            None
+        } else {
+            Some(info.os)
+        },
+        address: format_socket_address(&info.address, info.port),
+        tls_fingerprint: info.fingerprint,
+        enrolled,
+        client_id,
+    };
+
+    let as_json = if json {
+        true
+    } else {
+        cfg.cli.output_format.eq_ignore_ascii_case("json")
+    };
+
+    if as_json {
+        output_json(&output)?;
+    } else {
+        print_info_output(&output);
+    }
+
+    Ok(())
+}
+
+async fn run_list_commands(cmd: ListCommand) -> Result<()> {
+    let ListCommand { server, tags, json } = cmd;
+
+    let cfg = config::load()?;
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&server, &registry)?;
+
+    let CommandList {
+        config_version,
+        mut commands,
+    } = fetch_command_list(entry).await?;
+    if !tags.is_empty() {
+        let filters: Vec<String> = tags.iter().map(|t| t.to_ascii_lowercase()).collect();
+        commands.retain(|cmd| {
+            filters
+                .iter()
+                .all(|tag| cmd.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)))
+        });
+    }
+
+    let output = CommandsOutput {
+        server_id: entry.id,
+        config_version,
+        commands,
+    };
+
+    let as_json = if json {
+        true
+    } else {
+        cfg.cli.output_format.eq_ignore_ascii_case("json")
+    };
+
+    if as_json {
+        output_json(&output)?;
+    } else {
+        print_commands_tsv(&output.commands, &cfg)?;
+    }
+
+    Ok(())
+}
+
+async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
+    let ExecCommand {
+        server,
+        command_id,
+        parameters,
+        stream,
+        quiet,
+    } = cmd;
+
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&server, &registry)?;
+
+    let provided = parse_parameter_pairs(&parameters)?;
+    let command_list = fetch_command_list(entry).await?;
+    let command = command_list
+        .commands
+        .iter()
+        .find(|c| c.id.eq_ignore_ascii_case(&command_id))
+        .ok_or_else(|| anyhow!("Command '{}' not found on server {}", command_id, entry.id))?;
+
+    let sanitized = validate_parameters(command, &provided)?;
+    let actual_command_id = command.id.clone();
+
+    if command.requires_confirmation && !quiet {
+        println!(
+            "Command '{}' requires confirmation on the server before execution",
+            command.name
+        );
+    }
+
+    let exit_code = if stream {
+        let mut on_event = |event: CommandStreamEvent| {
+            if quiet {
+                return;
+            }
+            print_stream_event(&event);
+        };
+        execute_command(entry, &actual_command_id, sanitized, &mut on_event).await?
+    } else {
+        let mut captured: Vec<CommandStreamEvent> = Vec::new();
+        let mut capture = |event: CommandStreamEvent| {
+            if quiet {
+                return;
+            }
+            captured.push(event);
+        };
+        let exit = execute_command(entry, &actual_command_id, sanitized, &mut capture).await?;
+
+        if !quiet {
+            replay_buffered_events(&captured)?;
+        }
+
+        exit
+    };
+
+    if !quiet {
+        if stream {
+            println!("EXIT {}", exit_code);
+        } else {
+            println!("Exit code: {}", exit_code);
+        }
+    }
+
+    if exit_code != 0 {
+        bail!("Remote command exited with code {}", exit_code);
+    }
+
+    Ok(())
+}
+
+fn run_remove(cmd: RemoveCommand) -> Result<()> {
+    let RemoveCommand { server, confirm } = cmd;
+
+    let mut registry = ServerRegistry::load()?;
+    if registry.iter().next().is_none() {
+        bail!("No enrolled servers to remove");
+    }
+
+    let entry = find_enrolled_server(&server, &registry)?.clone();
+
+    if !confirm && !prompt_removal_confirmation(&entry)? {
+        println!("Aborted");
+        return Ok(());
+    }
+
+    let server_id = entry.id;
+    registry.remove(&server_id);
+    registry.save()?;
+
+    if let Ok(cert_dir) = certificate_dir_for(&entry) {
+        if cert_dir.exists() {
+            match fs::remove_dir_all(&cert_dir) {
+                Ok(_) => {
+                    println!("Removed credentials in {}", cert_dir.display());
+                }
+                Err(err) => {
+                    eprintln!(
+                        "Warning: failed to remove credential directory {} ({err})",
+                        cert_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    println!("Removed enrollment for server {}", server_id);
+    Ok(())
+}
+
 fn run_config(command: ConfigCommand) -> Result<()> {
     match command {
         ConfigCommand::Show { json } => {
@@ -207,6 +494,12 @@ fn run_config(command: ConfigCommand) -> Result<()> {
         ConfigCommand::Path => {
             let path = config::config_path()?;
             println!("{}", path.display());
+        }
+        ConfigCommand::Set { key, value } => {
+            let mut cfg = config::load()?;
+            set_config_value(&mut cfg, &key, &value)?;
+            config::save(&cfg)?;
+            println!("Updated {key}");
         }
     }
     Ok(())
@@ -272,7 +565,7 @@ async fn run_enroll_approve(args: ApproveEnrollCommand) -> Result<()> {
     let ApproveEnrollCommand {
         server,
         address,
-        mut port,
+        port,
         timeout,
         poll_interval,
         device_name,
@@ -280,55 +573,7 @@ async fn run_enroll_approve(args: ApproveEnrollCommand) -> Result<()> {
     } = args;
 
     let cfg = config::load()?;
-    let mut addresses: Vec<String> = Vec::new();
-    let mut server_id_hint: Option<Uuid> = None;
-
-    if let Some(addr) = address {
-        if let Some((host, parsed_port)) = parse_host_port(&addr) {
-            addresses.push(host);
-            if port.is_none() {
-                port = Some(parsed_port);
-            }
-        } else {
-            addresses.push(addr);
-        }
-    } else {
-        let discovered = discover_servers(&cfg.discovery)?;
-        let query = server.to_lowercase();
-        for entry in discovered {
-            let mut matched = false;
-            if let Some(id) = entry.server_id {
-                if id.to_string().eq_ignore_ascii_case(&query) || id.to_string() == server {
-                    matched = true;
-                    server_id_hint = Some(id);
-                }
-            }
-            if !matched
-                && (entry.instance_name.eq_ignore_ascii_case(&server)
-                    || entry.hostname.eq_ignore_ascii_case(&server))
-            {
-                matched = true;
-                if server_id_hint.is_none() {
-                    server_id_hint = entry.server_id;
-                }
-            }
-            if matched {
-                addresses.extend(entry.addresses.clone());
-                if port.is_none() {
-                    port = Some(entry.port);
-                }
-            }
-        }
-
-        if addresses.is_empty() {
-            bail!(
-                "Unable to resolve server '{server}'. Run 'handcontrol-cli discover' or supply --address"
-            );
-        }
-    }
-
-    addresses.sort();
-    addresses.dedup();
+    let resolved = resolve_server_targets(&server, address, port, &cfg)?;
 
     let resolved_device_name =
         device_name.or_else(|| cfg.device.as_ref().and_then(|d| d.name.clone()));
@@ -336,9 +581,9 @@ async fn run_enroll_approve(args: ApproveEnrollCommand) -> Result<()> {
         device_model.or_else(|| cfg.device.as_ref().and_then(|d| d.model.clone()));
 
     let input = ApprovalEnrollmentInput {
-        addresses,
-        port,
-        server_id_hint,
+        addresses: resolved.addresses,
+        port: resolved.port,
+        server_id_hint: resolved.server_id_hint,
         device_name: resolved_device_name,
         device_model: resolved_device_model,
         timeout: Duration::from_secs(timeout),
@@ -374,6 +619,400 @@ fn print_verification_block(code: &str) {
     println!("{border}");
     println!("Approve this request on the server to continue...");
     println!();
+}
+
+#[derive(Debug, Serialize)]
+struct InfoOutput {
+    server_id: Uuid,
+    hostname: Option<String>,
+    version: Option<String>,
+    os: Option<String>,
+    address: String,
+    tls_fingerprint: String,
+    enrolled: bool,
+    client_id: Option<Uuid>,
+}
+
+fn print_info_output(info: &InfoOutput) {
+    println!("Server ID: {}", info.server_id);
+    println!("Hostname: {}", info.hostname.as_deref().unwrap_or("-"));
+    println!("Version: {}", info.version.as_deref().unwrap_or("-"));
+    println!("OS: {}", info.os.as_deref().unwrap_or("-"));
+    println!("Address: {}", info.address);
+    println!("TLS Fingerprint: {}", info.tls_fingerprint);
+    println!("Enrolled: {}", if info.enrolled { "yes" } else { "no" });
+    println!(
+        "Client ID: {}",
+        info.client_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    );
+}
+
+fn format_socket_address(address: &str, port: u16) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
+    }
+}
+
+struct ResolvedServer {
+    addresses: Vec<String>,
+    port: Option<u16>,
+    server_id_hint: Option<Uuid>,
+}
+
+fn resolve_server_targets(
+    server: &str,
+    address: Option<String>,
+    port: Option<u16>,
+    cfg: &ClientConfig,
+) -> Result<ResolvedServer> {
+    let mut addresses: Vec<String> = Vec::new();
+    let mut resolved_port = port;
+    let mut server_id_hint = Uuid::parse_str(server).ok();
+
+    if let Some(addr) = address {
+        if let Some((host, parsed_port)) = parse_host_port(&addr) {
+            addresses.push(host);
+            if resolved_port.is_none() {
+                resolved_port = Some(parsed_port);
+            }
+        } else {
+            addresses.push(addr);
+        }
+    } else {
+        let discovered = discover_servers(&cfg.discovery)?;
+        let query = server.to_lowercase();
+        for entry in discovered {
+            let mut matched = false;
+            if let Some(id) = entry.server_id {
+                if id.to_string().eq_ignore_ascii_case(&query) || id.to_string() == server {
+                    matched = true;
+                    server_id_hint = Some(id);
+                }
+            }
+            if !matched
+                && (entry.instance_name.eq_ignore_ascii_case(&server)
+                    || entry.hostname.eq_ignore_ascii_case(&server))
+            {
+                matched = true;
+                if server_id_hint.is_none() {
+                    server_id_hint = entry.server_id;
+                }
+            }
+            if matched {
+                addresses.extend(entry.addresses.clone());
+                if resolved_port.is_none() {
+                    resolved_port = Some(entry.port);
+                }
+            }
+        }
+    }
+
+    addresses.sort();
+    addresses.dedup();
+
+    if addresses.is_empty() {
+        bail!(
+            "Unable to resolve server '{server}'. Run 'handcontrol-cli discover' or supply --address"
+        );
+    }
+
+    Ok(ResolvedServer {
+        addresses,
+        port: resolved_port,
+        server_id_hint,
+    })
+}
+
+fn prompt_removal_confirmation(entry: &ServerRegistryEntry) -> Result<bool> {
+    let display_name = entry
+        .hostname
+        .as_deref()
+        .or(entry.ip.as_deref())
+        .unwrap_or("unknown");
+
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    write!(
+        handle,
+        "Remove enrollment for {} ({display_name})? [y/N]: ",
+        entry.id
+    )?;
+    handle.flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let normalized = input.trim().to_ascii_lowercase();
+    Ok(matches!(normalized.as_str(), "y" | "yes"))
+}
+
+fn certificate_dir_for(entry: &ServerRegistryEntry) -> Result<PathBuf> {
+    if let Some(path) = &entry.cert_path {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut dir = config::config_dir()?;
+    dir.push("client-certs");
+    dir.push(entry.id.to_string());
+    Ok(dir)
+}
+
+#[derive(Debug, Serialize)]
+struct CommandsOutput {
+    server_id: Uuid,
+    config_version: u64,
+    commands: Vec<CommandSummary>,
+}
+
+fn print_commands_tsv(commands: &[CommandSummary], cfg: &ClientConfig) -> Result<()> {
+    let mut stdout = io::BufWriter::new(io::stdout().lock());
+
+    if cfg.cli.show_headers {
+        writeln!(stdout, "ID\tNAME\tDESCRIPTION\tTAGS")?;
+    }
+
+    for command in commands {
+        let tags = if command.tags.is_empty() {
+            "-".to_string()
+        } else {
+            command.tags.join(",")
+        };
+        writeln!(
+            stdout,
+            "{}\t{}\t{}\t{}",
+            command.id,
+            command.name,
+            command.description.as_deref().unwrap_or("-"),
+            tags
+        )?;
+    }
+
+    stdout.flush()?;
+    Ok(())
+}
+
+fn replay_buffered_events(events: &[CommandStreamEvent]) -> Result<()> {
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+    let mut out = stdout.lock();
+    let mut err = stderr.lock();
+
+    for event in events {
+        match event {
+            CommandStreamEvent::Stdout(data) => {
+                out.write_all(data.as_bytes())?;
+                out.flush()?;
+            }
+            CommandStreamEvent::Stderr(data) => {
+                err.write_all(data.as_bytes())?;
+                err.flush()?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_stream_event(event: &CommandStreamEvent) {
+    match event {
+        CommandStreamEvent::Stdout(data) => print_prefixed_chunk("STDOUT", data),
+        CommandStreamEvent::Stderr(data) => print_prefixed_chunk("STDERR", data),
+    }
+}
+
+fn print_prefixed_chunk(prefix: &str, data: &str) {
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    for chunk in data.split_inclusive('\n') {
+        if chunk.is_empty() {
+            continue;
+        }
+        if chunk.ends_with('\n') {
+            let _ = write!(handle, "{} {}", prefix, chunk);
+        } else {
+            let _ = writeln!(handle, "{} {}", prefix, chunk);
+        }
+    }
+    let _ = handle.flush();
+}
+
+fn parse_parameter_pairs(values: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for pair in values {
+        let (key, value) = pair
+            .split_once('=')
+            .ok_or_else(|| anyhow!("Parameter '{pair}' must be in key=value format"))?;
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("Parameter key cannot be empty in '{pair}'");
+        }
+        let value = value.to_string();
+        if map.insert(key.to_string(), value).is_some() {
+            bail!("Duplicate parameter '{}' provided", key);
+        }
+    }
+    Ok(map)
+}
+
+fn find_enrolled_server<'a>(
+    identifier: &str,
+    registry: &'a ServerRegistry,
+) -> Result<&'a ServerRegistryEntry> {
+    if let Ok(id) = Uuid::parse_str(identifier) {
+        if let Some(entry) = registry.find_by_id(&id) {
+            return Ok(entry);
+        }
+    }
+
+    for entry in registry.iter() {
+        if entry
+            .hostname
+            .as_ref()
+            .map(|h| h.eq_ignore_ascii_case(identifier))
+            .unwrap_or(false)
+            || entry
+                .ip
+                .as_ref()
+                .map(|ip| ip.eq_ignore_ascii_case(identifier))
+                .unwrap_or(false)
+        {
+            return Ok(entry);
+        }
+    }
+
+    bail!(
+        "Server '{}' is not enrolled. Run 'handcontrol-cli enroll' to register it first.",
+        identifier
+    );
+}
+
+fn set_config_value(cfg: &mut ClientConfig, key: &str, value: &str) -> Result<()> {
+    let parts: Vec<&str> = key.split('.').collect();
+    match parts.as_slice() {
+        ["discovery", "auto_discover"] => {
+            cfg.discovery.auto_discover = parse_bool_arg(value)?;
+        }
+        ["discovery", "timeout_seconds"] => {
+            cfg.discovery.timeout_seconds = parse_u64_arg(key, value)?;
+        }
+        ["discovery", "prefer_ipv6"] => {
+            cfg.discovery.prefer_ipv6 = parse_bool_arg(value)?;
+        }
+        ["discovery", "include_link_local"] => {
+            cfg.discovery.include_link_local = parse_bool_arg(value)?;
+        }
+        ["connection", "timeout_seconds"] => {
+            cfg.connection.timeout_seconds = parse_u64_arg(key, value)?;
+        }
+        ["connection", "command_timeout_seconds"] => {
+            cfg.connection.command_timeout_seconds = parse_u64_arg(key, value)?;
+        }
+        ["connection", "retry_attempts"] => {
+            cfg.connection.retry_attempts = parse_u32_arg(key, value)?;
+        }
+        ["connection", "retry_delay_ms"] => {
+            cfg.connection.retry_delay_ms = parse_u64_arg(key, value)?;
+        }
+        ["tui", "show_timestamps"] => {
+            cfg.tui.show_timestamps = parse_bool_arg(value)?;
+        }
+        ["tui", "color_scheme"] => {
+            cfg.tui.color_scheme = value.trim().to_string();
+        }
+        ["tui", "auto_scroll"] => {
+            cfg.tui.auto_scroll = parse_bool_arg(value)?;
+        }
+        ["tui", "confirm_commands"] => {
+            cfg.tui.confirm_commands = parse_bool_arg(value)?;
+        }
+        ["cli", "output_format"] => {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "tsv" | "json" => cfg.cli.output_format = normalized,
+                _ => bail!("Unsupported output format '{}'. Use 'tsv' or 'json'", value),
+            }
+        }
+        ["cli", "show_headers"] => {
+            cfg.cli.show_headers = parse_bool_arg(value)?;
+        }
+        ["cli", "color_output"] => {
+            let normalized = value.trim().to_ascii_lowercase();
+            match normalized.as_str() {
+                "auto" | "always" | "never" => cfg.cli.color_output = normalized,
+                _ => bail!(
+                    "Invalid value for cli.color_output '{}'. Use auto|always|never",
+                    value
+                ),
+            }
+        }
+        ["device", "name"] => set_device_string(cfg, true, value),
+        ["device", "model"] => set_device_string(cfg, false, value),
+        _ => {
+            bail!("Unknown configuration key '{key}'")
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_bool_arg(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => bail!(
+            "Invalid boolean value '{}'. Use true/false, yes/no, on/off",
+            value
+        ),
+    }
+}
+
+fn parse_u64_arg(key: &str, value: &str) -> Result<u64> {
+    value
+        .trim()
+        .parse::<u64>()
+        .with_context(|| format!("{} must be a positive integer", key))
+}
+
+fn parse_u32_arg(key: &str, value: &str) -> Result<u32> {
+    value
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("{} must be a positive integer", key))
+}
+
+fn set_device_string(cfg: &mut ClientConfig, is_name: bool, value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        if let Some(device) = cfg.device.as_mut() {
+            if is_name {
+                device.name = None;
+            } else {
+                device.model = None;
+            }
+        }
+    } else {
+        let device = cfg.device.get_or_insert(DeviceConfig {
+            name: None,
+            model: None,
+        });
+        if is_name {
+            device.name = Some(trimmed.to_string());
+        } else {
+            device.model = Some(trimmed.to_string());
+        }
+    }
+
+    if cfg
+        .device
+        .as_ref()
+        .map(|d| d.name.is_none() && d.model.is_none())
+        .unwrap_or(false)
+    {
+        cfg.device = None;
+    }
 }
 
 fn to_discover_row(server: DiscoveredServer, registry: &ServerRegistry) -> DiscoverRow {

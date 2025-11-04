@@ -1241,11 +1241,13 @@ dependencies = [
  "base64",
  "directories",
  "hex",
+ "hostname",
  "http",
  "hyper-util",
  "mdns-sd",
  "prost",
  "rcgen",
+ "regex",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -1369,6 +1371,8 @@ dependencies = [
  "ratatui",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

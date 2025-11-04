@@ -10,3 +10,5 @@ handcontrol-client-lib = { path = "../client-lib" }
 ratatui = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

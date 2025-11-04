@@ -34,8 +34,7 @@ pub fn generate_verification_code(
     let hash = hasher.finalize();
 
     // Convert to a 6-digit numeric code (matches client implementation)
-    let value =
-        u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
+    let value = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]) % 1_000_000;
     format!("{:03}-{:03}", value / 1_000, value % 1_000)
 }
 

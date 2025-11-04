@@ -24,6 +24,7 @@ use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tower::service_fn;
+use uuid::Uuid;
 
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
 const HANDSHAKE_TIMEOUT_SECONDS: u64 = 10;
@@ -418,4 +419,70 @@ pub async fn connect_registered(
 
 fn normalize_domain(address: &str) -> String {
     address.trim_matches(|c| c == '[' || c == ']').to_string()
+}
+
+/// Result of retrieving server information over an unauthenticated connection.
+pub struct ServerInfoData {
+    pub address: String,
+    pub port: u16,
+    pub server_id: Uuid,
+    pub hostname: String,
+    pub version: String,
+    pub os: String,
+    pub fingerprint: String,
+}
+
+/// Attempt to fetch server information from the provided addresses.
+pub async fn fetch_server_info(
+    addresses: &[String],
+    port: u16,
+    server_id_hint: Option<Uuid>,
+) -> Result<ServerInfoData> {
+    if addresses.is_empty() {
+        bail!("No addresses provided to fetch server info");
+    }
+
+    let mut last_err: Option<anyhow::Error> = None;
+    for address in addresses {
+        match connect_unverified(address, port).await {
+            Ok((mut client, fingerprint_bytes)) => {
+                let response = client
+                    .get_server_info(Request::new(crate::proto::ServerInfoRequest {}))
+                    .await
+                    .context("GetServerInfo RPC failed")?
+                    .into_inner();
+
+                let server_id = Uuid::parse_str(&response.server_id)
+                    .context("Server returned invalid server_id")?;
+
+                if let Some(expected) = server_id_hint {
+                    if expected != server_id {
+                        bail!(
+                            "Server ID mismatch (expected {}, got {})",
+                            expected,
+                            server_id
+                        );
+                    }
+                }
+
+                let fingerprint = format!("SHA256:{}", hex::encode(&fingerprint_bytes));
+
+                return Ok(ServerInfoData {
+                    address: address.clone(),
+                    port,
+                    server_id,
+                    hostname: response.hostname,
+                    version: response.version,
+                    os: response.os,
+                    fingerprint,
+                });
+            }
+            Err(err) => {
+                last_err = Some(err);
+                continue;
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("Failed to connect to any provided address")))
 }

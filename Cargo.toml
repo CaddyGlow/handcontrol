@@ -5,7 +5,7 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0"
 prost = "0.14"
-tonic = { version = "0.14", features = ["tls-webpki-roots"] }
+tonic = { version = "0.14", features = ["tls-webpki-roots", "tls-connect-info"] }
 tonic-prost = "0.14"
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }

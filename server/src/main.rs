@@ -469,8 +469,10 @@ async fn start_handcontrol_server() -> Result<()> {
         .map(|p| std::path::PathBuf::from(p))
         .unwrap_or_else(|| paths::server_key_path().unwrap());
 
-    let server_cert = ensure_server_certificate(&cert_path, &key_path)
-        .context("Failed to initialize server certificate")?;
+    let server_cert = Arc::new(
+        ensure_server_certificate(&cert_path, &key_path)
+            .context("Failed to initialize server certificate")?,
+    );
 
     info!(
         "Server certificate ready: {}",
@@ -564,7 +566,7 @@ async fn start_handcontrol_server() -> Result<()> {
     info!("Creating gRPC service...");
     let service = RemoteControlService::new(
         config_arc.clone(),
-        Arc::new(server_cert),
+        server_cert.clone(),
         server_id,
         client_store,
         enrollment_manager,
@@ -634,7 +636,7 @@ async fn start_handcontrol_server() -> Result<()> {
 
     // Start gRPC server with TLS
     info!("Starting gRPC server with TLS...");
-    start_server(addr, service, cert_path, key_path)
+    start_server(addr, service, server_cert.clone())
         .await
         .context("gRPC server failed")?;
 

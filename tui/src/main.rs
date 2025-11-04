@@ -41,7 +41,9 @@ mod app {
         pub status: StatusLine,
         pub command_state: CommandListState,
         pub discovery_in_progress: bool,
+        pub enrollment_in_progress: bool,
         pub pending_command_server: Option<Uuid>,
+        pub pending_escape: Option<EscapeSequenceState>,
     }
 
     impl App {
@@ -57,7 +59,9 @@ mod app {
                 status: StatusLine::default(),
                 command_state: CommandListState::default(),
                 discovery_in_progress: false,
+                enrollment_in_progress: false,
                 pending_command_server: None,
+                pending_escape: None,
             };
             app.rebuild_servers();
             app
@@ -362,7 +366,16 @@ mod app {
                 self.selected = None;
                 return;
             }
-            let current = self.selected.unwrap_or_else(|| self.filtered_indices[0]);
+            if self.selected.is_none() {
+                self.selected = Some(self.filtered_indices[0]);
+                tracing::debug!(
+                    ?self.selected,
+                    "initialized command selection (next)"
+                );
+                return;
+            }
+
+            let current = self.selected.unwrap();
             let position = self
                 .filtered_indices
                 .iter()
@@ -370,6 +383,7 @@ mod app {
                 .unwrap_or(0);
             let next = (position + 1) % self.filtered_indices.len();
             self.selected = Some(self.filtered_indices[next]);
+            tracing::debug!(?self.selected, "advanced command selection");
         }
 
         pub fn select_previous(&mut self) {
@@ -377,7 +391,16 @@ mod app {
                 self.selected = None;
                 return;
             }
-            let current = self.selected.unwrap_or_else(|| self.filtered_indices[0]);
+            if self.selected.is_none() {
+                self.selected = self.filtered_indices.last().copied();
+                tracing::debug!(
+                    ?self.selected,
+                    "initialized command selection (previous)"
+                );
+                return;
+            }
+
+            let current = self.selected.unwrap();
             let position = self
                 .filtered_indices
                 .iter()
@@ -389,6 +412,7 @@ mod app {
                 position - 1
             };
             self.selected = Some(self.filtered_indices[prev]);
+            tracing::debug!(?self.selected, "moved command selection backwards");
         }
 
         pub fn set_search_query(&mut self, query: String) {
@@ -653,24 +677,34 @@ mod app {
         pub status_message: String,
         pub started: bool,
     }
+
+    #[derive(Debug, Clone)]
+    pub struct EscapeSequenceState {
+        pub collected: Vec<char>,
+    }
 }
 
 use anyhow::{anyhow, Context, Result};
 use app::{App, FocusPane, OutputChannel, ParameterValue, ServerStatus};
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event as CrosstermEvent, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event as CrosstermEvent, KeyCode, KeyEvent,
+        KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use handcontrol_client_lib::{
-    config, config::DiscoveryConfig, discover_servers, execute_command, list_commands,
-    validate_parameters, CommandList, CommandParameterType, CommandStreamEvent, CommandSummary,
-    DiscoveredServer, ServerRegistry, ServerRegistryEntry,
+    config, config::DiscoveryConfig, discover_servers, enroll_via_approval, execute_command,
+    list_commands, validate_parameters, ApprovalEnrollmentInput, CommandList, CommandParameterType,
+    CommandStreamEvent, CommandSummary, DiscoveredServer, ServerRegistry, ServerRegistryEntry,
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
@@ -678,6 +712,7 @@ use ratatui::{
 };
 use std::{collections::HashMap, fs, io, time::Duration};
 use tokio::sync::mpsc;
+use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 type EventSender = mpsc::UnboundedSender<UiEvent>;
@@ -737,6 +772,17 @@ impl TerminalGuard {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, Hide)?;
+        execute!(
+            stdout,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+            )
+        )?;
         Ok(Self)
     }
 }
@@ -747,7 +793,15 @@ impl Drop for TerminalGuard {
             tracing::warn!("Failed to disable raw mode: {err}");
         }
         let mut stdout = io::stdout();
-        let _ = execute!(stdout, LeaveAlternateScreen, Show);
+        let _ = execute!(
+            stdout,
+            PopKeyboardEnhancementFlags,
+            DisableFocusChange,
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
     }
 }
 
@@ -761,9 +815,11 @@ fn setup_terminal() -> Result<(TerminalGuard, Terminal<CrosstermBackend<io::Stdo
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if tracing_subscriber::fmt::try_init().is_err() {
-        tracing::debug!("Tracing already configured");
-    }
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::fmt::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(env_filter)
+        .try_init();
 
     let config = config::load().context("Failed to load client configuration")?;
     let registry = ServerRegistry::load().context("Failed to load server registry")?;
@@ -810,10 +866,12 @@ async fn main() -> Result<()> {
 fn spawn_input_thread(event_tx: EventSender) {
     std::thread::spawn(move || {
         while let Ok(event) = event::read() {
+            tracing::debug!(?event, "crossterm event read");
             if event_tx.send(UiEvent::Input(event)).is_err() {
                 break;
             }
         }
+        tracing::debug!("input thread exiting");
     });
 }
 
@@ -837,6 +895,111 @@ fn trigger_discovery(app: &mut App, event_tx: &EventSender) {
     app.set_status_message("Discovering servers...");
     let task_tx = event_tx.clone();
     spawn_discovery(task_tx, app.config.discovery.clone());
+}
+
+fn trigger_enrollment(app: &mut App, event_tx: &EventSender) -> Result<()> {
+    if app.enrollment_in_progress {
+        app.set_status_message("Enrollment already in progress");
+        return Ok(());
+    }
+
+    let server = match app.selected_server().cloned() {
+        Some(server) => server,
+        None => {
+            app.set_status_message("Select a server to enroll");
+            return Ok(());
+        }
+    };
+
+    if server.registry_entry.is_some() {
+        app.set_status_message("Server is already enrolled");
+        return Ok(());
+    }
+
+    if server.addresses.is_empty() {
+        app.set_status_message("Selected server does not have any reachable addresses");
+        return Ok(());
+    }
+
+    let addresses = server.addresses.clone();
+    let port = server.port;
+    let server_id_hint = server.id;
+    let label = server.label.clone();
+
+    let overlay_state = app::EnrollmentState {
+        server: server.clone(),
+        step: app::EnrollmentStep::Approval(app::ApprovalState {
+            verification_code: None,
+            status_message: "Requesting enrollment...".to_string(),
+            started: false,
+        }),
+    };
+    app.overlay = Some(app::Overlay::Enrollment(overlay_state));
+
+    let device_name = app
+        .config
+        .device
+        .as_ref()
+        .and_then(|device| device.name.clone());
+    let device_model = app
+        .config
+        .device
+        .as_ref()
+        .and_then(|device| device.model.clone());
+
+    let timeout = Duration::from_secs(60);
+    let poll_interval = Duration::from_secs(2);
+
+    app.enrollment_in_progress = true;
+    app.set_status_message(format!("Requesting enrollment for {}", label));
+
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let start_event = EnrollmentTaskEvent::Started {
+            server_id: server_id_hint,
+        };
+        let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(start_event)));
+
+        let wait_event = EnrollmentTaskEvent::Progress {
+            message: format!("Waiting for approval from {}", label),
+        };
+        let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(wait_event)));
+
+        let input = ApprovalEnrollmentInput {
+            addresses,
+            port,
+            server_id_hint,
+            device_name,
+            device_model,
+            timeout,
+            poll_interval,
+        };
+
+        let result = enroll_via_approval(input, |code| {
+            let event = EnrollmentTaskEvent::VerificationCode {
+                code: code.to_string(),
+            };
+            let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
+        })
+        .await;
+
+        match result {
+            Ok(outcome) => {
+                let message = format!(
+                    "Enrollment complete for {} (server {})",
+                    label, outcome.server_id
+                );
+                let event = EnrollmentTaskEvent::Completed { message };
+                let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
+            }
+            Err(error) => {
+                let event = EnrollmentTaskEvent::Failed { error };
+                let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
+            }
+        }
+    });
+
+    Ok(())
 }
 
 fn spawn_discovery(event_tx: EventSender, discovery_config: DiscoveryConfig) {
@@ -902,18 +1065,92 @@ fn handle_input_event(
     event_tx: &EventSender,
 ) -> Result<bool> {
     match event {
-        CrosstermEvent::Key(key) => handle_key_event(key, app, event_tx),
+        CrosstermEvent::Key(key) => {
+            let mut should_quit = false;
+            let expanded_keys = expand_key_event(key, app);
+            tracing::debug!(keys = ?expanded_keys, "expanded keys");
+            if expanded_keys.is_empty() {
+                return Ok(false);
+            }
+            for key_event in expanded_keys {
+                if handle_key_event(key_event, app, event_tx)? {
+                    should_quit = true;
+                    break;
+                }
+            }
+            Ok(should_quit)
+        }
         CrosstermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
 }
 
+fn expand_key_event(key: KeyEvent, app: &mut App) -> Vec<KeyEvent> {
+    tracing::debug!(?key, "expand_key_event input");
+
+    let is_plain_press =
+        matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) && key.modifiers.is_empty();
+
+    if is_plain_press && matches!(key.code, KeyCode::Esc) {
+        tracing::debug!("start escape sequence");
+        app.pending_escape = Some(app::EscapeSequenceState {
+            collected: Vec::new(),
+        });
+        return Vec::new();
+    }
+
+    if let Some(state) = app.pending_escape.as_mut() {
+        if is_plain_press {
+            match key.code {
+                KeyCode::Char(c) if state.collected.is_empty() && (c == '[' || c == 'O') => {
+                    tracing::debug!("escape sequence received prefix {}", c);
+                    state.collected.push(c);
+                    return Vec::new();
+                }
+                KeyCode::Char(c) if !state.collected.is_empty() => {
+                    state.collected.push(c);
+                    if matches!(c, 'A' | 'B' | 'C' | 'D') {
+                        let code = match c {
+                            'A' => KeyCode::Up,
+                            'B' => KeyCode::Down,
+                            'C' => KeyCode::Right,
+                            'D' => KeyCode::Left,
+                            _ => unreachable!(),
+                        };
+                        tracing::debug!(sequence = ?state.collected, ?code, "escape sequence decoded to arrow");
+                        app.pending_escape = None;
+                        return vec![KeyEvent::new(code, KeyModifiers::NONE)];
+                    } else {
+                        tracing::debug!(sequence = ?state.collected, "escape sequence accumulating");
+                        return Vec::new();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tracing::debug!("escape sequence fallback, emitting raw events");
+        app.pending_escape = None;
+        return vec![KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), key];
+    }
+
+    vec![key]
+}
+
 fn handle_key_event(key: KeyEvent, app: &mut App, event_tx: &EventSender) -> Result<bool> {
+    tracing::debug!(?key, "received key event");
+    if matches!(key.kind, KeyEventKind::Release) {
+        tracing::debug!(?key, "ignoring key release");
+        return Ok(false);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        tracing::debug!("Ctrl+C pressed; exiting");
         return Ok(true);
     }
 
     if let Some(overlay) = app.overlay.take() {
+        tracing::debug!("delegating key to overlay");
         let result = handle_overlay_value(key, app, overlay, event_tx)?;
         match result {
             OverlayHandlerResult::Continue(next) => app.overlay = Some(next),
@@ -923,10 +1160,30 @@ fn handle_key_event(key: KeyEvent, app: &mut App, event_tx: &EventSender) -> Res
         return Ok(false);
     }
 
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+    tracing::debug!(
+        ?normalized,
+        modifiers = ?key.modifiers,
+        "normalized key for handling"
+    );
+
+    match normalized {
         KeyCode::Char('q') => Ok(true),
         KeyCode::Char('d') => {
             trigger_discovery(app, event_tx);
+            Ok(false)
+        }
+        KeyCode::Char('e') => {
+            if let Err(err) = trigger_enrollment(app, event_tx) {
+                app.set_status_message(format!("Unable to start enrollment: {err}"));
+            }
             Ok(false)
         }
         KeyCode::Char('r') => {
@@ -994,6 +1251,20 @@ fn handle_key_event(key: KeyEvent, app: &mut App, event_tx: &EventSender) -> Res
             Ok(false)
         }
         KeyCode::Down => {
+            match app.focus {
+                FocusPane::Servers => move_selection_down(app),
+                FocusPane::Commands => move_command_selection_down(app),
+            }
+            Ok(false)
+        }
+        KeyCode::Char('k') | KeyCode::Char('K') => {
+            match app.focus {
+                FocusPane::Servers => move_selection_up(app),
+                FocusPane::Commands => move_command_selection_up(app),
+            }
+            Ok(false)
+        }
+        KeyCode::Char('j') | KeyCode::Char('J') => {
             match app.focus {
                 FocusPane::Servers => move_selection_down(app),
                 FocusPane::Commands => move_command_selection_down(app),
@@ -1143,7 +1414,103 @@ fn handle_task_event(event: TaskEvent, app: &mut App) -> Result<()> {
                 }
             }
         },
-        TaskEvent::Enrollment(_) => {}
+        TaskEvent::Enrollment(event) => match event {
+            EnrollmentTaskEvent::Started { .. } => {
+                if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    match &mut state.step {
+                        app::EnrollmentStep::Approval(approval) => {
+                            approval.status_message =
+                                "Enrollment request sent; waiting for verification code"
+                                    .to_string();
+                            approval.started = true;
+                        }
+                        _ => {
+                            state.step = app::EnrollmentStep::Approval(app::ApprovalState {
+                                verification_code: None,
+                                status_message:
+                                    "Enrollment request sent; waiting for verification code"
+                                        .to_string(),
+                                started: true,
+                            });
+                        }
+                    }
+                }
+                app.set_status_message("Enrollment request sent; waiting for verification code");
+            }
+            EnrollmentTaskEvent::VerificationCode { code } => {
+                if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    match &mut state.step {
+                        app::EnrollmentStep::Approval(approval) => {
+                            approval.verification_code = Some(code.clone());
+                            approval.status_message =
+                                "Approve this request on the server to continue".to_string();
+                        }
+                        _ => {
+                            state.step = app::EnrollmentStep::Approval(app::ApprovalState {
+                                verification_code: Some(code.clone()),
+                                status_message: "Approve this request on the server to continue"
+                                    .to_string(),
+                                started: true,
+                            });
+                        }
+                    }
+                }
+                app.set_status_message(format!(
+                    "Enter verification code {} on the server to approve enrollment",
+                    code
+                ));
+            }
+            EnrollmentTaskEvent::Progress { message } => {
+                if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    match &mut state.step {
+                        app::EnrollmentStep::Approval(approval) => {
+                            approval.status_message = message.clone();
+                        }
+                        _ => {
+                            state.step = app::EnrollmentStep::InProgress {
+                                message: message.clone(),
+                            };
+                        }
+                    }
+                }
+                app.set_status_message(message);
+            }
+            EnrollmentTaskEvent::Completed { message } => {
+                app.enrollment_in_progress = false;
+                if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    state.step = app::EnrollmentStep::Completed {
+                        message: message.clone(),
+                    };
+                }
+                match ServerRegistry::load() {
+                    Ok(registry) => {
+                        app.registry = registry;
+                        app.rebuild_servers();
+                        app.set_status_message(message);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            "Enrollment succeeded but reloading registry failed: {}",
+                            err
+                        );
+                        app.set_status_message(format!(
+                            "{} (registry reload failed: {})",
+                            message, err
+                        ));
+                    }
+                }
+            }
+            EnrollmentTaskEvent::Failed { error } => {
+                app.enrollment_in_progress = false;
+                let error_text = error.to_string();
+                if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    state.step = app::EnrollmentStep::Error {
+                        message: error_text.clone(),
+                    };
+                }
+                app.set_status_message(format!("Enrollment failed: {}", error_text));
+            }
+        },
     }
     Ok(())
 }
@@ -1179,7 +1546,7 @@ fn handle_overlay_value(
                 )),
             }
         }
-        app::Overlay::Enrollment(_) => Ok(OverlayHandlerResult::Close),
+        app::Overlay::Enrollment(state) => handle_enrollment_overlay_event(key, app, state),
         app::Overlay::Prompt(state) => handle_prompt_overlay_event(key, app, state),
         app::Overlay::Help => {
             if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
@@ -1202,7 +1569,16 @@ fn handle_search_overlay_key(
     state: &mut app::SearchState,
 ) -> Result<SearchOverlayAction> {
     let len = state.query.chars().count();
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
         KeyCode::Esc => Ok(SearchOverlayAction::Close),
         KeyCode::Enter => {
             app.command_state.set_search_query(state.query.clone());
@@ -1272,7 +1648,16 @@ fn handle_execution_overlay_key(
     app: &mut App,
     state: &mut app::CommandExecutionState,
 ) -> Result<ExecutionOverlayAction> {
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
         KeyCode::Esc => {
             if !state.running {
                 Ok(ExecutionOverlayAction::Close)
@@ -1282,6 +1667,40 @@ fn handle_execution_overlay_key(
             }
         }
         _ => Ok(ExecutionOverlayAction::Continue),
+    }
+}
+
+fn handle_enrollment_overlay_event(
+    key: KeyEvent,
+    _app: &mut App,
+    state: app::EnrollmentState,
+) -> Result<OverlayHandlerResult> {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
+        KeyCode::Esc => Ok(OverlayHandlerResult::Close),
+        KeyCode::Enter => {
+            if matches!(
+                state.step,
+                app::EnrollmentStep::Completed { .. } | app::EnrollmentStep::Error { .. }
+            ) {
+                Ok(OverlayHandlerResult::Close)
+            } else {
+                Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                    state,
+                )))
+            }
+        }
+        _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+            state,
+        ))),
     }
 }
 
@@ -1337,7 +1756,16 @@ fn handle_parameter_overlay_event(
                 let cursor = state.text_cursor.unwrap_or_else(|| text.chars().count());
                 let mut cursor = cursor;
                 state.error = None;
-                match key.code {
+                let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    match key.code {
+                        KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+                        other => other,
+                    }
+                } else {
+                    key.code
+                };
+
+                match normalized {
                     KeyCode::Esc => {
                         state.editing = false;
                         state.text_cursor = None;
@@ -1399,7 +1827,16 @@ fn handle_parameter_overlay_event(
     }
 
     let field_count = state.fields.len();
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
         KeyCode::Esc => return Ok(OverlayHandlerResult::Close),
         KeyCode::Up | KeyCode::BackTab => {
             if field_count > 0 {
@@ -1614,6 +2051,10 @@ fn open_remove_prompt(app: &mut App) -> Result<()> {
     };
 
     app.overlay = Some(app::Overlay::Prompt(prompt));
+    app.set_status_message(format!(
+        "Confirm removal for {} (Enter removes, Esc cancels)",
+        server.label
+    ));
     Ok(())
 }
 
@@ -1650,7 +2091,16 @@ fn handle_prompt_overlay_event(
     app: &mut App,
     state: app::PromptState,
 ) -> Result<OverlayHandlerResult> {
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
         KeyCode::Esc | KeyCode::Char('n') => Ok(OverlayHandlerResult::Close),
         KeyCode::Char('y') | KeyCode::Enter => {
             execute_prompt_action(app, &state.action)?;
@@ -1703,7 +2153,16 @@ fn handle_tag_overlay_event(
         return Ok(OverlayHandlerResult::Close);
     }
 
-    match key.code {
+    let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
+        match key.code {
+            KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
+            other => other,
+        }
+    } else {
+        key.code
+    };
+
+    match normalized {
         KeyCode::Esc => Ok(OverlayHandlerResult::Close),
         KeyCode::Up | KeyCode::BackTab => {
             state.selected = if state.selected == 0 {
@@ -1736,19 +2195,37 @@ fn handle_tag_overlay_event(
 }
 
 fn move_selection_up(app: &mut App) {
-    if let Some(current) = app.selected_server {
-        if current > 0 {
-            app.selected_server = Some(current - 1);
-        }
+    let len = app.servers.len();
+    if len == 0 {
+        return;
     }
+
+    match app.selected_server {
+        Some(current) if current > 0 => app.selected_server = Some(current - 1),
+        Some(_) => {}
+        None => app.selected_server = Some(len.saturating_sub(1)),
+    }
+    tracing::debug!(
+        selected = ?app.selected_server,
+        "moved server selection up"
+    );
 }
 
 fn move_selection_down(app: &mut App) {
-    if let Some(current) = app.selected_server {
-        if current + 1 < app.servers.len() {
-            app.selected_server = Some(current + 1);
-        }
+    let len = app.servers.len();
+    if len == 0 {
+        return;
     }
+
+    match app.selected_server {
+        Some(current) if current + 1 < len => app.selected_server = Some(current + 1),
+        Some(_) => {}
+        None => app.selected_server = Some(0),
+    }
+    tracing::debug!(
+        selected = ?app.selected_server,
+        "moved server selection down"
+    );
 }
 
 fn insert_char_at(target: &mut String, index: usize, ch: char) {
@@ -2173,6 +2650,121 @@ fn render_overlay(frame: &mut Frame<'_>, content_area: Rect, app: &App) {
                     .style(Style::default().fg(Color::Gray));
                 frame.render_widget(instructions, chunks[1]);
             }
+            app::Overlay::Prompt(state) => {
+                let area = centered_rect(content_area, 50, 35);
+                frame.render_widget(Clear, area);
+                let block = Block::default()
+                    .title(state.title.as_str())
+                    .borders(Borders::ALL);
+                frame.render_widget(block, area);
+
+                let inner = Rect {
+                    x: area.x.saturating_add(1),
+                    y: area.y.saturating_add(1),
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(1), Constraint::Length(1)])
+                    .split(inner);
+
+                let message = Paragraph::new(state.message.as_str());
+                frame.render_widget(message, chunks[0]);
+
+                let instructions = format!(
+                    "[Enter/y] {} · [Esc/n] {}",
+                    state.confirm_label, state.cancel_label
+                );
+                frame.render_widget(
+                    Paragraph::new(instructions).style(Style::default().fg(Color::Gray)),
+                    chunks[1],
+                );
+            }
+            app::Overlay::Enrollment(state) => {
+                let area = centered_rect(content_area, 60, 50);
+                frame.render_widget(Clear, area);
+                let title = format!("Enroll {}", state.server.label);
+                let block = Block::default().title(title).borders(Borders::ALL);
+                frame.render_widget(block, area);
+
+                let inner = Rect {
+                    x: area.x.saturating_add(1),
+                    y: area.y.saturating_add(1),
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                };
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(3), Constraint::Length(1)])
+                    .split(inner);
+
+                let mut lines: Vec<Line> = Vec::new();
+                lines.push(Line::from(vec![Span::styled(
+                    state.server.label.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                )]));
+                lines.push(Line::from(""));
+
+                let instructions = match &state.step {
+                    app::EnrollmentStep::Approval(approval) => {
+                        lines.push(Line::from(Span::styled(
+                            approval.status_message.clone(),
+                            Style::default().fg(Color::Gray),
+                        )));
+                        if let Some(code) = &approval.verification_code {
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(vec![Span::styled(
+                                code.clone(),
+                                Style::default()
+                                    .fg(Color::Yellow)
+                                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                            )]));
+                            lines.push(Line::from(Span::styled(
+                                "Enter this code on the server to approve enrollment",
+                                Style::default().fg(Color::Gray),
+                            )));
+                            "Esc hides overlay after noting the code"
+                        } else {
+                            "Waiting for verification code · Esc hides overlay"
+                        }
+                    }
+                    app::EnrollmentStep::InProgress { message } => {
+                        lines.push(Line::from(Span::raw(message.clone())));
+                        "Esc hides overlay"
+                    }
+                    app::EnrollmentStep::Completed { message } => {
+                        lines.push(Line::from(Span::styled(
+                            message.clone(),
+                            Style::default().fg(Color::Green),
+                        )));
+                        "Press Enter or Esc to close"
+                    }
+                    app::EnrollmentStep::Error { message } => {
+                        lines.push(Line::from(Span::styled(
+                            message.clone(),
+                            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                        )));
+                        "Press Enter or Esc to close"
+                    }
+                    other => {
+                        lines.push(Line::from(Span::styled(
+                            format!("{other:?}"),
+                            Style::default().fg(Color::Gray),
+                        )));
+                        "Esc hides overlay"
+                    }
+                };
+
+                let body = Paragraph::new(lines).alignment(Alignment::Center);
+                frame.render_widget(body, chunks[0]);
+                frame.render_widget(
+                    Paragraph::new(instructions).style(Style::default().fg(Color::Gray)),
+                    chunks[1],
+                );
+            }
             app::Overlay::ParameterForm(state) => {
                 let area = centered_rect(content_area, 70, 75);
                 frame.render_widget(Clear, area);
@@ -2398,7 +2990,6 @@ fn render_overlay(frame: &mut Frame<'_>, content_area: Rect, app: &App) {
                 frame.render_widget(Clear, area);
                 frame.render_widget(message, area);
             }
-            _ => {}
         }
     }
 }

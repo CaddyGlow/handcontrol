@@ -1,12 +1,75 @@
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::{DistinguishedName, ServerConfig, SignatureScheme};
+use rustls::{DigitallySignedStruct, DistinguishedName, ServerConfig, SignatureScheme};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 
 use super::certificates::ServerCertificate;
 use crate::storage::clients::ClientStore;
+
+/// Client certificate verifier that requests client certificates without enforcing trust.
+///
+/// The gRPC layer performs certificate authorization by comparing fingerprints against the
+/// enrolled client registry. This verifier keeps TLS flexible enough to allow enrollment flows
+/// (no certificate yet) while still collecting presented certificates for authenticated RPCs.
+#[derive(Debug, Default)]
+pub struct PermissiveClientVerifier;
+
+impl ClientCertVerifier for PermissiveClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+        ]
+    }
+}
 
 /// Custom client certificate verifier that checks against authorized clients
 #[derive(Debug)]
@@ -170,6 +233,29 @@ pub fn build_server_config_no_client_auth(server_cert: &ServerCertificate) -> Re
         .context("Failed to build server config with certificate")?;
 
     info!("TLS server configuration ready (no client auth)");
+    Ok(config)
+}
+
+/// Build a TLS server configuration that requests (but does not enforce) client certificates.
+///
+/// Presented certificates are inspected at the gRPC layer to enforce enrollment policy, allowing
+/// unauthenticated flows (e.g., enrollment) to continue while blocking untrusted command execution.
+pub fn build_permissive_server_config(server_cert: &ServerCertificate) -> Result<ServerConfig> {
+    info!("Building TLS server configuration that requests client certificates");
+
+    let cert_chain = vec![CertificateDer::from(server_cert.cert_der.clone())];
+    let private_key = PrivateKeyDer::try_from(server_cert.key_der.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
+
+    let verifier = Arc::new(PermissiveClientVerifier::default());
+
+    let mut config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, private_key)
+        .context("Failed to build server config with certificate")?;
+
+    config.alpn_protocols.push(b"h2".to_vec());
+
     Ok(config)
 }
 

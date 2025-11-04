@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
+use async_stream::try_stream;
+use futures_util::stream::Stream;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
+use tokio_rustls::TlsAcceptor;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
@@ -27,9 +30,11 @@ use crate::notifications::NotificationManager;
 use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
 use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
+use crate::security::tls::build_permissive_server_config;
 use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
 use crate::storage::clients::ClientStore;
+use sha2::{Digest, Sha256};
 
 /// gRPC service implementation
 pub struct RemoteControlService {
@@ -97,6 +102,29 @@ impl RemoteControlService {
                 tracing::error!("Failed to generate relay token for {}: {}", client_id, e);
                 None
             }
+        }
+    }
+
+    /// Ensure the incoming request is associated with an enrolled TLS client certificate.
+    fn ensure_enrolled_client<T>(&self, request: &Request<T>) -> Result<String, Status> {
+        let certs = request
+            .peer_certs()
+            .ok_or_else(|| Status::unauthenticated("Client TLS certificate required"))?;
+
+        let certificate = certs
+            .first()
+            .ok_or_else(|| Status::unauthenticated("Client TLS certificate required"))?;
+
+        let fingerprint = Sha256::digest(certificate.as_ref());
+        let fingerprint_hex = hex::encode(fingerprint);
+
+        let client_store = self.client_store.lock().unwrap();
+        if client_store.is_authorized(&fingerprint_hex) {
+            Ok(fingerprint_hex)
+        } else {
+            Err(Status::permission_denied(
+                "Client certificate is not enrolled on this server",
+            ))
         }
     }
 }
@@ -368,7 +396,7 @@ impl RemoteControl for RemoteControlService {
         // Generate random nonce for this pairing attempt (prevents precomputation attacks)
         let mut nonce = [0u8; 32];
         use rand::RngCore;
-        rand::thread_rng().fill_bytes(&mut nonce);
+        rand::rng().fill_bytes(&mut nonce);
 
         // Generate verification code (server's computation)
         let server_verification_code = generate_verification_code(
@@ -571,14 +599,16 @@ impl RemoteControl for RemoteControlService {
             request.remote_addr(),
         );
 
+        let fingerprint = self.ensure_enrolled_client(&request)?;
         let req = request.into_inner();
         info!(
-            "ApprovePairing RPC called for request_id={} (IP: {})",
+            "ApprovePairing RPC called for request_id={} (IP: {}, fingerprint={})",
             req.pairing_request_id,
             client_ip
                 .as_ref()
                 .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            fingerprint
         );
 
         let result = {
@@ -618,9 +648,11 @@ impl RemoteControl for RemoteControlService {
 
     async fn list_pending_pairings(
         &self,
-        _request: Request<ListPendingPairingsRequest>,
+        request: Request<ListPendingPairingsRequest>,
     ) -> Result<Response<ListPendingPairingsResponse>, Status> {
         info!("ListPendingPairings RPC called");
+
+        self.ensure_enrolled_client(&request)?;
 
         let pending_requests = self.pairing_manager.list_pending();
 
@@ -705,6 +737,8 @@ impl RemoteControl for RemoteControlService {
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
+        self.ensure_enrolled_client(&request)?;
+
         // Read config once and use it throughout
         let config = self.config.read().unwrap();
         let config_version = self.config_version.load(Ordering::SeqCst);
@@ -782,15 +816,17 @@ impl RemoteControl for RemoteControlService {
             request.remote_addr(),
         );
 
+        let fingerprint = self.ensure_enrolled_client(&request)?;
         let req = request.into_inner();
 
         info!(
-            "ExecuteCommand RPC called: command_id={} (IP: {})",
+            "ExecuteCommand RPC called: command_id={} (IP: {}, fingerprint={})",
             req.command_id,
             client_ip
                 .as_ref()
                 .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "unknown".to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            fingerprint
         );
 
         // Read config and find command
@@ -936,6 +972,8 @@ impl RemoteControl for RemoteControlService {
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
+        self.ensure_enrolled_client(&request)?;
+
         let config_version = self.config_version.load(Ordering::SeqCst);
         let last_updated_ms = self.last_config_update.load(Ordering::SeqCst) as i64;
 
@@ -970,6 +1008,8 @@ impl RemoteControl for RemoteControlService {
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         );
+
+        self.ensure_enrolled_client(&request)?;
 
         // Subscribe to config updates
         let mut rx = self.config_broadcaster.subscribe();
@@ -1015,35 +1055,47 @@ impl RemoteControl for RemoteControlService {
 pub async fn start_server(
     addr: SocketAddr,
     service: RemoteControlService,
-    cert_path: std::path::PathBuf,
-    key_path: std::path::PathBuf,
+    server_cert: Arc<ServerCertificate>,
 ) -> Result<()> {
-    use tonic::transport::{Identity, ServerTlsConfig};
-
     info!("Starting gRPC server with TLS on {}", addr);
 
-    // Load certificate and key from PEM files
-    let cert_pem = std::fs::read(&cert_path)
-        .with_context(|| format!("Failed to read certificate file: {}", cert_path.display()))?;
-    let key_pem = std::fs::read(&key_path)
-        .with_context(|| format!("Failed to read key file: {}", key_path.display()))?;
-
-    // Create server identity from certificate and key
-    let identity = Identity::from_pem(cert_pem, key_pem);
-
-    // Configure TLS (without client certificate verification for now)
-    // TODO: Implement custom client certificate verification (see IMPLEMENTATION_GAPS.md #18)
-    let tls_config = ServerTlsConfig::new().identity(identity);
+    let tls_config = build_permissive_server_config(&server_cert)
+        .context("Failed to build TLS server configuration")?;
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let std_listener =
         bind_tcp_listener(addr).context("Failed to bind TCP listener for gRPC server")?;
     let listener =
         TcpListener::from_std(std_listener).context("Failed to create async TCP listener")?;
-    let incoming = TcpListenerStream::new(listener);
+    let listener = Arc::new(listener);
+    let acceptor = Arc::new(tls_acceptor);
+
+    let incoming: Pin<
+        Box<
+            dyn Stream<
+                    Item = Result<
+                        tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                        std::io::Error,
+                    >,
+                > + Send,
+        >,
+    > = {
+        let listener = listener.clone();
+        let acceptor = acceptor.clone();
+        Box::pin(try_stream! {
+            loop {
+                let (socket, _) = listener.accept().await?;
+                match acceptor.accept(socket).await {
+                    Ok(stream) => yield stream,
+                    Err(err) => {
+                        warn!("TLS handshake failed: {}", err);
+                    }
+                }
+            }
+        })
+    };
 
     Server::builder()
-        .tls_config(tls_config)
-        .context("Failed to configure TLS")?
         .add_service(RemoteControlServer::new(service))
         .serve_with_incoming(incoming)
         .await
@@ -1082,4 +1134,291 @@ fn bind_tcp_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
         .context("Failed to set TCP socket to non-blocking mode")?;
 
     Ok(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ConfigBroadcaster;
+    use crate::config::parser::{
+        CommandConfig, Config, EnrollmentConfig, NetworkConfig, RelayConfig, SecurityConfig,
+        ServerConfig,
+    };
+    use crate::grpc::proto::ListCommandsRequest;
+    use crate::grpc::proto::remote_control_client::RemoteControlClient;
+    use crate::notifications::{NotificationManager, NotificationProvider};
+    use crate::security::certificates::ClientCertificate;
+    use crate::security::enrollment::EnrollmentTokenManager;
+    use crate::security::pairing::PairingRequestManager;
+    use crate::storage::clients::ClientStore;
+    use pem::Pem;
+    use rcgen::generate_simple_self_signed;
+    use std::io;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex, RwLock};
+    use tempfile::TempDir;
+    use tokio::sync::oneshot;
+    use tonic::Request;
+    use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
+
+    struct TestNotificationProvider;
+
+    impl NotificationProvider for TestNotificationProvider {
+        fn show_pairing_notification(
+            &self,
+            _device_name: &str,
+            _verification_code: &str,
+            _request_id: &str,
+        ) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestHarness {
+        addr: SocketAddr,
+        shutdown: Option<oneshot::Sender<()>>,
+        handle: tokio::task::JoinHandle<Result<(), tonic::transport::Error>>,
+        client_store: Arc<Mutex<ClientStore>>,
+        server_cert_pem: String,
+        _temp_dir: TempDir,
+    }
+
+    impl TestHarness {
+        async fn new() -> io::Result<Self> {
+            let temp_dir = TempDir::new().expect("create temp dir");
+            let clients_dir = temp_dir.path().join("clients");
+            let client_store = Arc::new(Mutex::new(
+                ClientStore::new(clients_dir).expect("create client store"),
+            ));
+
+            let command = CommandConfig {
+                id: "echo".to_string(),
+                name: "Echo".to_string(),
+                description: Some("test".to_string()),
+                icon: None,
+                shell: "echo test".to_string(),
+                tags: Vec::new(),
+                timeout_seconds: 5,
+                env: std::collections::HashMap::new(),
+                parameters: Vec::new(),
+                requires_confirmation: false,
+                show_output: true,
+            };
+
+            let config = Config {
+                server: ServerConfig {
+                    port: 0,
+                    bind_address: "127.0.0.1".to_string(),
+                    mdns_service_name: "test".to_string(),
+                    mdns_instance_name: None,
+                },
+                security: SecurityConfig {
+                    cert_path: None,
+                    key_path: None,
+                    authorized_clients_dir: None,
+                    enrollment_token_ttl: 300,
+                    enrollment: EnrollmentConfig::default(),
+                },
+                network: NetworkConfig::default(),
+                relay: RelayConfig::default(),
+                command: vec![command],
+            };
+
+            let config_arc = Arc::new(RwLock::new(config));
+            let server_cert =
+                Arc::new(ServerCertificate::generate().expect("generate server cert"));
+            let server_id = Uuid::new_v4();
+
+            let enrollment_manager = EnrollmentTokenManager::new(300);
+            let pairing_manager = PairingRequestManager::new(60);
+            let notification_manager =
+                NotificationManager::with_provider(Box::new(TestNotificationProvider));
+            let config_version = Arc::new(AtomicU64::new(1));
+            let config_broadcaster = Arc::new(ConfigBroadcaster::new(16));
+            let last_config_update = Arc::new(AtomicU64::new(0));
+
+            let service = RemoteControlService::new(
+                config_arc,
+                server_cert.clone(),
+                server_id,
+                client_store.clone(),
+                enrollment_manager,
+                pairing_manager,
+                notification_manager,
+                config_version,
+                config_broadcaster,
+                last_config_update,
+                None,
+            );
+
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+            let addr = listener.local_addr()?;
+
+            let tls_config =
+                build_permissive_server_config(&server_cert).expect("build permissive tls config");
+            let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+            let listener = Arc::new(listener);
+            let acceptor = Arc::new(tls_acceptor);
+
+            let incoming: Pin<
+                Box<
+                    dyn Stream<
+                            Item = Result<
+                                tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+                                std::io::Error,
+                            >,
+                        > + Send,
+                >,
+            > = {
+                let listener = listener.clone();
+                let acceptor = acceptor.clone();
+                Box::pin(try_stream! {
+                    loop {
+                        let (socket, _) = listener.accept().await?;
+                        match acceptor.accept(socket).await {
+                            Ok(stream) => yield stream,
+                            Err(err) => {
+                                warn!("TLS handshake failed during test: {}", err);
+                            }
+                        }
+                    }
+                })
+            };
+
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let handle = tokio::spawn(async move {
+                Server::builder()
+                    .add_service(RemoteControlServer::new(service))
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+            });
+
+            let server_cert_pem =
+                pem::encode(&Pem::new("CERTIFICATE", server_cert.cert_der.clone()));
+
+            Ok(Self {
+                addr,
+                shutdown: Some(shutdown_tx),
+                handle,
+                client_store,
+                server_cert_pem,
+                _temp_dir: temp_dir,
+            })
+        }
+
+        async fn shutdown(mut self) {
+            if let Some(tx) = self.shutdown.take() {
+                let _ = tx.send(());
+            }
+            match self.handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => panic!("server error: {err}"),
+                Err(join_err) => panic!("server task join failed: {join_err}"),
+            }
+        }
+    }
+
+    async fn make_client(
+        harness: &TestHarness,
+        identity: Option<Identity>,
+    ) -> RemoteControlClient<tonic::transport::Channel> {
+        let endpoint = Endpoint::from_shared(format!("https://localhost:{}", harness.addr.port()))
+            .expect("create endpoint");
+        let ca_cert = Certificate::from_pem(harness.server_cert_pem.clone());
+        let mut tls = ClientTlsConfig::new()
+            .ca_certificate(ca_cert)
+            .domain_name("localhost");
+
+        if let Some(identity) = identity {
+            tls = tls.identity(identity);
+        }
+
+        let channel = endpoint.tls_config(tls).unwrap().connect().await.unwrap();
+        RemoteControlClient::new(channel)
+    }
+
+    fn generate_client_identity(common_name: &str) -> (Identity, Vec<u8>) {
+        let certified = generate_simple_self_signed(vec![common_name.to_string()])
+            .expect("generate client certificate");
+        let cert_der = certified.cert.der().to_vec();
+        let cert_pem = certified.cert.pem().into_bytes();
+        let key_pem = certified.signing_key.serialize_pem().into_bytes();
+        let identity = Identity::from_pem(cert_pem, key_pem);
+
+        (identity, cert_der)
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_client_rejected() {
+        let harness = match TestHarness::new().await {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to initialize test harness: {e}"),
+        };
+        let mut client = make_client(&harness, None).await;
+
+        let status = client
+            .list_commands(Request::new(ListCommandsRequest {}))
+            .await
+            .expect_err("unauthenticated client should be rejected");
+
+        assert_eq!(status.code(), tonic::Code::Unauthenticated);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn unenrolled_client_rejected() {
+        let harness = match TestHarness::new().await {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to initialize test harness: {e}"),
+        };
+        let (identity, _cert_der) = generate_client_identity("unenrolled");
+        let mut client = make_client(&harness, Some(identity)).await;
+
+        let status = client
+            .list_commands(Request::new(ListCommandsRequest {}))
+            .await
+            .expect_err("unenrolled client should be rejected");
+
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn enrolled_client_can_access_commands() {
+        let harness = match TestHarness::new().await {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to initialize test harness: {e}"),
+        };
+        let (identity, cert_der) = generate_client_identity("enrolled");
+
+        {
+            let mut store = harness.client_store.lock().unwrap();
+            let client_cert = ClientCertificate::from_der(cert_der.clone());
+            store
+                .add_client(&client_cert, "enrolled".to_string(), None)
+                .expect("store client cert");
+        }
+
+        let mut client = make_client(&harness, Some(identity)).await;
+        let response = client
+            .list_commands(Request::new(ListCommandsRequest {}))
+            .await
+            .expect("enrolled client should succeed")
+            .into_inner();
+
+        assert_eq!(response.commands.len(), 1);
+
+        harness.shutdown().await;
+    }
 }

@@ -8,7 +8,9 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import com.google.protobuf.ByteString
 import com.handcontrol.core.network.MtlsSslContextFactory
+import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.security.ClientCertificate
+import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.core.security.ClientCertificateManager
 import com.handcontrol.core.security.VerificationCodeGenerator
 import com.handcontrol.data.database.ConnectionMode
@@ -39,6 +41,7 @@ import java.security.MessageDigest
 import java.security.cert.X509Certificate
 import java.time.Instant
 import java.util.concurrent.TimeUnit
+import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -51,6 +54,7 @@ class GrpcEnrollmentRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val certificateManager: ClientCertificateManager,
     private val channelFactory: com.handcontrol.core.network.MtlsGrpcChannelFactory,
+    private val relayChannelFactory: RelayGrpcChannelFactory,
     private val enrolledServerRepository: EnrolledServerRepository
 ) : EnrollmentRepository {
 
@@ -86,23 +90,28 @@ class GrpcEnrollmentRepository @Inject constructor(
 
         // Strategy: IPv6 first -> IPv4 second -> remaining IPs in parallel
         // Server orders IPs as: [best IPv6, best IPv4, other IPv6s, other IPv4s]
+        var lastError: EnrollmentResult? = null
 
         // 1. Try first IP (should be IPv6)
         val firstHost = hosts[0]
         try {
             Timber.d("Trying primary IP (IPv6): $firstHost")
-                return tryEnrollWithHost(
-                    host = firstHost,
-                    port = port,
-                    token = token,
-                    deviceName = deviceName,
-                    timeoutMs = 3000L,
-                    expectedCertFingerprint = expectedCertFingerprint,
-                    expectedServerId = expectedServerId,
-                    validUntil = validUntil,
-                    allHosts = hosts,
-                    relayOptions = relayOptions
-                )
+            val result = tryEnrollWithHost(
+                host = firstHost,
+                port = port,
+                token = token,
+                deviceName = deviceName,
+                timeoutMs = 3000L,
+                expectedCertFingerprint = expectedCertFingerprint,
+                expectedServerId = expectedServerId,
+                validUntil = validUntil,
+                allHosts = hosts,
+                relayOptions = relayOptions
+            )
+            if (result is EnrollmentResult.Success) {
+                return result
+            }
+            lastError = result
         } catch (e: Exception) {
             Timber.w(e, "Primary IP $firstHost failed: ${e.javaClass.simpleName}")
         }
@@ -112,7 +121,7 @@ class GrpcEnrollmentRepository @Inject constructor(
             val secondHost = hosts[1]
             try {
                 Timber.d("Trying fallback IP (IPv4): $secondHost")
-                return tryEnrollWithHost(
+                val result = tryEnrollWithHost(
                     host = secondHost,
                     port = port,
                     token = token,
@@ -124,13 +133,17 @@ class GrpcEnrollmentRepository @Inject constructor(
                     allHosts = hosts,
                     relayOptions = relayOptions
                 )
+                if (result is EnrollmentResult.Success) {
+                    return result
+                }
+                lastError = result
             } catch (e: Exception) {
                 Timber.w(e, "Fallback IP $secondHost failed: ${e.javaClass.simpleName}")
             }
         }
 
         // 3. Try remaining IPs in parallel if any
-        return if (hosts.size > 2) {
+        val parallelResult = if (hosts.size > 2) {
             val remainingHosts = hosts.drop(2)
             Timber.d("Trying ${remainingHosts.size} remaining IPs in parallel")
 
@@ -158,25 +171,47 @@ class GrpcEnrollmentRepository @Inject constructor(
                     }
                 }
 
-                // Return first successful result
                 for (deferred in results) {
                     val result = deferred.await()
                     if (result is EnrollmentResult.Success) {
-                        // Cancel remaining tasks
                         results.forEach { if (it != deferred) it.cancel() }
                         return@coroutineScope result
                     }
                 }
 
-                // All attempts failed
                 Timber.e("All ${hosts.size} enrollment attempts failed")
                 EnrollmentResult.Error("Failed to connect to any of ${hosts.size} IP addresses")
             }
         } else {
-            // Only 1 or 2 IPs and both failed
-            Timber.e("All ${hosts.size} enrollment attempts failed")
-            EnrollmentResult.Error("Failed to connect to any of ${hosts.size} IP addresses")
+            null
         }
+
+        if (parallelResult is EnrollmentResult.Success) {
+            return parallelResult
+        }
+        if (parallelResult is EnrollmentResult.Error) {
+            lastError = parallelResult
+        }
+
+        val failureResult = lastError ?: EnrollmentResult.Error(
+            "Failed to connect to any of ${hosts.size} IP addresses"
+        )
+
+        if (relayOptions != null) {
+            Timber.i("Direct enrollment attempts failed; attempting relay fallback via ${relayOptions.relayUrl}")
+            return tryEnrollViaRelay(
+                options = relayOptions,
+                token = token,
+                deviceName = deviceName,
+                expectedCertFingerprint = expectedCertFingerprint,
+                expectedServerId = expectedServerId,
+                validUntil = validUntil,
+                allHosts = hosts,
+                port = port
+            )
+        }
+
+        return failureResult
     }
 
     private suspend fun tryEnrollWithHost(
@@ -257,82 +292,15 @@ class GrpcEnrollmentRepository @Inject constructor(
                 Timber.i("Server certificate pinned and verified: %s", fingerprint)
 
                 if (response.success) {
-                    val serverInfo = try {
-                        getServerInfo(channel)
-                    } catch (e: Exception) {
-                        Timber.e(e, "Failed to fetch server information")
-                        return@withTimeout EnrollmentResult.Error(
-                            "Failed to fetch server information: ${e.message}"
-                        )
-                    }
-
-                    val serverId = serverInfo.serverId
-                    if (expectedServerId != serverId) {
-                        Timber.e(
-                            "Server ID mismatch! Expected: %s, Got: %s",
-                            expectedServerId,
-                            serverId
-                        )
-                        return@withTimeout EnrollmentResult.Error(
-                            "Security verification failed: server ID does not match QR code"
-                        )
-                    }
-
-                    val relayEnabled = response.hasRelayInfo() && !response.relayInfo.relayUrl.isEmpty()
-                    val relayUrl = if (relayEnabled) response.relayInfo.relayUrl else null
-                    val relayToken = if (relayEnabled) response.relayInfo.relayToken else null
-
-                    if (relayEnabled) {
-                        Timber.i("Relay info received: url=%s", relayUrl)
-                    }
-
-                    val relayAllowSelfSigned =
-                        relayEnabled && (relayOptions?.allowSelfSignedTls ?: false)
-                    val relayPinned = if (relayEnabled) {
-                        relayOptions?.pinnedCertSha256?.let { value ->
-                            value.takeIf { it.isNotBlank() }
-                        }
-                    } else {
-                        null
-                    }
-
-                    enrolledServerRepository.saveServer(
-                        serverId = serverId,
-                        ips = allHosts,
-                        serverPort = port,
-                        clientId = response.clientId,
-                        serverName = serverInfo.hostname,
-                        certFingerprint = fingerprint,
-                        relayEnabled = relayEnabled,
-                        relayUrl = relayUrl,
-                        relayToken = relayToken,
-                        relayAllowSelfSigned = relayAllowSelfSigned,
-                        relayPinnedCertSha256 = relayPinned,
-                        initialConnectionMode = ConnectionMode.DIRECT
+                    return@withTimeout handleSuccessfulEnrollment(
+                        channel = channel,
+                        response = response,
+                        fingerprint = fingerprint,
+                        expectedServerId = expectedServerId,
+                        allHosts = allHosts,
+                        port = port,
+                        relayOptions = relayOptions
                     )
-                    Timber.i(
-                        "Server info saved: serverId=%s, hostname=%s, relay=%s",
-                        serverId,
-                        serverInfo.hostname,
-                        relayEnabled
-                    )
-
-                    if (relayEnabled && (response.relayInfo.relayRequired || relayOptions?.relayRequired == true)) {
-                        enrolledServerRepository.updateConnectionPreference(
-                            serverId,
-                            ConnectionPreference.RELAY_ONLY
-                        )
-                    }
-
-                    saveClientId(response.clientId)
-                    Timber.i(
-                        "QR enrollment successful: clientId=%s, serverId=%s via host=%s",
-                        response.clientId,
-                        serverId,
-                        host
-                    )
-
-                    EnrollmentResult.Success(response.clientId, serverId)
                 } else {
                     Timber.w("QR enrollment failed: %s", response.errorMessage)
                     EnrollmentResult.Error(response.errorMessage)
@@ -366,6 +334,227 @@ class GrpcEnrollmentRepository @Inject constructor(
                 enrollmentChannel?.let { shutdownEnrollmentChannel(it.channel) }
             }
         }
+    }
+
+    private suspend fun tryEnrollViaRelay(
+        options: RelayEnrollmentOptions,
+        token: String,
+        deviceName: String,
+        expectedCertFingerprint: String,
+        expectedServerId: String,
+        validUntil: Instant?,
+        allHosts: List<String>,
+        port: Int
+    ): EnrollmentResult {
+        if (validUntil != null && Instant.now().isAfter(validUntil)) {
+            Timber.w(
+                "Relay enrollment aborted due to expired token: validUntil=%s",
+                validUntil
+            )
+            return EnrollmentResult.Error(
+                "This enrollment QR code has expired. Generate a new code and try again."
+            )
+        }
+
+        val clientUuid = try {
+            UUID.fromString(token)
+        } catch (e: IllegalArgumentException) {
+            Timber.e(e, "Relay enrollment requires UUID-formatted token")
+            return EnrollmentResult.Error(
+                "Relay enrollment is unavailable because the enrollment token is not a UUID"
+            )
+        }
+
+        var channel: ManagedChannel? = null
+        return try {
+            Timber.d("Attempting relay enrollment via ${options.relayUrl}")
+
+            val certificate = certificateManager.loadOrCreate()
+            channel = relayChannelFactory.createChannelViaRelay(
+                relayUrl = options.relayUrl,
+                serverId = expectedServerId,
+                relayToken = options.relayToken,
+                clientId = clientUuid.toString(),
+                defaultAuthority = computeDefaultRelayAuthority(allHosts, port),
+                expectedFingerprint = expectedCertFingerprint,
+                allowSelfSignedTls = options.allowSelfSignedTls,
+                pinnedCertSha256 = options.pinnedCertSha256
+            )
+
+            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+            val request = EnrollRequest.newBuilder()
+                .setEnrollmentToken(token)
+                .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
+                .setDeviceName(deviceName)
+                .build()
+
+            val response = stub.enroll(request)
+            Timber.d("Relay enrollment RPC completed, success=%s", response.success)
+
+            val serverCert = relayChannelFactory.getServerCertificate(channel)
+            if (serverCert == null) {
+                Timber.e("Relay enrollment: server certificate not captured during handshake")
+                return EnrollmentResult.Error(
+                    "Security verification failed: could not extract server certificate"
+                )
+            }
+
+            val fingerprint = VerificationCodeGenerator.computeFingerprint(serverCert.encoded)
+            if (fingerprint != expectedCertFingerprint) {
+                Timber.e(
+                    "Relay enrollment fingerprint mismatch! expected=%s actual=%s",
+                    expectedCertFingerprint,
+                    fingerprint
+                )
+                return EnrollmentResult.Error(
+                    "Security verification failed: server certificate does not match QR code"
+                )
+            }
+
+            certificateManager.pinServerFingerprint(fingerprint)
+            Timber.i("Server certificate verified via relay: %s", fingerprint)
+
+            if (response.success) {
+                handleSuccessfulEnrollment(
+                    channel = channel,
+                    response = response,
+                    fingerprint = fingerprint,
+                    expectedServerId = expectedServerId,
+                    allHosts = allHosts,
+                    port = port,
+                    relayOptions = options
+                )
+            } else {
+                Timber.w("Relay enrollment failed: ${response.errorMessage}")
+                EnrollmentResult.Error(response.errorMessage)
+            }
+        } catch (e: RelayConnectionException) {
+            Timber.e(e, "Relay connection error during enrollment")
+            EnrollmentResult.Error("Relay connection failed: ${e.userMessage}")
+        } catch (e: StatusException) {
+            val errorMsg = mapGrpcError(e.status)
+            Timber.e(
+                e,
+                "Relay enrollment RPC failed - Status: ${e.status.code} - $errorMsg"
+            )
+            EnrollmentResult.Error("gRPC ${e.status.code}: $errorMsg")
+        } catch (e: Exception) {
+            Timber.e(e, "Relay enrollment failed - ${e.javaClass.simpleName}")
+            EnrollmentResult.Error("Relay enrollment error: ${e.message}")
+        } finally {
+            if (channel != null) {
+                try {
+                    relayChannelFactory.shutdownChannel(channel)
+                } catch (e: Exception) {
+                    Timber.w(e, "Error shutting down relay channel after enrollment attempt")
+                }
+            }
+        }
+    }
+
+    private suspend fun handleSuccessfulEnrollment(
+        channel: ManagedChannel,
+        response: com.handcontrol.grpc.EnrollResponse,
+        fingerprint: String,
+        expectedServerId: String,
+        allHosts: List<String>,
+        port: Int,
+        relayOptions: RelayEnrollmentOptions?
+    ): EnrollmentResult {
+        val serverInfo = try {
+            getServerInfo(channel)
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to fetch server information")
+            return EnrollmentResult.Error(
+                "Failed to fetch server information: ${e.message}"
+            )
+        }
+
+        val serverId = serverInfo.serverId
+        if (serverId.isBlank()) {
+            Timber.e("Server returned empty server_id during enrollment")
+            return EnrollmentResult.Error("Server returned an invalid server ID")
+        }
+
+        if (expectedServerId != serverId) {
+            Timber.e(
+                "Server ID mismatch! Expected: %s, Got: %s",
+                expectedServerId,
+                serverId
+            )
+            return EnrollmentResult.Error(
+                "Security verification failed: server ID does not match QR code"
+            )
+        }
+
+        val relayInfo = if (response.hasRelayInfo()) response.relayInfo else null
+        val relayUrl = relayInfo?.relayUrl?.takeIf { it.isNotBlank() } ?: relayOptions?.relayUrl
+        val relayToken = relayInfo?.relayToken?.takeIf { it.isNotBlank() } ?: relayOptions?.relayToken
+        val relayEnabled = !relayUrl.isNullOrBlank() && !relayToken.isNullOrBlank()
+
+        if (relayEnabled) {
+            Timber.i("Relay info registered for server %s: %s", serverId, relayUrl)
+        }
+
+        val relayAllowSelfSigned = if (relayEnabled) {
+            relayOptions?.allowSelfSignedTls ?: false
+        } else {
+            false
+        }
+        val relayPinned = if (relayEnabled) {
+            relayOptions?.pinnedCertSha256?.takeIf { !it.isNullOrBlank() }
+        } else {
+            null
+        }
+
+        enrolledServerRepository.saveServer(
+            serverId = serverId,
+            ips = allHosts,
+            serverPort = port,
+            clientId = response.clientId,
+            serverName = serverInfo.hostname,
+            certFingerprint = fingerprint,
+            relayEnabled = relayEnabled,
+            relayUrl = relayUrl,
+            relayToken = relayToken,
+            relayAllowSelfSigned = relayAllowSelfSigned,
+            relayPinnedCertSha256 = relayPinned,
+            initialConnectionMode = ConnectionMode.DIRECT
+        )
+        Timber.i(
+            "Server info saved: serverId=%s, hostname=%s, relay=%s",
+            serverId,
+            serverInfo.hostname,
+            relayEnabled
+        )
+
+        val relayRequired =
+            (relayInfo?.relayRequired == true) || (relayOptions?.relayRequired == true)
+        if (relayEnabled && relayRequired) {
+            enrolledServerRepository.updateConnectionPreference(
+                serverId,
+                ConnectionPreference.RELAY_ONLY
+            )
+        }
+
+        saveClientId(response.clientId)
+        Timber.i(
+            "Enrollment successful: clientId=%s, serverId=%s",
+            response.clientId,
+            serverId
+        )
+
+        return EnrollmentResult.Success(response.clientId, serverId)
+    }
+
+    private fun computeDefaultRelayAuthority(hosts: List<String>, port: Int): String {
+        val host = hosts.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: "handcontrol.local"
+        val authority = if (host.contains(":") && !host.startsWith("[")) {
+            "[$host]"
+        } else {
+            host
+        }
+        return "$authority:$port"
     }
 
     override suspend fun requestApproval(

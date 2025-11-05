@@ -203,10 +203,14 @@ fun QrScannerScreen(
                                 val relayOptions = if (json.has("relay") && !json.isNull("relay")) {
                                     val relayJson = json.getJSONObject("relay")
                                     val relayUrl = relayJson.optString("relay_url")
-                                    if (relayUrl.isNullOrBlank()) {
+                                    val relayToken = relayJson.optString("relay_token")
+                                    if (relayUrl.isNullOrBlank() || relayToken.isNullOrBlank()) {
+                                        Timber.w("Relay block present but missing url/token")
                                         null
                                     } else {
                                         RelayEnrollmentOptions(
+                                            relayUrl = relayUrl,
+                                            relayToken = relayToken,
                                             relayRequired = relayJson.optBoolean("relay_required", false),
                                             allowSelfSignedTls = relayJson.optBoolean("allow_self_signed_tls", false),
                                             pinnedCertSha256 = relayJson.optString("pinned_cert_sha256").takeIf { it.isNotBlank() }

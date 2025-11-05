@@ -10,6 +10,8 @@ sealed interface EnrollmentResult {
 }
 
 data class RelayEnrollmentOptions(
+    val relayUrl: String,
+    val relayToken: String,
     val relayRequired: Boolean,
     val allowSelfSignedTls: Boolean,
     val pinnedCertSha256: String?

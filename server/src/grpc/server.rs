@@ -2,10 +2,12 @@ use anyhow::{Context, Result};
 use async_stream::try_stream;
 use futures_util::stream::Stream;
 use socket2::{Domain, Protocol, Socket, Type};
+use std::convert::TryFrom;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration as StdDuration;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::transport::Server;
@@ -81,7 +83,11 @@ impl RemoteControlService {
     }
 
     /// Generate relay info for enrollment responses
-    fn generate_relay_info(&self, client_id: &str) -> Option<super::proto::RelayInfo> {
+    fn generate_relay_info(
+        &self,
+        client_id: &str,
+        ttl_override: Option<StdDuration>,
+    ) -> Option<super::proto::RelayInfo> {
         let config = self.config.read().unwrap();
 
         if !config.relay.enabled || !config.relay.include_in_enrollment {
@@ -90,9 +96,21 @@ impl RemoteControlService {
 
         let token_issuer = self.token_issuer.as_ref()?;
         let relay_url = config.relay.relay_server_url.as_ref()?;
-        let ttl_hours = config.relay.relay_token_ttl_hours;
+        let config_ttl_seconds = config.relay.relay_token_ttl_hours.saturating_mul(3600);
+        let config_ttl = StdDuration::from_secs(config_ttl_seconds.max(1));
+        let ttl = match ttl_override {
+            Some(override_ttl) if override_ttl.is_zero() => {
+                tracing::warn!(
+                    "Skipping relay token generation for {}: override TTL is zero",
+                    client_id
+                );
+                return None;
+            }
+            Some(override_ttl) => std::cmp::min(override_ttl, config_ttl),
+            None => config_ttl,
+        };
 
-        match token_issuer.generate_relay_token(client_id, relay_url, ttl_hours) {
+        match token_issuer.generate_relay_token(client_id, relay_url, ttl) {
             Ok(token) => Some(super::proto::RelayInfo {
                 relay_url: relay_url.clone(),
                 relay_token: token,
@@ -227,7 +245,7 @@ impl RemoteControl for RemoteControlService {
             req.device_name, client_id
         );
 
-        let relay_info = self.generate_relay_info(&client_id);
+        let relay_info = self.generate_relay_info(&client_id, None);
 
         Ok(Response::new(EnrollResponse {
             success: true,
@@ -260,6 +278,7 @@ impl RemoteControl for RemoteControlService {
                 ttl_seconds: 0,
                 error_message: "QR code enrollment is disabled on this server".to_string(),
                 relay_info: None,
+                valid_until: String::new(),
             }));
         }
 
@@ -279,6 +298,7 @@ impl RemoteControl for RemoteControlService {
                     ttl_seconds: 0,
                     error_message: format!("Failed to generate enrollment token: {}", e),
                     relay_info: None,
+                    valid_until: String::new(),
                 }));
             }
         };
@@ -304,7 +324,13 @@ impl RemoteControl for RemoteControlService {
         let server_port = config.server.port as i32;
 
         // Create QR payload
-        let relay_info_proto = self.generate_relay_info(&token.token);
+        let now = time::OffsetDateTime::now_utc();
+        let enrollment_ttl = if token.expires_at > now {
+            StdDuration::try_from(token.expires_at - now).ok()
+        } else {
+            None
+        };
+        let relay_info_proto = self.generate_relay_info(&token.token, enrollment_ttl);
         let relay_qr_info = relay_info_proto
             .as_ref()
             .map(|info| crate::utils::qr::RelayQrInfo {
@@ -321,8 +347,11 @@ impl RemoteControl for RemoteControlService {
             self.server_cert.fingerprint_display(),
             token.token.clone(),
             self.server_id,
+            token.expires_at,
             relay_qr_info,
         );
+
+        let valid_until = payload.valid_until.clone();
 
         let qr_payload = match payload.to_json() {
             Ok(json) => json,
@@ -339,6 +368,7 @@ impl RemoteControl for RemoteControlService {
                     ttl_seconds: 0,
                     error_message: format!("Failed to serialize QR payload: {}", e),
                     relay_info: None,
+                    valid_until: String::new(),
                 }));
             }
         };
@@ -359,6 +389,7 @@ impl RemoteControl for RemoteControlService {
             ttl_seconds: config.security.enrollment_token_ttl as i32,
             error_message: String::new(),
             relay_info: relay_info_proto,
+            valid_until,
         }))
     }
 
@@ -592,7 +623,7 @@ impl RemoteControl for RemoteControlService {
         };
 
         let relay_info = if status == super::proto::PairingStatus::Approved as i32 {
-            self.generate_relay_info(&client_id)
+            self.generate_relay_info(&client_id, None)
         } else {
             None
         };

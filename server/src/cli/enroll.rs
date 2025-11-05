@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use std::convert::TryFrom;
 use std::net::SocketAddr;
+use std::time::Duration as StdDuration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -42,8 +44,9 @@ pub async fn handle_qr_enrollment(
         ips,
         bind_addr.port(),
         server_cert.fingerprint_display(),
-        token.token,
+        token.token.clone(),
         server_id,
+        token.expires_at,
         None,
     );
 
@@ -53,7 +56,13 @@ pub async fn handle_qr_enrollment(
     info!("Waiting for enrollment... (Press Ctrl+C to cancel)");
 
     // Wait for enrollment or timeout
-    tokio::time::sleep(tokio::time::Duration::from_secs(300)).await;
+    let now = time::OffsetDateTime::now_utc();
+    let wait_duration = if token.expires_at > now {
+        StdDuration::try_from(token.expires_at - now).unwrap_or_else(|_| StdDuration::from_secs(0))
+    } else {
+        StdDuration::from_secs(0)
+    };
+    tokio::time::sleep(wait_duration).await;
 
     info!("Enrollment session expired");
 

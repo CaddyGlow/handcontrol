@@ -7,9 +7,10 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::Path;
+use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RelayClaims {
     pub iss: String,
     pub sub: String,
@@ -101,24 +102,39 @@ impl TokenIssuer {
         &self,
         client_id: &str,
         relay_url: &str,
-        ttl_hours: u64,
+        ttl: Duration,
     ) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         tracing::debug!(
             client_id = %client_id,
             relay_url = %relay_url,
-            ttl_hours = %ttl_hours,
+            ttl_seconds = %ttl.as_secs(),
             "Generating relay JWT token"
         );
+
+        if ttl.is_zero() {
+            anyhow::bail!("Relay token TTL must be greater than zero");
+        }
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .context("System time is before UNIX_EPOCH")?
             .as_secs();
 
+        let ttl_secs = ttl.as_secs();
+        let ttl_total = if ttl.subsec_nanos() > 0 {
+            ttl_secs.saturating_add(1)
+        } else {
+            ttl_secs
+        };
+
+        if ttl_total == 0 {
+            anyhow::bail!("Relay token TTL resolved to zero seconds");
+        }
+
         let exp = now
-            .checked_add(ttl_hours * 3600)
+            .checked_add(ttl_total)
             .context("Token expiry overflow")?;
 
         let claims = RelayClaims {
@@ -135,6 +151,7 @@ impl TokenIssuer {
             server_id = %self.server_id,
             iat = %now,
             exp = %exp,
+            ttl_seconds = %ttl_total,
             "JWT claims prepared"
         );
 
@@ -177,6 +194,7 @@ impl TokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     use tempfile::TempDir;
 
     #[test]
@@ -207,12 +225,57 @@ mod tests {
         let issuer = TokenIssuer::new(server_id, &key_path).unwrap();
 
         let token = issuer
-            .generate_relay_token("test-client", "https://relay.example.com", 24)
+            .generate_relay_token(
+                "test-client",
+                "https://relay.example.com",
+                Duration::from_secs(24 * 3600),
+            )
             .unwrap();
 
         // Token should be a valid JWT (three parts separated by dots)
         let parts: Vec<&str> = token.split('.').collect();
         assert_eq!(parts.len(), 3);
+    }
+
+    #[test]
+    fn test_generate_token_respects_ttl() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_path = temp_dir.path().join("relay-key.pem");
+
+        let server_id = Uuid::new_v4();
+        let issuer = TokenIssuer::new(server_id, &key_path).unwrap();
+
+        let relay_url = "https://relay.example.com";
+        let token = issuer
+            .generate_relay_token("client", relay_url, Duration::from_secs(300))
+            .unwrap();
+
+        let pubkey_pem = issuer.public_key_pem().unwrap();
+        let decoding_key = DecodingKey::from_ed_pem(pubkey_pem.as_bytes()).unwrap();
+        let mut validation = Validation::new(Algorithm::EdDSA);
+        validation.set_audience(&[relay_url]);
+        validation.validate_exp = false;
+
+        let decoded = decode::<RelayClaims>(&token, &decoding_key, &validation).unwrap();
+        let ttl = decoded.claims.exp - decoded.claims.iat;
+        assert!((300..=301).contains(&ttl));
+    }
+
+    #[test]
+    fn test_generate_token_zero_ttl_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let key_path = temp_dir.path().join("relay-key.pem");
+
+        let server_id = Uuid::new_v4();
+        let issuer = TokenIssuer::new(server_id, &key_path).unwrap();
+
+        let result = issuer.generate_relay_token(
+            "client",
+            "https://relay.example.com",
+            Duration::from_secs(0),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

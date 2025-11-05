@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use qr2term::print_qr;
 use serde::{Deserialize, Serialize};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 /// QR code payload for enrollment
@@ -11,6 +12,7 @@ pub struct EnrollmentQrPayload {
     pub cert_fingerprint: String,
     pub enrollment_token: String,
     pub server_id: String,
+    pub valid_until: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay: Option<RelayQrInfo>,
 }
@@ -33,14 +35,20 @@ impl EnrollmentQrPayload {
         cert_fingerprint: String,
         enrollment_token: String,
         server_id: Uuid,
+        valid_until: OffsetDateTime,
         relay: Option<RelayQrInfo>,
     ) -> Self {
+        let valid_until_str = valid_until
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| valid_until.to_string());
+
         Self {
             ips,
             port,
             cert_fingerprint,
             enrollment_token,
             server_id: server_id.to_string(),
+            valid_until: valid_until_str,
             relay,
         }
     }
@@ -86,6 +94,7 @@ impl EnrollmentQrPayload {
                 println!("Relay Pinned Cert SHA256: {}", fingerprint);
             }
         }
+        println!("Valid Until: {}", self.valid_until);
         println!("\n======================================\n");
 
         Ok(())
@@ -99,12 +108,15 @@ mod tests {
     #[test]
     fn test_qr_payload_creation() {
         let server_id = Uuid::new_v4();
+        let valid_until =
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
         let payload = EnrollmentQrPayload::new(
             vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            valid_until,
             None,
         );
 
@@ -113,17 +125,21 @@ mod tests {
         assert_eq!(payload.cert_fingerprint, "SHA256:abc123");
         assert_eq!(payload.enrollment_token, "token-uuid");
         assert_eq!(payload.server_id, server_id.to_string());
+        assert_eq!(payload.valid_until, "2023-11-14T22:13:20Z");
     }
 
     #[test]
     fn test_qr_payload_json_serialization() {
         let server_id = Uuid::new_v4();
+        let valid_until =
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
         let payload = EnrollmentQrPayload::new(
             vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            valid_until,
             None,
         );
 
@@ -135,17 +151,21 @@ mod tests {
         assert!(json.contains("\"cert_fingerprint\":\"SHA256:abc123\""));
         assert!(json.contains("\"enrollment_token\":\"token-uuid\""));
         assert!(json.contains(&format!("\"server_id\":\"{}\"", server_id)));
+        assert!(json.contains("\"valid_until\":\"2023-11-14T22:13:20Z\""));
     }
 
     #[test]
     fn test_qr_payload_json_roundtrip() {
         let server_id = Uuid::new_v4();
+        let valid_until =
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
         let payload = EnrollmentQrPayload::new(
             vec!["192.168.1.100".to_string(), "10.0.0.1".to_string()],
             50051,
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            valid_until,
             None,
         );
 
@@ -157,11 +177,14 @@ mod tests {
         assert_eq!(deserialized.cert_fingerprint, payload.cert_fingerprint);
         assert_eq!(deserialized.enrollment_token, payload.enrollment_token);
         assert_eq!(deserialized.server_id, payload.server_id);
+        assert_eq!(deserialized.valid_until, payload.valid_until);
     }
 
     #[test]
     fn test_qr_payload_with_relay_info_serialization() {
         let server_id = Uuid::new_v4();
+        let valid_until =
+            OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid timestamp");
         let relay_info = RelayQrInfo {
             relay_url: "https://relay.example.com".to_string(),
             relay_token: "relay-token".to_string(),
@@ -178,6 +201,7 @@ mod tests {
             "SHA256:abc123".to_string(),
             "token-uuid".to_string(),
             server_id,
+            valid_until,
             Some(relay_info),
         );
 

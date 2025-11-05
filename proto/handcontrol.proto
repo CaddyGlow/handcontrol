@@ -63,6 +63,7 @@ message GenerateEnrollmentQRResponse {
 
   // Reserved for future relay support (optional)
   optional RelayInfo relay_info = 10;
+  string valid_until = 11;         // RFC3339 expiry timestamp for enrollment token
 }
 
 // Enrollment (Approval mode with verification code)

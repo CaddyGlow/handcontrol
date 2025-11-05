@@ -1,17 +1,20 @@
 use crate::{
     certificates::CertificatePaths,
-    grpc_client::{connect_unauthenticated, connect_unverified, persist_fingerprint},
+    grpc_client::{
+        connect_unauthenticated, connect_unauthenticated_via_relay, connect_unverified,
+        persist_fingerprint,
+    },
     storage::{RegistryRelayInfo, ServerRegistry, ServerRegistryEntry},
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use std::time::Duration;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
-use tokio::time::{sleep, Instant};
-use tonic::Request;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::time::{Instant, sleep};
+use tonic::{Request, transport::Channel};
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -153,8 +156,9 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
 
     let port = raw.port();
     let mut relay_info = raw.relay.as_ref().map(|info| relay_from_qr(info));
-
+    let mut errors: Vec<String> = Vec::new();
     let mut last_err: Option<anyhow::Error> = None;
+
     for address in addresses.iter() {
         match attempt_qr_enrollment(
             address,
@@ -167,46 +171,72 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
         .await
         {
             Ok((client_id, response_relay)) => {
-                if let Some(info) = response_relay {
-                    relay_info = Some(info);
-                }
-
-                cert_paths.write_client_credentials(&cert_pem, &key_pem)?;
-                persist_fingerprint(&cert_paths, &raw.server_cert_fingerprint)?;
-
-                let mut registry = ServerRegistry::load()?;
-                let enrolled_at = OffsetDateTime::now_utc().format(&Rfc3339).ok();
-
-                let entry = ServerRegistryEntry {
-                    id: server_id,
-                    hostname: raw.hostname.clone(),
-                    ip: Some(address.clone()),
-                    port: Some(port),
-                    enrolled_at: enrolled_at.clone(),
-                    last_seen: enrolled_at,
-                    client_id,
-                    cert_fingerprint: Some(raw.server_cert_fingerprint.clone()),
-                    cert_path: Some(cert_paths.dir.to_string_lossy().into_owned()),
-                    addresses: addresses.clone(),
-                    relay: relay_info.clone(),
-                };
-                registry.upsert(entry);
-                registry.save()?;
-
-                return Ok(QrEnrollmentOutcome {
+                return finalize_qr_enrollment(
+                    &mut relay_info,
+                    &cert_paths,
+                    &cert_pem,
+                    &key_pem,
                     server_id,
-                    client_id,
-                    addresses: addresses.clone(),
+                    raw.hostname.as_ref(),
+                    &addresses,
                     port,
-                    relay: relay_info.clone(),
-                    cert_directory: cert_paths.dir.clone(),
-                });
+                    &raw.server_cert_fingerprint,
+                    client_id,
+                    response_relay,
+                    Some(address.as_str()),
+                );
             }
             Err(err) => {
+                errors.push(format!("direct {}: {:#}", address, err));
                 last_err = Some(err);
-                continue;
             }
         }
+    }
+
+    if let Some(relay_details) = relay_info.clone() {
+        match attempt_qr_enrollment_via_relay(
+            &relay_details,
+            server_id,
+            raw.hostname.as_deref(),
+            &addresses,
+            port,
+            &raw.server_cert_fingerprint,
+            client_cert_der.clone(),
+            &device_name,
+            &raw.enrollment_token,
+        )
+        .await
+        {
+            Ok((client_id, response_relay)) => {
+                let merged_relay = response_relay.or(Some(relay_details));
+                return finalize_qr_enrollment(
+                    &mut relay_info,
+                    &cert_paths,
+                    &cert_pem,
+                    &key_pem,
+                    server_id,
+                    raw.hostname.as_ref(),
+                    &addresses,
+                    port,
+                    &raw.server_cert_fingerprint,
+                    client_id,
+                    merged_relay,
+                    addresses.first().map(|s| s.as_str()),
+                );
+            }
+            Err(err) => {
+                errors.push(format!("relay: {:#}", err));
+                last_err = Some(err);
+            }
+        }
+    }
+
+    if !errors.is_empty() {
+        bail!(
+            "All enrollment attempts failed for server {}:\n{}",
+            server_id,
+            errors.join("\n")
+        );
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("All enrollment attempts failed")))
@@ -271,35 +301,34 @@ async fn attempt_qr_enrollment(
 ) -> Result<(Option<Uuid>, Option<RegistryRelayInfo>)> {
     let mut client = connect_unauthenticated(address, port, server_fingerprint).await?;
 
-    let request = crate::proto::EnrollRequest {
-        enrollment_token: enrollment_token.to_string(),
-        client_certificate: client_cert_der,
-        device_name: device_name.to_string(),
-    };
+    complete_enrollment_request(&mut client, client_cert_der, device_name, enrollment_token).await
+}
 
-    let response = client
-        .enroll(Request::new(request))
-        .await
-        .context("Enroll RPC failed")?
-        .into_inner();
+async fn attempt_qr_enrollment_via_relay(
+    relay_info: &RegistryRelayInfo,
+    server_id: Uuid,
+    hostname: Option<&str>,
+    addresses: &[String],
+    port: u16,
+    server_fingerprint: &str,
+    client_cert_der: Vec<u8>,
+    device_name: &str,
+    enrollment_token: &str,
+) -> Result<(Option<Uuid>, Option<RegistryRelayInfo>)> {
+    let client_uuid = Uuid::parse_str(enrollment_token)
+        .context("Enrollment token must be a UUID when using relay enrollment")?;
+    let mut client = connect_unauthenticated_via_relay(
+        relay_info,
+        server_id,
+        client_uuid,
+        hostname,
+        addresses,
+        port,
+        server_fingerprint,
+    )
+    .await?;
 
-    if !response.success {
-        if !response.error_message.is_empty() {
-            bail!("Enrollment failed: {}", response.error_message);
-        }
-        bail!("Enrollment failed (unspecified error)");
-    }
-
-    let client_id = if response.client_id.is_empty() {
-        None
-    } else {
-        Some(Uuid::parse_str(&response.client_id).context("Invalid client_id returned by server")?)
-    };
-    let relay_info = response
-        .relay_info
-        .as_ref()
-        .map(|info| relay_from_proto(info));
-    Ok((client_id, relay_info))
+    complete_enrollment_request(&mut client, client_cert_der, device_name, enrollment_token).await
 }
 
 async fn attempt_approval_enrollment<F>(
@@ -472,6 +501,102 @@ where
 
         sleep(poll_interval).await;
     }
+}
+
+async fn complete_enrollment_request(
+    client: &mut crate::proto::remote_control_client::RemoteControlClient<Channel>,
+    client_cert_der: Vec<u8>,
+    device_name: &str,
+    enrollment_token: &str,
+) -> Result<(Option<Uuid>, Option<RegistryRelayInfo>)> {
+    let request = crate::proto::EnrollRequest {
+        enrollment_token: enrollment_token.to_string(),
+        client_certificate: client_cert_der,
+        device_name: device_name.to_string(),
+    };
+
+    let response = client
+        .enroll(Request::new(request))
+        .await
+        .context("Enroll RPC failed")?
+        .into_inner();
+
+    if !response.success {
+        if !response.error_message.is_empty() {
+            bail!("Enrollment failed: {}", response.error_message);
+        }
+        bail!("Enrollment failed (unspecified error)");
+    }
+
+    let client_id = if response.client_id.is_empty() {
+        None
+    } else {
+        Some(Uuid::parse_str(&response.client_id).context("Invalid client_id returned by server")?)
+    };
+    let relay_info = response
+        .relay_info
+        .as_ref()
+        .map(|info| relay_from_proto(info));
+
+    Ok((client_id, relay_info))
+}
+
+fn finalize_qr_enrollment(
+    relay_info: &mut Option<RegistryRelayInfo>,
+    cert_paths: &CertificatePaths,
+    cert_pem: &str,
+    key_pem: &str,
+    server_id: Uuid,
+    hostname: Option<&String>,
+    addresses: &[String],
+    port: u16,
+    server_fingerprint: &str,
+    client_id: Option<Uuid>,
+    new_relay: Option<RegistryRelayInfo>,
+    connected_address: Option<&str>,
+) -> Result<QrEnrollmentOutcome> {
+    if let Some(info) = new_relay {
+        *relay_info = Some(info);
+    }
+
+    cert_paths.write_client_credentials(cert_pem, key_pem)?;
+    persist_fingerprint(cert_paths, server_fingerprint)?;
+
+    let mut registry = ServerRegistry::load()?;
+    let enrolled_at = OffsetDateTime::now_utc().format(&Rfc3339).ok();
+    let ip_field = connected_address.and_then(|addr| {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let entry = ServerRegistryEntry {
+        id: server_id,
+        hostname: hostname.cloned(),
+        ip: ip_field,
+        port: Some(port),
+        enrolled_at: enrolled_at.clone(),
+        last_seen: enrolled_at,
+        client_id,
+        cert_fingerprint: Some(server_fingerprint.to_string()),
+        cert_path: Some(cert_paths.dir.to_string_lossy().into_owned()),
+        addresses: addresses.to_vec(),
+        relay: relay_info.clone(),
+    };
+    registry.upsert(entry);
+    registry.save()?;
+
+    Ok(QrEnrollmentOutcome {
+        server_id,
+        client_id,
+        addresses: addresses.to_vec(),
+        port,
+        relay: relay_info.clone(),
+        cert_directory: cert_paths.dir.clone(),
+    })
 }
 
 fn generate_client_certificate(

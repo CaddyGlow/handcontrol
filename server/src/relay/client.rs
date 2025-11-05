@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
 use tokio_tungstenite::{
     Connector, MaybeTlsStream, WebSocketStream, connect_async,
-    tungstenite::{Message, protocol::frame::Payload},
+    tungstenite::{
+        Message, client::IntoClientRequest, http::HeaderValue, protocol::frame::Payload,
+    },
 };
 use tracing::{error, info, trace, warn};
 use uuid::Uuid;
@@ -28,6 +30,7 @@ type LocalReadHalf = Box<dyn AsyncRead + Send + Unpin>;
 type LocalWriteHalf = Box<dyn AsyncWrite + Send + Unpin>;
 
 const CONTROL_PING_INTERVAL_SECS: u64 = 30;
+const RELAY_SUBPROTOCOL: &str = "handcontrol-relay.v1";
 
 #[derive(Debug, Clone, Copy)]
 struct RelayTlsOptions {
@@ -155,7 +158,7 @@ impl RelayClient {
         let (ws_stream, _) = if register_url.starts_with("wss://") {
             if let Some(connector) = build_tls_connector(tls_options)? {
                 tokio_tungstenite::connect_async_tls_with_config(
-                    &register_url,
+                    build_relay_request(&register_url)?,
                     None,
                     false,
                     Some(connector),
@@ -163,12 +166,12 @@ impl RelayClient {
                 .await
                 .context("Failed to connect to relay server")?
             } else {
-                connect_async(&register_url)
+                connect_async(build_relay_request(&register_url)?)
                     .await
                     .context("Failed to connect to relay server")?
             }
         } else {
-            connect_async(&register_url)
+            connect_async(build_relay_request(&register_url)?)
                 .await
                 .context("Failed to connect to relay server")?
         };
@@ -361,7 +364,7 @@ async fn handle_tunnel(
     let (ws_stream, _) = if tunnel_url.starts_with("wss://") {
         if let Some(connector) = build_tls_connector(tls_options)? {
             tokio_tungstenite::connect_async_tls_with_config(
-                &tunnel_url,
+                build_relay_request(&tunnel_url)?,
                 None,
                 false,
                 Some(connector),
@@ -369,12 +372,12 @@ async fn handle_tunnel(
             .await
             .context("Failed to connect to tunnel endpoint")?
         } else {
-            connect_async(&tunnel_url)
+            connect_async(build_relay_request(&tunnel_url)?)
                 .await
                 .context("Failed to connect to tunnel endpoint")?
         }
     } else {
-        connect_async(&tunnel_url)
+        connect_async(build_relay_request(&tunnel_url)?)
             .await
             .context("Failed to connect to tunnel endpoint")?
     };
@@ -454,6 +457,19 @@ async fn handle_tunnel(
 
     info!(tunnel_id = %tunnel_id, "Tunnel closed");
     Ok(())
+}
+
+fn build_relay_request(
+    url: &str,
+) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let mut request = url
+        .into_client_request()
+        .context("Failed to construct relay WebSocket request")?;
+    request.headers_mut().insert(
+        "Sec-WebSocket-Protocol",
+        HeaderValue::from_static(RELAY_SUBPROTOCOL),
+    );
+    Ok(request)
 }
 
 fn parse_pinned_cert(value: Option<&str>) -> Result<Option<[u8; 32]>> {

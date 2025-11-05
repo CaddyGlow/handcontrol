@@ -232,7 +232,10 @@ fn build_endpoints(address: &str, port: u16) -> Result<(String, SocketAddr, Serv
     Ok((uri, socket_addr, server_name))
 }
 
-fn build_uri_and_server_name(host: &str, port: u16) -> Result<(String, ServerName<'static>)> {
+pub(crate) fn build_uri_and_server_name(
+    host: &str,
+    port: u16,
+) -> Result<(String, ServerName<'static>)> {
     let domain = normalize_domain(host);
     let uri = if domain.contains(':') {
         format!("http://[{domain}]:{port}")
@@ -717,6 +720,71 @@ fn derive_relay_authority(
     }
 
     (entry.id.to_string(), None)
+}
+
+fn derive_enrollment_relay_authority(
+    tunnel_authority: Option<&str>,
+    hostname: Option<&str>,
+    addresses: &[String],
+    fallback_id: Uuid,
+) -> (String, Option<u16>) {
+    if let Some(authority) = tunnel_authority {
+        if let Ok(parsed) = authority.parse::<Authority>() {
+            return (parsed.host().to_string(), parsed.port_u16());
+        }
+    }
+
+    if let Some(host) = hostname {
+        if !host.trim().is_empty() {
+            return (host.to_string(), None);
+        }
+    }
+
+    if let Some(addr) = addresses.first() {
+        let trimmed = addr.trim();
+        if !trimmed.is_empty() {
+            return (trimmed.to_string(), None);
+        }
+    }
+
+    (fallback_id.to_string(), None)
+}
+
+/// Establish an unauthenticated relay-backed channel for enrollment flows.
+pub async fn connect_unauthenticated_via_relay(
+    relay_info: &RegistryRelayInfo,
+    server_id: Uuid,
+    client_uuid: Uuid,
+    hostname: Option<&str>,
+    addresses: &[String],
+    default_port: u16,
+    expected_fingerprint: &str,
+) -> Result<RemoteControlClient<Channel>> {
+    let tunnel = establish_relay_tunnel(relay_info, server_id, &client_uuid)
+        .await
+        .context("Failed to establish relay tunnel")?;
+
+    let (authority_host, port_override) = derive_enrollment_relay_authority(
+        tunnel.server_authority.as_deref(),
+        hostname,
+        addresses,
+        server_id,
+    );
+    let port = port_override.unwrap_or(default_port);
+    let (endpoint_uri, server_name) =
+        build_uri_and_server_name(&authority_host, port).context("Invalid relay authority")?;
+
+    let stream_holder = Arc::new(AsyncMutex::new(Some(tunnel.stream)));
+    let result = connect_channel_with_stream(
+        stream_holder,
+        endpoint_uri,
+        server_name,
+        Some(expected_fingerprint),
+        None,
+    )
+    .await?;
+
+    Ok(RemoteControlClient::new(result.channel))
 }
 
 fn normalize_domain(address: &str) -> String {

@@ -36,6 +36,8 @@ use tungstenite::protocol::frame::coding::CloseCode;
 use url::Url;
 use uuid::Uuid;
 
+const RELAY_SUBPROTOCOL: &str = "handcontrol-relay.v1";
+
 #[derive(Parser)]
 #[command(name = "handcontrol-relay")]
 struct Cli {
@@ -481,22 +483,26 @@ async fn register_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(err) = handle_register_socket(socket, state).await {
-            warn!("Register socket ended with error: {err:?}");
-        }
-    })
+    ws.protocols([RELAY_SUBPROTOCOL])
+        .on_failed_upgrade(|error| warn!("register upgrade failed: {error}"))
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = handle_register_socket(socket, state).await {
+                warn!("Register socket ended with error: {err:?}");
+            }
+        })
 }
 
 async fn connect_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        if let Err(err) = handle_connect_socket(socket, state).await {
-            warn!("Connect socket ended with error: {err:?}");
-        }
-    })
+    ws.protocols([RELAY_SUBPROTOCOL])
+        .on_failed_upgrade(|error| warn!("connect upgrade failed: {error}"))
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = handle_connect_socket(socket, state).await {
+                warn!("Connect socket ended with error: {err:?}");
+            }
+        })
 }
 
 async fn tunnel_handler(
@@ -505,19 +511,21 @@ async fn tunnel_handler(
     Query(query): Query<TunnelQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| async move {
-        match Uuid::parse_str(&tunnel_id) {
-            Ok(tunnel_uuid) => {
-                if let Err(err) =
-                    handle_tunnel_socket(socket, state.clone(), tunnel_uuid, query).await
-                {
-                    warn!("Tunnel socket error: {err:?}");
-                    state.remove_tunnel(&tunnel_uuid).await;
+    ws.protocols([RELAY_SUBPROTOCOL])
+        .on_failed_upgrade(|error| warn!("tunnel upgrade failed: {error}"))
+        .on_upgrade(move |socket| async move {
+            match Uuid::parse_str(&tunnel_id) {
+                Ok(tunnel_uuid) => {
+                    if let Err(err) =
+                        handle_tunnel_socket(socket, state.clone(), tunnel_uuid, query).await
+                    {
+                        warn!("Tunnel socket error: {err:?}");
+                        state.remove_tunnel(&tunnel_uuid).await;
+                    }
                 }
+                Err(err) => warn!("Invalid tunnel id received: {err}"),
             }
-            Err(err) => warn!("Invalid tunnel id received: {err}"),
-        }
-    })
+        })
 }
 
 #[allow(dead_code)]
@@ -1303,7 +1311,8 @@ mod tests {
     };
     use tokio_stream::wrappers::TcpListenerStream;
     use tokio_tungstenite::{
-        MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as WsMessage,
+        MaybeTlsStream, WebSocketStream, connect_async,
+        tungstenite::{Message as WsMessage, client::IntoClientRequest, http::HeaderValue},
     };
     use tonic::{
         Request, Response, Status,
@@ -1334,6 +1343,32 @@ mod tests {
     struct TestCertificate {
         pem_cert: String,
         pem_key: String,
+    }
+
+    fn ws_request(url: &str) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        let mut request = url
+            .into_client_request()
+            .expect("failed to construct websocket request");
+        request.headers_mut().insert(
+            "Sec-WebSocket-Protocol",
+            HeaderValue::from_static(RELAY_SUBPROTOCOL),
+        );
+        request
+    }
+
+    async fn connect_with_protocol(
+        url: &str,
+    ) -> tokio_tungstenite::tungstenite::Result<(
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        tokio_tungstenite::tungstenite::handshake::client::Response,
+    )> {
+        match connect_async(ws_request(url)).await {
+            Ok(pair) => Ok(pair),
+            Err(err) => {
+                eprintln!("connect_with_protocol error for {url}: {err:?}");
+                Err(err)
+            }
+        }
     }
 
     fn generate_test_certificate() -> TestCertificate {
@@ -1549,7 +1584,7 @@ mod tests {
 
         // Register server control channel
         let register_url = format!("ws://{addr}/register");
-        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (control_ws, _) = connect_with_protocol(&register_url).await.unwrap();
         let (mut control_sink, mut control_stream) = control_ws.split();
 
         let register_msg = json!({
@@ -1613,7 +1648,7 @@ mod tests {
 
         // Client connects (no server tunnel yet)
         let connect_url = format!("ws://{addr}/connect");
-        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
 
         let client_id = Uuid::new_v4();
 
@@ -1679,7 +1714,7 @@ mod tests {
             url::form_urlencoded::byte_serialize(server_secret.as_bytes()).collect();
         let server_tunnel_url =
             format!("ws://{addr}/tunnel/{tunnel_id}?role=server&token={secret_param}");
-        let (server_tunnel_ws, _) = connect_async(server_tunnel_url).await.unwrap();
+        let (server_tunnel_ws, _) = connect_with_protocol(&server_tunnel_url).await.unwrap();
         let (mut server_sink, mut server_stream) = server_tunnel_ws.split();
         let ready_msg = json!({
             "type": "tunnel_ready",
@@ -1749,7 +1784,7 @@ mod tests {
 
         // Register server
         let register_url = format!("ws://{addr}/register");
-        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (control_ws, _) = connect_with_protocol(&register_url).await.unwrap();
         let (mut control_sink, mut control_stream) = control_ws.split();
 
         let register_msg = json!({
@@ -1791,7 +1826,7 @@ mod tests {
 
         // Client connects but server never opens tunnel
         let connect_url = format!("ws://{addr}/connect");
-        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
 
         let client_id = Uuid::new_v4();
 
@@ -1879,7 +1914,7 @@ mod tests {
 
         // Register server
         let register_url = format!("ws://{addr}/register");
-        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (control_ws, _) = connect_with_protocol(&register_url).await.unwrap();
         let (mut control_sink, mut control_stream) = control_ws.split();
 
         let register_msg = json!({
@@ -1916,7 +1951,7 @@ mod tests {
 
         // Client connects with mismatched client_id
         let connect_url = format!("ws://{addr}/connect");
-        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
 
         let client_id_in_token = Uuid::new_v4();
         let mismatched_client_id = Uuid::new_v4();
@@ -1989,7 +2024,7 @@ mod tests {
 
         // Register server with relay
         let register_url = format!("ws://{relay_addr}/register");
-        let (control_ws, _) = connect_async(register_url).await.unwrap();
+        let (control_ws, _) = connect_with_protocol(&register_url).await.unwrap();
         let (mut control_sink, mut control_stream) = control_ws.split();
 
         let register_msg = json!({
@@ -2047,7 +2082,7 @@ mod tests {
 
         // Client initiates relay tunnel
         let connect_url = format!("ws://{relay_addr}/connect");
-        let (mut client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (mut client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
         let client_id = Uuid::new_v4();
 
         let now = SystemTime::now()
@@ -2106,7 +2141,7 @@ mod tests {
                 let server_tunnel_url = format!(
                     "ws://{relay_addr}/tunnel/{tunnel_id}?role=server&token={secret_param}"
                 );
-                let (mut server_ws, _) = connect_async(server_tunnel_url).await?;
+                let (mut server_ws, _) = connect_with_protocol(&server_tunnel_url).await?;
                 let ready_msg = json!({
                     "type": "tunnel_ready",
                     "tunnel_id": tunnel_id.to_string(),
@@ -2222,7 +2257,7 @@ mod tests {
             create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
 
         let connect_url = format!("{}/connect", base_ws_url);
-        let (client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
         let (mut client_sink, mut client_stream) = client_ws.split();
 
         let connect_msg = json!({
@@ -2326,7 +2361,7 @@ mod tests {
             create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
 
         let connect_url = format!("{}/connect", base_ws_url);
-        let (client_ws, _) = connect_async(connect_url).await.unwrap();
+        let (client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
         let (mut client_sink, mut client_stream) = client_ws.split();
 
         let connect_msg = json!({
@@ -2390,7 +2425,7 @@ mod tests {
         public_key_base64: String,
         control_closed_tx: oneshot::Sender<()>,
     ) -> Result<()> {
-        let (ws_stream, _) = connect_async(register_url).await?;
+        let (ws_stream, _) = connect_with_protocol(&register_url).await?;
         let (mut sink, mut stream) = ws_stream.split();
 
         let register_msg = json!({
@@ -2471,7 +2506,7 @@ mod tests {
     }
 
     async fn handle_test_server_tunnel(tunnel_url: String, tunnel_id: String) -> Result<()> {
-        let (ws_stream, _) = connect_async(tunnel_url).await?;
+        let (ws_stream, _) = connect_with_protocol(&tunnel_url).await?;
         let (mut sink, mut stream) = ws_stream.split();
 
         let ready_msg = json!({

@@ -131,6 +131,7 @@ QR enrollment currently assumes the enrolling client can reach the server over o
 - **Preferences**: Offer global connection mode preference (auto/direct-only/relay-only) to mirror CLI/TUI behaviour.
 - **Background Renewals**: WorkManager job should refresh relay token alongside certificate renewal.
 - **Error Handling**: Present human-readable errors when relay tunnel fails (expired token, TLS mismatch) and prompt to re-enroll if necessary.
+- **QR Expiry Awareness**: Parse `valid_until`, refuse expired payloads locally, and surface clear guidance to regenerate a fresh QR code.
 - **Testing**: Add instrumentation tests using mock relay + local server; cover direct failover, relay-only scenarios, token expiry.
 
 #### Future Clients (Out of Scope)

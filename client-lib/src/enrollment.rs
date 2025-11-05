@@ -33,6 +33,7 @@ pub struct QrEnrollmentOutcome {
     pub port: u16,
     pub relay: Option<RegistryRelayInfo>,
     pub cert_directory: std::path::PathBuf,
+    pub token_expiry: Option<OffsetDateTime>,
 }
 
 #[derive(Debug)]
@@ -73,6 +74,8 @@ struct RawQrPayload {
     hostname: Option<String>,
     #[serde(default)]
     relay: Option<RawQrRelayInfo>,
+    #[serde(default)]
+    valid_until: Option<String>,
 }
 
 impl RawQrPayload {
@@ -133,6 +136,23 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
     let raw: RawQrPayload = serde_json::from_str(&input.payload)
         .context("Failed to parse QR enrollment payload JSON")?;
 
+    let token_expiry = if let Some(valid_until) = raw.valid_until.as_ref() {
+        let expiry = OffsetDateTime::parse(valid_until, &Rfc3339)
+            .context("Invalid valid_until timestamp in QR payload")?;
+        Some(expiry)
+    } else {
+        None
+    };
+
+    if let Some(expiry) = token_expiry {
+        if OffsetDateTime::now_utc() >= expiry {
+            let formatted = expiry
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| expiry.to_string());
+            bail!("Enrollment QR code expired at {}", formatted);
+        }
+    }
+
     let server_id = if let Some(id) = input.override_server_id {
         id
     } else {
@@ -184,6 +204,7 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
                     client_id,
                     response_relay,
                     Some(address.as_str()),
+                    token_expiry,
                 );
             }
             Err(err) => {
@@ -222,6 +243,7 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
                     client_id,
                     merged_relay,
                     addresses.first().map(|s| s.as_str()),
+                    token_expiry,
                 );
             }
             Err(err) => {
@@ -554,6 +576,7 @@ fn finalize_qr_enrollment(
     client_id: Option<Uuid>,
     new_relay: Option<RegistryRelayInfo>,
     connected_address: Option<&str>,
+    token_expiry: Option<OffsetDateTime>,
 ) -> Result<QrEnrollmentOutcome> {
     if let Some(info) = new_relay {
         *relay_info = Some(info);
@@ -596,6 +619,7 @@ fn finalize_qr_enrollment(
         port,
         relay: relay_info.clone(),
         cert_directory: cert_paths.dir.clone(),
+        token_expiry,
     })
 }
 

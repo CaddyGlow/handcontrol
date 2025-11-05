@@ -9,12 +9,14 @@ use handcontrol_client_lib::{
     DiscoveredServer, QrEnrollmentInput,
 };
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -512,6 +514,34 @@ async fn run_enroll(command: EnrollCommand) -> Result<()> {
     }
 }
 
+fn extract_token_expiry(payload: &str) -> Result<Option<OffsetDateTime>> {
+    let value: Value = serde_json::from_str(payload)?;
+    if let Some(valid_until_value) = value.get("valid_until") {
+        let raw = valid_until_value
+            .as_str()
+            .ok_or_else(|| anyhow!("valid_until must be a string"))?;
+        let expiry = OffsetDateTime::parse(raw, &Rfc3339)
+            .context("Invalid valid_until timestamp in payload")?;
+        Ok(Some(expiry))
+    } else {
+        Ok(None)
+    }
+}
+
+fn format_remaining(duration: TimeDuration) -> String {
+    let total_seconds = duration.whole_seconds();
+    if total_seconds <= 0 {
+        return "0s".to_string();
+    }
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{}m {:02}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
+    }
+}
+
 async fn run_enroll_qr(args: QrEnrollCommand) -> Result<()> {
     let QrEnrollCommand {
         payload,
@@ -530,6 +560,23 @@ async fn run_enroll_qr(args: QrEnrollCommand) -> Result<()> {
     }
     .trim()
     .to_string();
+
+    if let Some(expiry) = extract_token_expiry(&raw_payload)? {
+        let now = OffsetDateTime::now_utc();
+        let formatted_expiry = expiry
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| expiry.to_string());
+        if expiry <= now {
+            bail!("Enrollment QR code expired at {}", formatted_expiry);
+        } else {
+            let remaining = expiry - now;
+            println!(
+                "QR token expires in {} ({} UTC)",
+                format_remaining(remaining),
+                formatted_expiry
+            );
+        }
+    }
 
     let override_server_id = if let Some(id) = server_id {
         Some(Uuid::parse_str(&id).context("Invalid UUID passed to --server-id")?)
@@ -578,6 +625,21 @@ async fn run_enroll_qr(args: QrEnrollCommand) -> Result<()> {
         }
     }
     println!("Credentials stored in {}", outcome.cert_directory.display());
+    if let Some(expiry) = outcome.token_expiry {
+        let now = OffsetDateTime::now_utc();
+        let formatted_expiry = expiry
+            .format(&Rfc3339)
+            .unwrap_or_else(|_| expiry.to_string());
+        if expiry > now {
+            println!(
+                "Original QR token expires in {} ({} UTC)",
+                format_remaining(expiry - now),
+                formatted_expiry
+            );
+        } else {
+            println!("Original QR token expired at {}", formatted_expiry);
+        }
+    }
 
     Ok(())
 }

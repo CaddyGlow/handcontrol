@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use qr2term::print_qr;
 use serde::{Deserialize, Serialize};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 /// QR code payload for enrollment
@@ -81,7 +81,34 @@ impl EnrollmentQrPayload {
 
         println!("\nPort: {}", self.port);
         println!("Server ID: {}", self.server_id);
-        println!("Token expires in 5 minutes");
+
+        let expiry_summary = match OffsetDateTime::parse(&self.valid_until, &Rfc3339) {
+            Ok(expiry) => {
+                let now = OffsetDateTime::now_utc();
+                if expiry > now {
+                    let remaining = expiry - now;
+                    let minutes = remaining.whole_minutes();
+                    let seconds = (remaining - Duration::minutes(minutes)).whole_seconds();
+                    if minutes > 0 {
+                        format!("in {}m {}s", minutes, seconds)
+                    } else {
+                        format!("in {}s", seconds)
+                    }
+                } else {
+                    let elapsed = now - expiry;
+                    let minutes = elapsed.whole_minutes();
+                    let seconds = (elapsed - Duration::minutes(minutes)).whole_seconds();
+                    if minutes > 0 {
+                        format!("expired {}m {}s ago", minutes, seconds)
+                    } else {
+                        format!("expired {}s ago", seconds)
+                    }
+                }
+            }
+            Err(_) => format!("at {}", self.valid_until),
+        };
+
+        println!("Token expires {}", expiry_summary);
         if let Some(relay) = &self.relay {
             println!("\nRelay URL: {}", relay.relay_url);
             println!("Relay Required: {}", relay.relay_required);

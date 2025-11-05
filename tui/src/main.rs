@@ -5,6 +5,7 @@ mod app {
         CommandList, CommandParameter, CommandParameterType, CommandSummary, DiscoveredServer,
     };
     use std::collections::{BTreeSet, HashMap};
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +648,7 @@ mod app {
     pub struct EnrollmentState {
         pub server: ServerItem,
         pub step: EnrollmentStep,
+        pub qr_token_expiry: Option<OffsetDateTime>,
     }
 
     #[derive(Debug, Clone)]
@@ -669,6 +671,7 @@ mod app {
     pub struct QrInputState {
         pub payload: String,
         pub cursor: usize,
+        pub error: Option<String>,
     }
 
     #[derive(Debug, Clone)]
@@ -698,9 +701,10 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use handcontrol_client_lib::{
-    config, config::DiscoveryConfig, discover_servers, enroll_via_approval, execute_command,
-    list_commands, validate_parameters, ApprovalEnrollmentInput, CommandList, CommandParameterType,
-    CommandStreamEvent, CommandSummary, DiscoveredServer, ServerRegistry, ServerRegistryEntry,
+    config, config::DiscoveryConfig, discover_servers, enroll_via_approval, enroll_via_qr,
+    execute_command, list_commands, validate_parameters, ApprovalEnrollmentInput, CommandList,
+    CommandParameterType, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
+    ServerRegistry, ServerRegistryEntry,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -710,7 +714,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
     Frame, Terminal,
 };
+use serde_json::Value;
 use std::{collections::HashMap, fs, io, time::Duration};
+use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::mpsc;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
@@ -756,11 +762,22 @@ enum CommandExecutionUpdate {
 
 #[derive(Debug)]
 enum EnrollmentTaskEvent {
-    Started { server_id: Option<Uuid> },
-    VerificationCode { code: String },
-    Progress { message: String },
-    Completed { message: String },
-    Failed { error: anyhow::Error },
+    Started {
+        server_id: Option<Uuid>,
+    },
+    VerificationCode {
+        code: String,
+    },
+    Progress {
+        message: String,
+    },
+    Completed {
+        message: String,
+        qr_token_expiry: Option<OffsetDateTime>,
+    },
+    Failed {
+        error: anyhow::Error,
+    },
 }
 
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -897,7 +914,7 @@ fn trigger_discovery(app: &mut App, event_tx: &EventSender) {
     spawn_discovery(task_tx, app.config.discovery.clone());
 }
 
-fn trigger_enrollment(app: &mut App, event_tx: &EventSender) -> Result<()> {
+fn trigger_enrollment(app: &mut App, _event_tx: &EventSender) -> Result<()> {
     if app.enrollment_in_progress {
         app.set_status_message("Enrollment already in progress");
         return Ok(());
@@ -921,20 +938,56 @@ fn trigger_enrollment(app: &mut App, event_tx: &EventSender) -> Result<()> {
         return Ok(());
     }
 
-    let addresses = server.addresses.clone();
-    let port = server.port;
-    let server_id_hint = server.id;
-    let label = server.label.clone();
-
     let overlay_state = app::EnrollmentState {
         server: server.clone(),
-        step: app::EnrollmentStep::Approval(app::ApprovalState {
-            verification_code: None,
-            status_message: "Requesting enrollment...".to_string(),
-            started: false,
-        }),
+        step: app::EnrollmentStep::MethodSelect,
+        qr_token_expiry: None,
     };
     app.overlay = Some(app::Overlay::Enrollment(overlay_state));
+    app.set_status_message(format!("Select enrollment method for {}", server.label));
+
+    Ok(())
+}
+
+fn spawn_discovery(event_tx: EventSender, discovery_config: DiscoveryConfig) {
+    tokio::spawn(async move {
+        let outcome = tokio::task::spawn_blocking(move || discover_servers(&discovery_config))
+            .await
+            .map_err(|err| anyhow!(err))
+            .and_then(|res| res);
+
+        let _ = event_tx.send(UiEvent::Task(TaskEvent::DiscoveryFinished(outcome)));
+    });
+}
+
+fn start_approval_enrollment(
+    app: &mut App,
+    event_tx: &EventSender,
+    state: &mut app::EnrollmentState,
+) -> Result<()> {
+    if app.enrollment_in_progress {
+        app.set_status_message("Enrollment already in progress");
+        return Ok(());
+    }
+
+    if state.server.addresses.is_empty() {
+        state.step = app::EnrollmentStep::Error {
+            message: "Selected server does not have any reachable addresses".to_string(),
+        };
+        return Ok(());
+    }
+
+    let addresses = state.server.addresses.clone();
+    let port = state.server.port;
+    let server_id_hint = state.server.id;
+    let label = state.server.label.clone();
+
+    state.qr_token_expiry = None;
+    state.step = app::EnrollmentStep::Approval(app::ApprovalState {
+        verification_code: None,
+        status_message: "Requesting enrollment...".to_string(),
+        started: false,
+    });
 
     let device_name = app
         .config
@@ -989,7 +1042,10 @@ fn trigger_enrollment(app: &mut App, event_tx: &EventSender) -> Result<()> {
                     "Enrollment complete for {} (server {})",
                     label, outcome.server_id
                 );
-                let event = EnrollmentTaskEvent::Completed { message };
+                let event = EnrollmentTaskEvent::Completed {
+                    message,
+                    qr_token_expiry: None,
+                };
                 let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
             }
             Err(error) => {
@@ -1002,15 +1058,71 @@ fn trigger_enrollment(app: &mut App, event_tx: &EventSender) -> Result<()> {
     Ok(())
 }
 
-fn spawn_discovery(event_tx: EventSender, discovery_config: DiscoveryConfig) {
-    tokio::spawn(async move {
-        let outcome = tokio::task::spawn_blocking(move || discover_servers(&discovery_config))
-            .await
-            .map_err(|err| anyhow!(err))
-            .and_then(|res| res);
+fn start_qr_enrollment(
+    app: &mut App,
+    event_tx: &EventSender,
+    state: &mut app::EnrollmentState,
+    payload: String,
+    token_expiry: Option<OffsetDateTime>,
+) -> Result<()> {
+    if app.enrollment_in_progress {
+        app.set_status_message("Enrollment already in progress");
+        return Ok(());
+    }
 
-        let _ = event_tx.send(UiEvent::Task(TaskEvent::DiscoveryFinished(outcome)));
+    let label = state.server.label.clone();
+    let device_name = app
+        .config
+        .device
+        .as_ref()
+        .and_then(|device| device.name.clone());
+    let device_model = app
+        .config
+        .device
+        .as_ref()
+        .and_then(|device| device.model.clone());
+    let override_server_id = state.server.id;
+
+    state.qr_token_expiry = token_expiry;
+    state.step = app::EnrollmentStep::InProgress {
+        message: "Submitting QR enrollment...".to_string(),
+    };
+
+    app.enrollment_in_progress = true;
+    app.set_status_message(format!("Submitting QR enrollment for {}", label));
+
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        let initial_expiry = token_expiry;
+        let input = QrEnrollmentInput {
+            payload,
+            override_server_id,
+            device_name,
+            device_model,
+        };
+
+        let result = enroll_via_qr(input).await;
+        match result {
+            Ok(outcome) => {
+                let message = format!(
+                    "Enrollment complete for {} (server {})",
+                    label, outcome.server_id
+                );
+                let expiry = outcome.token_expiry.or(initial_expiry);
+                let event = EnrollmentTaskEvent::Completed {
+                    message,
+                    qr_token_expiry: expiry,
+                };
+                let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
+            }
+            Err(error) => {
+                let event = EnrollmentTaskEvent::Failed { error };
+                let _ = tx.send(UiEvent::Task(TaskEvent::Enrollment(event)));
+            }
+        }
     });
+
+    Ok(())
 }
 
 fn spawn_load_commands(event_tx: EventSender, entry: ServerRegistryEntry) {
@@ -1475,9 +1587,15 @@ fn handle_task_event(event: TaskEvent, app: &mut App) -> Result<()> {
                 }
                 app.set_status_message(message);
             }
-            EnrollmentTaskEvent::Completed { message } => {
+            EnrollmentTaskEvent::Completed {
+                message,
+                qr_token_expiry,
+            } => {
                 app.enrollment_in_progress = false;
                 if let Some(app::Overlay::Enrollment(state)) = app.overlay.as_mut() {
+                    if let Some(expiry) = qr_token_expiry {
+                        state.qr_token_expiry = Some(expiry);
+                    }
                     state.step = app::EnrollmentStep::Completed {
                         message: message.clone(),
                     };
@@ -1486,7 +1604,7 @@ fn handle_task_event(event: TaskEvent, app: &mut App) -> Result<()> {
                     Ok(registry) => {
                         app.registry = registry;
                         app.rebuild_servers();
-                        app.set_status_message(message);
+                        app.set_status_message(message.clone());
                     }
                     Err(err) => {
                         tracing::error!(
@@ -1546,7 +1664,9 @@ fn handle_overlay_value(
                 )),
             }
         }
-        app::Overlay::Enrollment(state) => handle_enrollment_overlay_event(key, app, state),
+        app::Overlay::Enrollment(state) => {
+            handle_enrollment_overlay_event(key, app, state, event_tx)
+        }
         app::Overlay::Prompt(state) => handle_prompt_overlay_event(key, app, state),
         app::Overlay::Help => {
             if key.code == KeyCode::Esc || key.code == KeyCode::Char('q') {
@@ -1672,9 +1792,11 @@ fn handle_execution_overlay_key(
 
 fn handle_enrollment_overlay_event(
     key: KeyEvent,
-    _app: &mut App,
+    app: &mut App,
     state: app::EnrollmentState,
+    event_tx: &EventSender,
 ) -> Result<OverlayHandlerResult> {
+    let mut state = state;
     let normalized = if key.modifiers.contains(KeyModifiers::SHIFT) {
         match key.code {
             KeyCode::Char(c) => KeyCode::Char(c.to_ascii_lowercase()),
@@ -1684,23 +1806,200 @@ fn handle_enrollment_overlay_event(
         key.code
     };
 
-    match normalized {
-        KeyCode::Esc => Ok(OverlayHandlerResult::Close),
-        KeyCode::Enter => {
-            if matches!(
-                state.step,
-                app::EnrollmentStep::Completed { .. } | app::EnrollmentStep::Error { .. }
-            ) {
-                Ok(OverlayHandlerResult::Close)
-            } else {
+    match &mut state.step {
+        app::EnrollmentStep::MethodSelect => match normalized {
+            KeyCode::Char('a') => {
+                if let Err(err) = start_approval_enrollment(app, event_tx, &mut state) {
+                    state.step = app::EnrollmentStep::Error {
+                        message: format!("Unable to start approval enrollment: {err}"),
+                    };
+                    app.enrollment_in_progress = false;
+                    app.set_status_message(format!("Unable to start enrollment: {err}"));
+                }
                 Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
                     state,
                 )))
             }
+            KeyCode::Char('q') => {
+                state.qr_token_expiry = None;
+                state.step = app::EnrollmentStep::QrInput(app::QrInputState {
+                    payload: String::new(),
+                    cursor: 0,
+                    error: None,
+                });
+                app.set_status_message(format!(
+                    "Paste QR payload for {} and press Enter",
+                    state.server.label
+                ));
+                Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                    state,
+                )))
+            }
+            KeyCode::Esc => Ok(OverlayHandlerResult::Close),
+            _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                state,
+            ))),
+        },
+        app::EnrollmentStep::QrInput(ref mut qr_state) => {
+            let len = qr_state.payload.chars().count();
+            match key.code {
+                KeyCode::Esc => Ok(OverlayHandlerResult::Close),
+                KeyCode::Enter => {
+                    let payload = qr_state.payload.trim().to_string();
+                    if payload.is_empty() {
+                        qr_state.error =
+                            Some("Paste a QR enrollment payload before submitting".to_string());
+                        return Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                            state,
+                        )));
+                    }
+                    match extract_token_expiry(&payload) {
+                        Ok(expiry_opt) => {
+                            if let Some(expiry) = expiry_opt {
+                                let now = OffsetDateTime::now_utc();
+                                if expiry <= now {
+                                    let formatted = expiry
+                                        .format(&Rfc3339)
+                                        .unwrap_or_else(|_| expiry.to_string());
+                                    qr_state.error =
+                                        Some(format!("QR token expired at {} UTC", formatted));
+                                    return Ok(OverlayHandlerResult::Continue(
+                                        app::Overlay::Enrollment(state),
+                                    ));
+                                }
+                            }
+                            if let Err(err) =
+                                start_qr_enrollment(app, event_tx, &mut state, payload, expiry_opt)
+                            {
+                                state.step = app::EnrollmentStep::Error {
+                                    message: format!("Unable to start QR enrollment: {err}"),
+                                };
+                                app.enrollment_in_progress = false;
+                                app.set_status_message(format!(
+                                    "Unable to start QR enrollment: {err}"
+                                ));
+                            }
+                            Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                                state,
+                            )))
+                        }
+                        Err(err) => {
+                            qr_state.error = Some(format!("Failed to parse QR payload: {err:#}"));
+                            Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                                state,
+                            )))
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if qr_state.cursor > 0 {
+                        let remove_index = qr_state.cursor - 1;
+                        if remove_char_at(&mut qr_state.payload, remove_index) {
+                            qr_state.cursor = remove_index;
+                        }
+                    }
+                    qr_state.error = None;
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::Delete => {
+                    if remove_char_at(&mut qr_state.payload, qr_state.cursor) {
+                        qr_state.error = None;
+                    }
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::Left => {
+                    if qr_state.cursor > 0 {
+                        qr_state.cursor -= 1;
+                    }
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::Right => {
+                    if qr_state.cursor < len {
+                        qr_state.cursor += 1;
+                    }
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::Home => {
+                    qr_state.cursor = 0;
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::End => {
+                    qr_state.cursor = len;
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    insert_char_at(&mut qr_state.payload, qr_state.cursor, c);
+                    qr_state.cursor += 1;
+                    qr_state.error = None;
+                    Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                        state,
+                    )))
+                }
+                _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                    state,
+                ))),
+            }
         }
-        _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
-            state,
-        ))),
+        app::EnrollmentStep::Approval(_) | app::EnrollmentStep::InProgress { .. } => {
+            match normalized {
+                KeyCode::Esc => Ok(OverlayHandlerResult::Close),
+                _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                    state,
+                ))),
+            }
+        }
+        app::EnrollmentStep::Completed { .. } | app::EnrollmentStep::Error { .. } => {
+            match normalized {
+                KeyCode::Esc | KeyCode::Enter => Ok(OverlayHandlerResult::Close),
+                _ => Ok(OverlayHandlerResult::Continue(app::Overlay::Enrollment(
+                    state,
+                ))),
+            }
+        }
+    }
+}
+
+fn extract_token_expiry(payload: &str) -> Result<Option<OffsetDateTime>> {
+    let value: Value = serde_json::from_str(payload)?;
+    if let Some(valid_until_value) = value.get("valid_until") {
+        let raw = valid_until_value
+            .as_str()
+            .ok_or_else(|| anyhow!("valid_until must be a string"))?;
+        let expiry = OffsetDateTime::parse(raw, &Rfc3339)
+            .context("Invalid valid_until timestamp in payload")?;
+        Ok(Some(expiry))
+    } else {
+        Ok(None)
+    }
+}
+
+fn format_remaining(duration: TimeDuration) -> String {
+    let total_seconds = duration.whole_seconds();
+    if total_seconds <= 0 {
+        return "0s".to_string();
+    }
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    if minutes > 0 {
+        format!("{}m {:02}s", minutes, seconds)
+    } else {
+        format!("{}s", seconds)
     }
 }
 
@@ -2718,6 +3017,7 @@ fn render_overlay(frame: &mut Frame<'_>, content_area: Rect, app: &App) {
                     .split(inner);
 
                 let mut lines: Vec<Line> = Vec::new();
+                let mut alignment = Alignment::Center;
                 lines.push(Line::from(vec![Span::styled(
                     state.server.label.clone(),
                     Style::default().add_modifier(Modifier::BOLD),
@@ -2725,6 +3025,48 @@ fn render_overlay(frame: &mut Frame<'_>, content_area: Rect, app: &App) {
                 lines.push(Line::from(""));
 
                 let instructions = match &state.step {
+                    app::EnrollmentStep::MethodSelect => {
+                        lines.push(Line::from("Choose how to enroll this device:"));
+                        lines.push(Line::from(""));
+                        lines.push(Line::from(vec![Span::styled(
+                            "[A] Approval code (requires server interaction)",
+                            Style::default().fg(Color::Gray),
+                        )]));
+                        lines.push(Line::from(vec![Span::styled(
+                            "[Q] Paste QR payload (from server UI)",
+                            Style::default().fg(Color::Gray),
+                        )]));
+                        "[a] Approval · [q] Paste QR · [Esc] Cancel"
+                    }
+                    app::EnrollmentStep::QrInput(qr_state) => {
+                        alignment = Alignment::Left;
+                        lines.push(Line::from(Span::styled(
+                            "Paste QR enrollment JSON and press Enter to submit.",
+                            Style::default().fg(Color::Gray),
+                        )));
+                        lines.push(Line::from(""));
+                        if qr_state.payload.is_empty() {
+                            lines.push(Line::from(Span::styled(
+                                "[payload empty]",
+                                Style::default().fg(Color::DarkGray),
+                            )));
+                        } else {
+                            let display = format_text_with_cursor(
+                                &qr_state.payload,
+                                true,
+                                Some(qr_state.cursor),
+                            );
+                            lines.push(Line::from(display));
+                        }
+                        if let Some(error) = &qr_state.error {
+                            lines.push(Line::from(""));
+                            lines.push(Line::from(Span::styled(
+                                error.clone(),
+                                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                            )));
+                        }
+                        "[Enter] Submit · [Esc] Cancel"
+                    }
                     app::EnrollmentStep::Approval(approval) => {
                         lines.push(Line::from(Span::styled(
                             approval.status_message.clone(),
@@ -2765,16 +3107,34 @@ fn render_overlay(frame: &mut Frame<'_>, content_area: Rect, app: &App) {
                         )));
                         "Press Enter or Esc to close"
                     }
-                    other => {
-                        lines.push(Line::from(Span::styled(
-                            format!("{other:?}"),
-                            Style::default().fg(Color::Gray),
-                        )));
-                        "Esc hides overlay"
-                    }
                 };
 
-                let body = Paragraph::new(lines).alignment(Alignment::Center);
+                if let Some(expiry) = state.qr_token_expiry {
+                    let now = OffsetDateTime::now_utc();
+                    let formatted = expiry
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| expiry.to_string());
+                    let (text, color) = if expiry > now {
+                        let remaining = expiry - now;
+                        (
+                            format!(
+                                "QR token expires in {} ({} UTC)",
+                                format_remaining(remaining),
+                                formatted
+                            ),
+                            Color::Yellow,
+                        )
+                    } else {
+                        (format!("QR token expired at {} UTC", formatted), Color::Red)
+                    };
+                    lines.push(Line::from(""));
+                    lines.push(Line::from(Span::styled(
+                        text,
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    )));
+                }
+
+                let body = Paragraph::new(lines).alignment(alignment);
                 frame.render_widget(body, chunks[0]);
                 frame.render_widget(
                     Paragraph::new(instructions).style(Style::default().fg(Color::Gray)),

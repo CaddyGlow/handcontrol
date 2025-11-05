@@ -8,7 +8,9 @@ anyhow = { workspace = true }
 crossterm = { workspace = true }
 handcontrol-client-lib = { path = "../client-lib" }
 ratatui = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+time = { workspace = true }
 uuid = { workspace = true }

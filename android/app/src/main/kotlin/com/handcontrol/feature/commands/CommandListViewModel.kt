@@ -399,6 +399,26 @@ class CommandListViewModel @Inject constructor(
         }
     }
 
+    fun triggerQuickCommand(
+        command: Command,
+        parameters: Map<String, String> = emptyMap(),
+        showOutputOverride: Boolean? = null
+    ) {
+        val showOutput = showOutputOverride ?: command.showOutput
+        if (!showOutput) {
+            viewModelScope.launch {
+                _toastMessage.emit("${command.name} sent")
+            }
+        }
+
+        executeCommandWithMode(
+            commandId = command.id,
+            commandName = command.name,
+            parameters = parameters,
+            showOutput = showOutput
+        )
+    }
+
     override fun onCleared() {
         super.onCleared()
         telemetryJobs.values.forEach { it.cancel() }

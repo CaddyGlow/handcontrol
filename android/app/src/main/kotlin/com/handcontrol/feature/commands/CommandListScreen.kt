@@ -232,11 +232,9 @@ fun CommandListScreen(
                                             showConfirmationDialog = true
                                         }
                                         else -> {
-                                            viewModel.executeCommandWithMode(
-                                                commandId = command.id,
-                                                commandName = command.name,
-                                                parameters = emptyMap(),
-                                                showOutput = action.showOutput
+                                            viewModel.triggerQuickCommand(
+                                                command = command,
+                                                showOutputOverride = action.showOutput
                                             )
                                             if (action.showOutput) {
                                                 onNavigateToCommandExecution(serverId, command.id)
@@ -474,12 +472,7 @@ private fun handleCommandClick(
         }
         // No parameters, no confirmation - immediate execution
         else -> {
-            viewModel.executeCommandWithMode(
-                commandId = command.id,
-                commandName = command.name,
-                parameters = emptyMap(),
-                showOutput = command.showOutput
-            )
+            viewModel.triggerQuickCommand(command)
             if (command.showOutput) {
                 onNavigateToExecution()
             }

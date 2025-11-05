@@ -158,7 +158,7 @@ fun CommandExecutionScreen(
                                 commandName = cmd.name,
                                 commandDescription = cmd.description,
                                 onExecute = {
-                                    viewModel.executeCommand(commandId, cmd.name, emptyMap())
+                                    viewModel.triggerQuickCommand(cmd)
                                 }
                             )
                         } else {
@@ -202,7 +202,7 @@ fun CommandExecutionScreen(
                                 },
                                 onExecute = {
                                     val params = parameterStates.mapValues { it.value.currentValue }
-                                    viewModel.executeCommand(commandId, cmd.name, params)
+                                    viewModel.triggerQuickCommand(cmd, params)
                                 },
                                 canExecute = isFormValid
                             )

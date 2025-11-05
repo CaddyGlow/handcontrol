@@ -164,7 +164,11 @@ class ServerConnectionManager @Inject constructor(
             val channel = try {
                 Timber.d("Direct connection attempt ${index + 1}/${ipAddresses.size} to $ip:${server.serverPort}")
                 withTimeout(timeoutMs) {
-                    directChannelFactory.createChannel(ip, server.serverPort)
+                    directChannelFactory.createChannel(
+                        host = ip,
+                        port = server.serverPort,
+                        expectedFingerprint = server.certFingerprint
+                    )
                 }
             } catch (e: Exception) {
                 Timber.d("Direct connection to $ip failed during channel creation: ${e.message}")
@@ -271,9 +275,30 @@ class ServerConnectionManager @Inject constructor(
             }
         }
 
-        reusedConnection?.let {
+        reusedConnection?.let { cachedResult ->
             Timber.d("Reusing cached relay connection for ${server.serverName}")
-            return it
+
+            val channelReady = try {
+                awaitChannelReady(cachedResult.channel, DEFAULT_DIRECT_CONNECT_TIMEOUT_MS)
+            } catch (e: Exception) {
+                Timber.d(e, "Cached relay channel readiness check failed")
+                false
+            }
+
+            if (channelReady) {
+                return cachedResult
+            }
+
+            Timber.w("Cached relay connection for ${server.serverName} is not ready; dropping and reconnecting")
+            relayLock.withLock {
+                cachedRelayConnections.remove(server.serverId)
+            }
+
+            try {
+                relayChannelFactory.shutdownChannel(cachedResult.channel)
+            } catch (e: Exception) {
+                Timber.d(e, "Error while shutting down stale relay channel")
+            }
         }
 
         try {
@@ -285,7 +310,8 @@ class ServerConnectionManager @Inject constructor(
                     serverId = server.serverId,
                     relayToken = server.relayToken,
                     clientId = server.clientId,
-                    defaultAuthority = defaultRelayAuthority(server)
+                    defaultAuthority = defaultRelayAuthority(server),
+                    expectedFingerprint = server.certFingerprint
                 )
             }
 

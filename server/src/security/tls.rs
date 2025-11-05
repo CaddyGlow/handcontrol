@@ -209,7 +209,6 @@ pub fn build_server_config(
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(cert_chain, private_key)
         .context("Failed to build server config with certificate")?;
-
     info!("mTLS server configuration ready");
 
     Ok(config)
@@ -227,11 +226,11 @@ pub fn build_server_config_no_client_auth(server_cert: &ServerCertificate) -> Re
         .map_err(|e| anyhow::anyhow!("Failed to parse private key: {}", e))?;
 
     // Build ServerConfig without client cert verification
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
         .context("Failed to build server config with certificate")?;
-
+    config.alpn_protocols.push(b"h2".to_vec());
     info!("TLS server configuration ready (no client auth)");
     Ok(config)
 }

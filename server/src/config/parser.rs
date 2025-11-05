@@ -34,6 +34,8 @@ pub struct SecurityConfig {
     pub authorized_clients_dir: Option<String>,
     #[serde(default = "default_enrollment_token_ttl")]
     pub enrollment_token_ttl: u64,
+    #[serde(default = "default_require_client_cert")]
+    pub require_client_cert: bool,
     #[serde(default)]
     pub enrollment: EnrollmentConfig,
 }
@@ -189,6 +191,10 @@ fn default_mdns_service_name() -> String {
 
 fn default_enrollment_token_ttl() -> u64 {
     300 // 5 minutes
+}
+
+fn default_require_client_cert() -> bool {
+    false
 }
 
 fn default_true() -> bool {

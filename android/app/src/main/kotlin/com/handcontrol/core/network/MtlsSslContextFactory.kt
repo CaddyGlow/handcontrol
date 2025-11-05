@@ -5,6 +5,7 @@ import com.handcontrol.core.security.VerificationCodeGenerator
 import timber.log.Timber
 import java.security.KeyStore
 import java.security.cert.X509Certificate
+import java.util.Locale
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
@@ -12,10 +13,14 @@ import javax.net.ssl.X509TrustManager
 object MtlsSslContextFactory {
     suspend fun createSslContext(
         certificateManager: ClientCertificateManager,
+        expectedFingerprint: String?,
         onServerCertificate: ((X509Certificate) -> Unit)? = null
     ): SSLContext {
         certificateManager.loadOrCreate()
-        val pinnedFingerprint = certificateManager.getPinnedServerFingerprint()
+        val normalizedExpectedFingerprint = expectedFingerprint
+            ?.takeIf { it.isNotBlank() }
+            ?.removePrefix("SHA256:")
+            ?.lowercase(Locale.US)
 
         val trustManager = object : X509TrustManager {
             override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {
@@ -30,21 +35,25 @@ object MtlsSslContextFactory {
                 val serverCert = chain[0]
                 onServerCertificate?.invoke(serverCert)
 
-                if (pinnedFingerprint != null) {
-                    val currentFingerprint = VerificationCodeGenerator.computeFingerprint(
-                        serverCert.encoded
-                    )
-                    if (currentFingerprint != pinnedFingerprint) {
+                val currentFingerprint = VerificationCodeGenerator.computeFingerprint(
+                    serverCert.encoded
+                )
+                val normalizedCurrent = currentFingerprint
+                    .removePrefix("SHA256:")
+                    .lowercase(Locale.US)
+
+                if (normalizedExpectedFingerprint != null) {
+                    if (normalizedCurrent != normalizedExpectedFingerprint) {
                         Timber.e("Server certificate fingerprint mismatch!")
-                        Timber.e("Expected: $pinnedFingerprint")
+                        Timber.e("Expected: ${expectedFingerprint ?: "unknown"}")
                         Timber.e("Got: $currentFingerprint")
                         throw javax.net.ssl.SSLException(
-                            "Server certificate fingerprint does not match pinned value"
+                            "Server certificate fingerprint does not match expected value"
                         )
                     }
                     Timber.d("Server certificate fingerprint verified")
                 } else {
-                    Timber.w("No pinned server certificate - first connection")
+                    Timber.w("No expected server certificate fingerprint provided; skipping pin validation")
                 }
 
                 try {

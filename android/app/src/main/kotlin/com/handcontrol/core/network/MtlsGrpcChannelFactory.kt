@@ -20,14 +20,21 @@ class MtlsGrpcChannelFactory @Inject constructor(
     private val activeChannels = mutableSetOf<ManagedChannel>()
     private var lastServerCertificate: X509Certificate? = null
 
-    override suspend fun createChannel(host: String, port: Int): ManagedChannel = withContext(Dispatchers.IO) {
+    override suspend fun createChannel(
+        host: String,
+        port: Int,
+        expectedFingerprint: String?
+    ): ManagedChannel = withContext(Dispatchers.IO) {
         // Remove brackets from IPv6 addresses if present (forAddress handles raw IPv6)
         val cleanHost = host.trimStart('[').trimEnd(']')
         val isIpv6 = cleanHost.contains(':')
 
         Timber.i("Creating mTLS gRPC channel to ${if (isIpv6) "[$cleanHost]" else cleanHost}:$port (IPv6: $isIpv6)")
 
-        val sslContext = MtlsSslContextFactory.createSslContext(certificateManager) { cert ->
+        val sslContext = MtlsSslContextFactory.createSslContext(
+            certificateManager = certificateManager,
+            expectedFingerprint = expectedFingerprint
+        ) { cert ->
             lastServerCertificate = cert
         }
 
@@ -53,6 +60,9 @@ class MtlsGrpcChannelFactory @Inject constructor(
         Timber.d("gRPC channel created successfully for $cleanHost")
         channel
     }
+
+    suspend fun createChannel(host: String, port: Int): ManagedChannel =
+        createChannel(host, port, null)
 
     override suspend fun shutdownChannel(channel: ManagedChannel) = withContext(Dispatchers.IO) {
         Timber.i("Shutting down gRPC channel")

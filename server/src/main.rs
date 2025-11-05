@@ -453,6 +453,15 @@ async fn start_handcontrol_server() -> Result<()> {
         "Enrollment modes: QR={}, Approval={}",
         config.security.enrollment.qr_code_enabled, config.security.enrollment.approval_enabled
     );
+    let require_client_cert = config.security.require_client_cert;
+    info!(
+        "Client certificate requirement: {}",
+        if require_client_cert {
+            "enabled"
+        } else {
+            "disabled (legacy mode)"
+        }
+    );
 
     // Initialize server certificate (Phase 2)
     info!("Initializing server certificate...");
@@ -636,7 +645,7 @@ async fn start_handcontrol_server() -> Result<()> {
 
     // Start gRPC server with TLS
     info!("Starting gRPC server with TLS...");
-    start_server(addr, service, server_cert.clone())
+    start_server(addr, service, server_cert.clone(), require_client_cert)
         .await
         .context("gRPC server failed")?;
 

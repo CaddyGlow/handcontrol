@@ -10,6 +10,7 @@ import io.grpc.NameResolver
 import io.grpc.NameResolver.ResolutionResult
 import io.grpc.Status
 import io.grpc.okhttp.OkHttpChannelBuilder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,6 +25,7 @@ import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketAddress
+import java.net.SocketException
 import java.net.URI
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
@@ -55,7 +57,8 @@ class RelayGrpcChannelFactory @Inject constructor(
         serverId: String,
         relayToken: String,
         clientId: String,
-        defaultAuthority: String
+        defaultAuthority: String,
+        expectedFingerprint: String? = null
     ): ManagedChannel = withContext(Dispatchers.IO) {
         Timber.i("Creating gRPC channel via relay for server $serverId")
 
@@ -96,7 +99,11 @@ class RelayGrpcChannelFactory @Inject constructor(
 
         Timber.d("Relay authority host resolved to '$authorityHost'; installing loopback resolver")
 
-        val channel = createMtlsChannel(authority = authority, loopbackPort = bridge.localPort)
+        val channel = createMtlsChannel(
+            authority = authority,
+            loopbackPort = bridge.localPort,
+            expectedFingerprint = expectedFingerprint
+        )
 
         activeBridges[channel] = bridge
         Timber.i("Relay gRPC channel created successfully")
@@ -207,10 +214,16 @@ class RelayGrpcChannelFactory @Inject constructor(
                         tunnel.sendData(data)
                     }
                 } catch (e: IOException) {
-                    if (tunnel.isHealthy()) {
-                        Timber.d("Socket read error: ${e.message}")
-                    } else {
-                        Timber.w("Socket read error (tunnel unhealthy): ${e.message}")
+                    when {
+                        e.isExpectedSocketClosure() -> {
+                            Timber.d("Socket read completed: ${e.message ?: "closed"}")
+                        }
+                        tunnel.isHealthy() -> {
+                            Timber.d("Socket read error: ${e.message}")
+                        }
+                        else -> {
+                            Timber.w("Socket read error (tunnel unhealthy): ${e.message}")
+                        }
                     }
                 } catch (e: Exception) {
                     Timber.e(e, "Error forwarding socket → tunnel")
@@ -226,10 +239,16 @@ class RelayGrpcChannelFactory @Inject constructor(
                     }
                     Timber.d("Tunnel incoming channel closed")
                 } catch (e: IOException) {
-                    if (tunnel.isHealthy()) {
-                        Timber.d("Socket write error: ${e.message}")
-                    } else {
-                        Timber.w("Socket write error (tunnel unhealthy): ${e.message}")
+                    when {
+                        e.isExpectedSocketClosure() -> {
+                            Timber.d("Socket write completed: ${e.message ?: "closed"}")
+                        }
+                        tunnel.isHealthy() -> {
+                            Timber.d("Socket write error: ${e.message}")
+                        }
+                        else -> {
+                            Timber.w("Socket write error (tunnel unhealthy): ${e.message}")
+                        }
                     }
                 } catch (e: Exception) {
                     Timber.e(e, "Error forwarding tunnel → socket")
@@ -237,9 +256,20 @@ class RelayGrpcChannelFactory @Inject constructor(
             }
 
             // Wait for both jobs to complete
-            sendJob.join()
-            receiveJob.join()
-
+            try {
+                sendJob.join()
+                receiveJob.join()
+            } catch (_: CancellationException) {
+                Timber.d("Socket bridge cancelled for ${socket.remoteSocketAddress}")
+            }
+        } catch (_: CancellationException) {
+            Timber.d("Socket bridge cancelled for ${socket.remoteSocketAddress}")
+        } catch (e: IOException) {
+            if (!e.isExpectedSocketClosure()) {
+                Timber.e(e, "Error in socket bridge")
+            } else {
+                Timber.d("Socket bridge closed: ${e.message ?: "socket closed"}")
+            }
         } catch (e: Exception) {
             Timber.e(e, "Error in socket bridge")
         } finally {
@@ -256,9 +286,13 @@ class RelayGrpcChannelFactory @Inject constructor(
      */
     private suspend fun createMtlsChannel(
         authority: String,
-        loopbackPort: Int
+        loopbackPort: Int,
+        expectedFingerprint: String?
     ): ManagedChannel {
-        val sslContext = MtlsSslContextFactory.createSslContext(certificateManager)
+        val sslContext = MtlsSslContextFactory.createSslContext(
+            certificateManager = certificateManager,
+            expectedFingerprint = expectedFingerprint
+        )
 
         val builder = OkHttpChannelBuilder
             .forTarget("loopback:///$authority")
@@ -341,6 +375,14 @@ private class LoopbackNameResolver(
     override fun shutdown() {
         // Nothing to release.
     }
+}
+
+private fun IOException.isExpectedSocketClosure(): Boolean {
+    val messageText = message?.lowercase() ?: return false
+    return messageText.contains("socket closed") ||
+        messageText.contains("software caused connection abort") ||
+        messageText.contains("connection reset") ||
+        messageText.contains("broken pipe")
 }
 
 /**

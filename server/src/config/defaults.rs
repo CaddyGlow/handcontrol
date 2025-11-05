@@ -21,6 +21,7 @@ pub fn generate_default_config() -> Result<Config> {
             key_path: None,
             authorized_clients_dir: None,
             enrollment_token_ttl: 300,
+            require_client_cert: false,
             enrollment: EnrollmentConfig {
                 qr_code_enabled: true,
                 approval_enabled: true,

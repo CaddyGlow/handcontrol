@@ -30,7 +30,7 @@ use crate::notifications::NotificationManager;
 use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
 use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
-use crate::security::tls::build_permissive_server_config;
+use crate::security::tls::{build_permissive_server_config, build_server_config_no_client_auth};
 use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
 use crate::storage::clients::ClientStore;
@@ -106,10 +106,20 @@ impl RemoteControlService {
     }
 
     /// Ensure the incoming request is associated with an enrolled TLS client certificate.
-    fn ensure_enrolled_client<T>(&self, request: &Request<T>) -> Result<String, Status> {
-        let certs = request
-            .peer_certs()
-            .ok_or_else(|| Status::unauthenticated("Client TLS certificate required"))?;
+    fn ensure_enrolled_client<T>(&self, request: &Request<T>) -> Result<Option<String>, Status> {
+        let require_cert = self.config.read().unwrap().security.require_client_cert;
+
+        let certs = match request.peer_certs() {
+            Some(certs) if !certs.is_empty() => certs,
+            _ => {
+                if require_cert {
+                    return Err(Status::unauthenticated("Client TLS certificate required"));
+                } else {
+                    warn!("Legacy client connected without presenting a TLS certificate");
+                    return Ok(None);
+                }
+            }
+        };
 
         let certificate = certs
             .first()
@@ -120,11 +130,17 @@ impl RemoteControlService {
 
         let client_store = self.client_store.lock().unwrap();
         if client_store.is_authorized(&fingerprint_hex) {
-            Ok(fingerprint_hex)
-        } else {
+            Ok(Some(fingerprint_hex))
+        } else if require_cert {
             Err(Status::permission_denied(
                 "Client certificate is not enrolled on this server",
             ))
+        } else {
+            warn!(
+                "Legacy client presented unrecognized certificate fingerprint={}",
+                fingerprint_hex
+            );
+            Ok(None)
         }
     }
 }
@@ -608,7 +624,7 @@ impl RemoteControl for RemoteControlService {
                 .as_ref()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            fingerprint
+            fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
         );
 
         let result = {
@@ -652,7 +668,7 @@ impl RemoteControl for RemoteControlService {
     ) -> Result<Response<ListPendingPairingsResponse>, Status> {
         info!("ListPendingPairings RPC called");
 
-        self.ensure_enrolled_client(&request)?;
+        let _ = self.ensure_enrolled_client(&request)?;
 
         let pending_requests = self.pairing_manager.list_pending();
 
@@ -737,7 +753,7 @@ impl RemoteControl for RemoteControlService {
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
-        self.ensure_enrolled_client(&request)?;
+        let _ = self.ensure_enrolled_client(&request)?;
 
         // Read config once and use it throughout
         let config = self.config.read().unwrap();
@@ -826,7 +842,7 @@ impl RemoteControl for RemoteControlService {
                 .as_ref()
                 .map(|ip| ip.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            fingerprint
+            fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
         );
 
         // Read config and find command
@@ -972,7 +988,7 @@ impl RemoteControl for RemoteControlService {
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
-        self.ensure_enrolled_client(&request)?;
+        let _ = self.ensure_enrolled_client(&request)?;
 
         let config_version = self.config_version.load(Ordering::SeqCst);
         let last_updated_ms = self.last_config_update.load(Ordering::SeqCst) as i64;
@@ -1009,7 +1025,7 @@ impl RemoteControl for RemoteControlService {
                 .unwrap_or_else(|| "unknown".to_string())
         );
 
-        self.ensure_enrolled_client(&request)?;
+        let _ = self.ensure_enrolled_client(&request)?;
 
         // Subscribe to config updates
         let mut rx = self.config_broadcaster.subscribe();
@@ -1056,11 +1072,17 @@ pub async fn start_server(
     addr: SocketAddr,
     service: RemoteControlService,
     server_cert: Arc<ServerCertificate>,
+    require_client_cert: bool,
 ) -> Result<()> {
     info!("Starting gRPC server with TLS on {}", addr);
 
-    let tls_config = build_permissive_server_config(&server_cert)
-        .context("Failed to build TLS server configuration")?;
+    let tls_config = if require_client_cert {
+        build_permissive_server_config(&server_cert)
+            .context("Failed to build TLS server configuration")?
+    } else {
+        build_server_config_no_client_auth(&server_cert)
+            .context("Failed to build TLS server configuration")?
+    };
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let std_listener =
@@ -1209,7 +1231,7 @@ mod tests {
                 show_output: true,
             };
 
-            let config = Config {
+            let mut config = Config {
                 server: ServerConfig {
                     port: 0,
                     bind_address: "127.0.0.1".to_string(),
@@ -1221,12 +1243,15 @@ mod tests {
                     key_path: None,
                     authorized_clients_dir: None,
                     enrollment_token_ttl: 300,
+                    require_client_cert: true,
                     enrollment: EnrollmentConfig::default(),
                 },
                 network: NetworkConfig::default(),
                 relay: RelayConfig::default(),
                 command: vec![command],
             };
+            // Ensure we enforce client certificates in tests
+            config.security.require_client_cert = true;
 
             let config_arc = Arc::new(RwLock::new(config));
             let server_cert =

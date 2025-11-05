@@ -50,8 +50,8 @@ class ServerHealthCheckerImpl @Inject constructor(
                         latencyMs = latency
                     )
                 } finally {
-                    // Always disconnect the channel
-                    connectionManager.disconnect(connectionResult, forceClose = true)
+                    // Leave relay connections cached for reuse; allow graceful shutdown otherwise
+                    connectionManager.disconnect(connectionResult)
                 }
             }
         } catch (e: RelayConnectionException) {

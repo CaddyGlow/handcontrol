@@ -242,8 +242,8 @@ class RelayTunnelFactory @Inject constructor() {
 
                                 // Create health monitor
                                 val monitor = TunnelHealthMonitor(scope) {
-                                    Timber.e("Tunnel ${ack.tunnel_id} became unhealthy, closing connection")
-                                    incomingData.close(IOException("Tunnel health check failed"))
+                                    Timber.w("Tunnel ${ack.tunnel_id} became unhealthy, closing connection")
+                                    incomingData.close()
                                     webSocket.close(1001, "Health check timeout")
                                 }
                                 healthMonitor = monitor
@@ -325,7 +325,12 @@ class RelayTunnelFactory @Inject constructor() {
                     else -> "WebSocket connection failed: ${t.message ?: t.javaClass.simpleName}"
                 }
 
-                Timber.e(t, errorMsg)
+                val expectedClosure = t is IOException && t.isExpectedSocketClosure()
+                if (expectedClosure) {
+                    Timber.d("Relay tunnel closed: ${t.message ?: "socket closed"}")
+                } else {
+                    Timber.e(t, errorMsg)
+                }
 
                 if (!tunnelReady.isCompleted) {
                     tunnelReady.completeExceptionally(
@@ -336,7 +341,11 @@ class RelayTunnelFactory @Inject constructor() {
                     healthMonitor?.stop()
                 }
 
-                incomingData.close(IOException(errorMsg, t))
+                if (expectedClosure) {
+                    incomingData.close()
+                } else {
+                    incomingData.close(IOException(errorMsg, t))
+                }
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
@@ -365,4 +374,12 @@ class RelayTunnelFactory @Inject constructor() {
         okHttpClient.dispatcher.executorService.shutdown()
         okHttpClient.connectionPool.evictAll()
     }
+}
+
+private fun IOException.isExpectedSocketClosure(): Boolean {
+    val messageText = message?.lowercase() ?: return false
+    return messageText.contains("socket closed") ||
+        messageText.contains("software caused connection abort") ||
+        messageText.contains("connection reset") ||
+        messageText.contains("broken pipe")
 }

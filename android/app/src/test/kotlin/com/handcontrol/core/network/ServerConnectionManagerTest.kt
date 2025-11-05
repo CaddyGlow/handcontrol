@@ -70,7 +70,11 @@ class ServerConnectionManagerTest {
     fun `connect succeeds via direct connection on first IP`() = runTest {
         // Given
         coEvery {
-            directChannelFactory.createChannel("192.168.1.100", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.100",
+                50051,
+                testServer.certFingerprint
+            )
         } returns mockDirectChannel
 
         // When
@@ -82,10 +86,14 @@ class ServerConnectionManagerTest {
         assertEquals("192.168.1.100:50051", result.connectedAddress)
 
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("192.168.1.100", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.100",
+                50051,
+                testServer.certFingerprint
+            )
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -93,11 +101,19 @@ class ServerConnectionManagerTest {
     fun `connect succeeds via direct connection on second IP after first fails`() = runTest {
         // Given
         coEvery {
-            directChannelFactory.createChannel("192.168.1.100", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.100",
+                50051,
+                testServer.certFingerprint
+            )
         } throws Exception("Connection timeout")
 
         coEvery {
-            directChannelFactory.createChannel("192.168.1.101", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.101",
+                50051,
+                testServer.certFingerprint
+            )
         } returns mockDirectChannel
 
         // When
@@ -109,13 +125,21 @@ class ServerConnectionManagerTest {
         assertEquals("192.168.1.101:50051", result.connectedAddress)
 
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("192.168.1.100", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.100",
+                50051,
+                testServer.certFingerprint
+            )
         }
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("192.168.1.101", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.101",
+                50051,
+                testServer.certFingerprint
+            )
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -123,7 +147,7 @@ class ServerConnectionManagerTest {
     fun `connect falls back to relay when all direct connections fail`() = runTest {
         // Given
         coEvery {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         } throws Exception("Connection timeout")
 
         coEvery {
@@ -131,7 +155,9 @@ class ServerConnectionManagerTest {
                 relayUrl = "wss://relay.example.com",
                 serverId = "test-server-id",
                 relayToken = "test-relay-token",
-                clientId = "test-client-id"
+                clientId = "test-client-id",
+                defaultAuthority = any(),
+                expectedFingerprint = testServer.certFingerprint
             )
         } returns mockRelayChannel
 
@@ -144,17 +170,27 @@ class ServerConnectionManagerTest {
         assertEquals(null, result.connectedAddress)
 
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("192.168.1.100", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.100",
+                50051,
+                testServer.certFingerprint
+            )
         }
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("192.168.1.101", 50051)
+            directChannelFactory.createChannel(
+                "192.168.1.101",
+                50051,
+                testServer.certFingerprint
+            )
         }
         coVerify(exactly = 1) {
             relayChannelFactory.createChannelViaRelay(
                 relayUrl = "wss://relay.example.com",
                 serverId = "test-server-id",
                 relayToken = "test-relay-token",
-                clientId = "test-client-id"
+                clientId = "test-client-id",
+                defaultAuthority = any(),
+                expectedFingerprint = testServer.certFingerprint
             )
         }
     }
@@ -163,11 +199,11 @@ class ServerConnectionManagerTest {
     fun `connect throws exception when both direct and relay fail`() = runTest {
         // Given
         coEvery {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         } throws Exception("Connection timeout")
 
         coEvery {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         } throws Exception("Relay connection failed")
 
         // When/Then
@@ -200,7 +236,7 @@ class ServerConnectionManagerTest {
         )
 
         coEvery {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         } throws Exception("Connection timeout")
 
         // When/Then
@@ -219,7 +255,7 @@ class ServerConnectionManagerTest {
         assertEquals("All connection attempts failed", exception.message)
 
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -227,7 +263,7 @@ class ServerConnectionManagerTest {
     fun `connect with direct-only preference stops after direct failures`() = runTest {
         // Given
         coEvery {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         } throws Exception("Connection timeout")
 
         // When/Then
@@ -242,7 +278,7 @@ class ServerConnectionManagerTest {
         assertEquals("Relay disabled by connection preference", exception.message)
 
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -254,7 +290,9 @@ class ServerConnectionManagerTest {
                 relayUrl = "wss://relay.example.com",
                 serverId = "test-server-id",
                 relayToken = "test-relay-token",
-                clientId = "test-client-id"
+                clientId = "test-client-id",
+                defaultAuthority = any(),
+                expectedFingerprint = testServer.certFingerprint
             )
         } returns mockRelayChannel
 
@@ -266,10 +304,10 @@ class ServerConnectionManagerTest {
         assertEquals(mockRelayChannel, result.channel)
 
         coVerify(exactly = 0) {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         }
         coVerify(exactly = 1) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -301,10 +339,10 @@ class ServerConnectionManagerTest {
         )
 
         coVerify(exactly = 0) {
-            directChannelFactory.createChannel(any(), any())
+            directChannelFactory.createChannel(any(), any(), any())
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -317,7 +355,11 @@ class ServerConnectionManagerTest {
         )
 
         coEvery {
-            directChannelFactory.createChannel("example.com", 50051)
+            directChannelFactory.createChannel(
+                "example.com",
+                50051,
+                serverWithoutIps.certFingerprint
+            )
         } returns mockDirectChannel
 
         // When
@@ -328,7 +370,11 @@ class ServerConnectionManagerTest {
         assertEquals("example.com:50051", result.connectedAddress)
 
         coVerify(exactly = 1) {
-            directChannelFactory.createChannel("example.com", 50051)
+            directChannelFactory.createChannel(
+                "example.com",
+                50051,
+                serverWithoutIps.certFingerprint
+            )
         }
     }
 
@@ -336,6 +382,7 @@ class ServerConnectionManagerTest {
     fun `disconnect calls directChannelFactory for DIRECT mode`() = runTest {
         // Given
         val result = ConnectionResult(
+            serverId = testServer.serverId,
             channel = mockDirectChannel,
             mode = ConnectionMode.DIRECT,
             connectedAddress = "192.168.1.100:50051"
@@ -360,18 +407,28 @@ class ServerConnectionManagerTest {
     @Test
     fun `disconnect calls relayChannelFactory for RELAY mode`() = runTest {
         // Given
-        val result = ConnectionResult(
-            channel = mockRelayChannel,
-            mode = ConnectionMode.RELAY,
-            connectedAddress = null
-        )
+        coEvery {
+            relayChannelFactory.createChannelViaRelay(
+                relayUrl = any(),
+                serverId = any(),
+                relayToken = any(),
+                clientId = any(),
+                defaultAuthority = any(),
+                expectedFingerprint = any()
+            )
+        } returns mockRelayChannel
 
         coEvery {
             relayChannelFactory.shutdownChannel(mockRelayChannel)
         } returns Unit
 
+        val result = connectionManager.connect(
+            testServer,
+            preferenceOverride = ConnectionPreference.RELAY_ONLY
+        )
+
         // When
-        connectionManager.disconnect(result)
+        connectionManager.disconnect(result, forceClose = true)
 
         // Then
         coVerify(exactly = 1) {
@@ -386,6 +443,7 @@ class ServerConnectionManagerTest {
     fun `disconnect handles UNKNOWN mode gracefully`() = runTest {
         // Given
         val result = ConnectionResult(
+            serverId = testServer.serverId,
             channel = mockDirectChannel,
             mode = ConnectionMode.UNKNOWN,
             connectedAddress = null

@@ -163,7 +163,11 @@ class GrpcEnrollmentRepository @Inject constructor(
                 val certificate = certificateManager.loadOrCreate()
                 Timber.d("tryEnrollWithHost: Client certificate loaded")
 
-                val channel = channelFactory.createChannel(host, port)
+                val channel = channelFactory.createChannel(
+                    host = host,
+                    port = port,
+                    expectedFingerprint = expectedCertFingerprint
+                )
                 Timber.d("tryEnrollWithHost: gRPC channel created")
 
                 val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)

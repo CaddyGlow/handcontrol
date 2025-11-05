@@ -702,9 +702,9 @@ use crossterm::{
 };
 use handcontrol_client_lib::{
     config, config::DiscoveryConfig, discover_servers, enroll_via_approval, enroll_via_qr,
-    execute_command, list_commands, validate_parameters, ApprovalEnrollmentInput, CommandList,
-    CommandParameterType, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
-    ServerRegistry, ServerRegistryEntry,
+    execute_command, list_commands, validate_parameters, ApprovalEnrollmentInput, CommandKind,
+    CommandList, CommandParameterType, CommandSessionMode, CommandStreamEvent, CommandSummary,
+    DiscoveredServer, QrEnrollmentInput, ServerRegistry, ServerRegistryEntry,
 };
 use ratatui::{
     backend::CrosstermBackend,
@@ -2270,6 +2270,16 @@ fn trigger_command_activation(app: &mut App, event_tx: &EventSender) -> Result<(
             return Ok(());
         }
     };
+
+    if command.session_mode != CommandSessionMode::OneShot {
+        app.set_status_message("Selected capability requires realtime session (not yet supported)");
+        return Ok(());
+    }
+
+    if command.kind != CommandKind::ShellScript {
+        app.set_status_message("Selected capability type is not supported in the TUI");
+        return Ok(());
+    }
 
     let server_id = match app.command_state.server_id {
         Some(id) => id,

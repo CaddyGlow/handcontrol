@@ -15,7 +15,7 @@ pub struct Config {
     #[serde(default)]
     pub relay: RelayConfig,
     #[serde(default)]
-    pub command: Vec<CommandConfig>,
+    pub capabilities: Vec<CapabilityConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -143,28 +143,118 @@ impl Default for RelayConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct CommandConfig {
+pub struct CapabilityConfig {
     pub id: String,
     pub name: String,
     pub description: Option<String>,
-    pub icon: Option<String>,
-    pub shell: String,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub requires_confirmation: bool,
+    #[serde(default)]
+    pub privileged: bool,
+    #[serde(default)]
+    pub parameters: Vec<CapabilityParameterConfig>,
+    #[serde(default)]
+    pub acl: CapabilityAclConfig,
+    #[serde(flatten)]
+    pub definition: CapabilityDefinition,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct CapabilityAclConfig {
+    #[serde(default)]
+    pub allow: Vec<String>,
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityDefinition {
+    ShellScript(ShellScriptDefinition),
+    ShellInteractive(ShellInteractiveDefinition),
+}
+
+impl CapabilityDefinition {
+    pub fn session_mode(&self) -> CapabilitySessionMode {
+        match self {
+            CapabilityDefinition::ShellScript(def) => def.session_mode,
+            CapabilityDefinition::ShellInteractive(def) => {
+                def.session_mode.unwrap_or(CapabilitySessionMode::Realtime)
+            }
+        }
+    }
+
+    pub fn kind(&self) -> CapabilityKindConfig {
+        match self {
+            CapabilityDefinition::ShellScript(_) => CapabilityKindConfig::ShellScript,
+            CapabilityDefinition::ShellInteractive(_) => CapabilityKindConfig::ShellInteractive,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ShellScriptDefinition {
+    pub command: String,
     #[serde(default = "default_command_timeout")]
     pub timeout_seconds: u64,
     #[serde(default)]
     pub env: HashMap<String, String>,
-    #[serde(default)]
-    pub parameters: Vec<ParameterConfig>,
-    #[serde(default)]
-    pub requires_confirmation: bool,
     #[serde(default = "default_true")]
     pub show_output: bool,
+    #[serde(default = "CapabilitySessionMode::one_shot_default")]
+    pub session_mode: CapabilitySessionMode,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct ParameterConfig {
+pub struct ShellInteractiveDefinition {
+    #[serde(default = "default_interactive_shell")]
+    pub shell: String,
+    pub working_directory: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub idle_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    pub max_duration_seconds: Option<u64>,
+    #[serde(default)]
+    pub session_mode: Option<CapabilitySessionMode>,
+}
+
+fn default_interactive_shell() -> String {
+    if cfg!(target_os = "windows") {
+        "cmd.exe".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySessionMode {
+    OneShot,
+    Realtime,
+    Upload,
+    Download,
+}
+
+impl CapabilitySessionMode {
+    fn one_shot_default() -> Self {
+        CapabilitySessionMode::OneShot
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityKindConfig {
+    ShellScript,
+    ShellInteractive,
+    FileTransfer,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CapabilityParameterConfig {
     pub name: String,
     #[serde(rename = "type")]
     pub param_type: String,
@@ -199,12 +289,12 @@ fn default_enrollment_token_ttl() -> u64 {
     300 // 5 minutes
 }
 
-fn default_require_client_cert() -> bool {
-    false
-}
-
 fn default_true() -> bool {
     true
+}
+
+fn default_require_client_cert() -> bool {
+    false
 }
 
 fn default_approval_timeout() -> u64 {
@@ -340,15 +430,16 @@ mod tests {
             approval_timeout_seconds = 120
             approval_notification = true
 
-            [[command]]
-            id = "test-cmd"
-            name = "Test Command"
-            description = "A test command"
-            shell = "echo {msg}"
+            [[capabilities]]
+            id = "test-shell"
+            name = "Test Shell"
+            description = "A test shell command"
             tags = ["test"]
+            kind = "shell_script"
+            command = "echo {msg}"
             timeout_seconds = 10
 
-            [[command.parameters]]
+            [[capabilities.parameters]]
             name = "msg"
             type = "text"
             description = "Message to echo"
@@ -357,26 +448,47 @@ mod tests {
         let config = load_config_from_str(toml).unwrap();
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.bind_address, "127.0.0.1");
-        assert_eq!(config.command.len(), 1);
-        assert_eq!(config.command[0].id, "test-cmd");
-        assert_eq!(config.command[0].parameters.len(), 1);
+        assert_eq!(config.capabilities.len(), 1);
+
+        let capability = &config.capabilities[0];
+        assert_eq!(capability.id, "test-shell");
+        assert_eq!(capability.parameters.len(), 1);
+
+        match &capability.definition {
+            CapabilityDefinition::ShellScript(def) => {
+                assert_eq!(def.command, "echo {msg}");
+                assert_eq!(def.timeout_seconds, 10);
+            }
+            other => panic!("Unexpected capability definition: {:?}", other),
+        }
     }
 
     #[test]
-    fn test_command_defaults() {
+    fn test_shell_script_defaults() {
         let toml = r#"
             [server]
             [security]
 
-            [[command]]
+            [[capabilities]]
             id = "minimal"
             name = "Minimal"
-            shell = "ls"
+            kind = "shell_script"
+            command = "ls"
         "#;
 
         let config = load_config_from_str(toml).unwrap();
-        assert_eq!(config.command[0].timeout_seconds, 30);
-        assert_eq!(config.command[0].tags.len(), 0);
-        assert_eq!(config.command[0].parameters.len(), 0);
+        assert_eq!(config.capabilities.len(), 1);
+
+        let capability = &config.capabilities[0];
+        assert_eq!(capability.tags.len(), 0);
+        assert_eq!(capability.parameters.len(), 0);
+
+        match &capability.definition {
+            CapabilityDefinition::ShellScript(def) => {
+                assert_eq!(def.timeout_seconds, 30);
+                assert!(def.show_output);
+            }
+            other => panic!("Unexpected capability definition: {:?}", other),
+        }
     }
 }

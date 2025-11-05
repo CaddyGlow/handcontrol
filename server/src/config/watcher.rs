@@ -112,8 +112,8 @@ impl ConfigWatcher {
             let old_config = self.config.read().unwrap();
             if !config_reload_allowed(&old_config, &new_config) {
                 warn!(
-                    "Config contains non-command changes. These changes require server restart. \
-                     Only command modifications will be hot-reloaded in future versions."
+                    "Config contains non-capability changes. These changes require server restart. \
+                     Only capability modifications will be hot-reloaded in future versions."
                 );
                 // For now, we still allow the reload but warn the user
                 // In the future, we could reject this reload
@@ -149,9 +149,9 @@ impl ConfigWatcher {
     }
 }
 
-/// Check if config reload is allowed (only command changes)
+/// Check if config reload is allowed (only capability changes)
 fn config_reload_allowed(old: &Config, new: &Config) -> bool {
-    // For now, we're lenient - we allow any changes but warn about non-command changes
+    // For now, we're lenient - we allow any changes but warn about non-capability changes
     // In a stricter implementation, we would reject changes to server/security settings
 
     // Check if server settings changed
@@ -172,7 +172,7 @@ fn config_reload_allowed(old: &Config, new: &Config) -> bool {
         || old.security.enrollment.approval_notification
             != new.security.enrollment.approval_notification;
 
-    // Return true if only commands changed (server and security are unchanged)
+    // Return true if only capabilities changed (server and security are unchanged)
     !server_changed && !security_changed
 }
 
@@ -202,15 +202,17 @@ mod tests {
 
             [security]
 
-            [[command]]
+            [[capabilities]]
             id = "test"
             name = "Test"
-            shell = "echo test"
+            kind = "shell_script"
+            command = "echo test"
 
-            [[command]]
+            [[capabilities]]
             id = "test2"
             name = "Test 2"
-            shell = "echo test2"
+            kind = "shell_script"
+            command = "echo test2"
         "#;
 
         let old = super::super::parser::load_config_from_str(old_config).unwrap();

@@ -2,8 +2,10 @@ use crate::{
     certificates::CertificatePaths,
     grpc_client::connect_registered,
     proto::{
-        execute_command_response, Command as ProtoCommand, ExecuteCommandRequest,
-        ListCommandsRequest, Parameter as ProtoParameter, ParameterType,
+        session_client_message, session_server_message, Capability as ProtoCapability,
+        CapabilityKind as ProtoCapabilityKind, CapabilityParameter as ProtoCapabilityParameter,
+        CapabilityParameterType as ProtoCapabilityParameterType, ListCapabilitiesRequest,
+        SessionClientMessage, SessionMode as ProtoSessionMode, SessionOpen,
     },
     storage::ServerRegistryEntry,
 };
@@ -11,16 +13,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
+use std::convert::TryFrom;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Request;
 
-/// Summary information about available commands on a server.
+/// Summary information about available capabilities on a server.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandList {
     pub config_version: u64,
     pub commands: Vec<CommandSummary>,
 }
 
-/// Command metadata returned by `list_commands`.
+/// Metadata describing an executable capability (formerly command).
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandSummary {
     pub id: String,
@@ -31,9 +36,12 @@ pub struct CommandSummary {
     pub parameters: Vec<CommandParameter>,
     pub requires_confirmation: bool,
     pub show_output: bool,
+    pub privileged: bool,
+    pub kind: CommandKind,
+    pub session_mode: CommandSessionMode,
 }
 
-/// Parameter definition for a command.
+/// Parameter definition associated with a capability.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandParameter {
     pub name: String,
@@ -46,9 +54,11 @@ pub struct CommandParameter {
     pub options: Vec<String>,
     pub label_on: Option<String>,
     pub label_off: Option<String>,
+    pub default_value_command: Option<String>,
+    pub default_value_pattern: Option<String>,
 }
 
-/// Supported parameter types.
+/// Supported parameter kinds.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandParameterType {
@@ -58,27 +68,144 @@ pub enum CommandParameterType {
     Dropdown,
 }
 
-/// Streaming events emitted while executing a command.
+/// Runtime classification of a capability.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandKind {
+    ShellScript,
+    ShellInteractive,
+    FileTransfer,
+    Unknown,
+}
+
+/// Session behaviour required by a capability.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandSessionMode {
+    OneShot,
+    Realtime,
+    Upload,
+    Download,
+    Unknown,
+}
+
+/// Streaming events emitted while executing a capability.
 #[derive(Debug, Clone)]
 pub enum CommandStreamEvent {
     Stdout(String),
     Stderr(String),
 }
 
-/// Retrieve the list of commands from a server using stored credentials.
+impl CommandSummary {
+    fn from_proto(proto: ProtoCapability) -> Result<Self> {
+        let parameters = proto
+            .parameters
+            .into_iter()
+            .map(CommandParameter::from_proto)
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            id: proto.id,
+            name: proto.name,
+            description: if proto.description.is_empty() {
+                None
+            } else {
+                Some(proto.description)
+            },
+            icon: None,
+            tags: proto.tags,
+            parameters,
+            requires_confirmation: proto.requires_confirmation.unwrap_or(false),
+            show_output: true,
+            privileged: proto.privileged.unwrap_or(false),
+            kind: CommandKind::from_proto(proto.kind),
+            session_mode: CommandSessionMode::from_proto(proto.session_mode),
+        })
+    }
+
+    /// Returns true when the capability behaves like a traditional one-shot command.
+    pub fn is_shell_script_oneshot(&self) -> bool {
+        self.kind == CommandKind::ShellScript && self.session_mode == CommandSessionMode::OneShot
+    }
+}
+
+impl CommandKind {
+    fn from_proto(value: i32) -> Self {
+        match ProtoCapabilityKind::try_from(value).unwrap_or(ProtoCapabilityKind::Unspecified) {
+            ProtoCapabilityKind::ShellScript => CommandKind::ShellScript,
+            ProtoCapabilityKind::ShellInteractive => CommandKind::ShellInteractive,
+            ProtoCapabilityKind::FileTransfer => CommandKind::FileTransfer,
+            ProtoCapabilityKind::Unspecified => CommandKind::Unknown,
+        }
+    }
+}
+
+impl CommandSessionMode {
+    fn from_proto(value: i32) -> Self {
+        match ProtoSessionMode::try_from(value).unwrap_or(ProtoSessionMode::Unspecified) {
+            ProtoSessionMode::OneShot => CommandSessionMode::OneShot,
+            ProtoSessionMode::Realtime => CommandSessionMode::Realtime,
+            ProtoSessionMode::Upload => CommandSessionMode::Upload,
+            ProtoSessionMode::Download => CommandSessionMode::Download,
+            ProtoSessionMode::Unspecified => CommandSessionMode::Unknown,
+        }
+    }
+}
+
+impl CommandParameter {
+    fn from_proto(proto: ProtoCapabilityParameter) -> Result<Self> {
+        let param_type = CommandParameterType::from_proto(proto.r#type)?;
+        Ok(Self {
+            name: proto.name,
+            description: if proto.description.is_empty() {
+                None
+            } else {
+                Some(proto.description)
+            },
+            param_type,
+            min: proto.min,
+            max: proto.max,
+            default_value: proto.default_value.filter(|v| !v.is_empty()),
+            validation: proto.validation.filter(|v| !v.is_empty()),
+            options: proto.options,
+            label_on: proto.label_on.filter(|v| !v.is_empty()),
+            label_off: proto.label_off.filter(|v| !v.is_empty()),
+            default_value_command: proto.default_value_command.filter(|v| !v.is_empty()),
+            default_value_pattern: proto.default_value_pattern.filter(|v| !v.is_empty()),
+        })
+    }
+}
+
+impl CommandParameterType {
+    fn from_proto(value: i32) -> Result<Self> {
+        match ProtoCapabilityParameterType::try_from(value)
+            .unwrap_or(ProtoCapabilityParameterType::Unspecified)
+        {
+            ProtoCapabilityParameterType::Slider => Ok(CommandParameterType::Slider),
+            ProtoCapabilityParameterType::Text => Ok(CommandParameterType::Text),
+            ProtoCapabilityParameterType::Toggle => Ok(CommandParameterType::Toggle),
+            ProtoCapabilityParameterType::Dropdown => Ok(CommandParameterType::Dropdown),
+            ProtoCapabilityParameterType::Unspecified => {
+                bail!("Encountered parameter with unspecified type")
+            }
+        }
+    }
+}
+
+/// Retrieve capabilities from a server using stored credentials.
 pub async fn list_commands(entry: &ServerRegistryEntry) -> Result<CommandList> {
     let cert_paths = CertificatePaths::for_server(&entry.id)?;
     let mut client = connect_registered(entry, &cert_paths).await?;
 
     let response = client
         .inner()
-        .list_commands(Request::new(ListCommandsRequest {}))
+        .list_capabilities(Request::new(ListCapabilitiesRequest {}))
         .await
-        .context("ListCommands RPC failed")?
+        .context("ListCapabilities RPC failed")?
         .into_inner();
 
     let commands = response
-        .commands
+        .capabilities
         .into_iter()
         .map(CommandSummary::from_proto)
         .collect::<Result<Vec<_>>>()?;
@@ -89,7 +216,7 @@ pub async fn list_commands(entry: &ServerRegistryEntry) -> Result<CommandList> {
     })
 }
 
-/// Validate parameters for a command, returning a sanitized map suitable for RPC transmission.
+/// Validate parameters for a capability, returning a sanitized map for RPC transmission.
 pub fn validate_parameters(
     command: &CommandSummary,
     provided: &HashMap<String, String>,
@@ -149,14 +276,23 @@ pub fn validate_parameters(
                                 param.name
                             );
                         }
-                        if !param.options.iter().any(|opt| opt == value) {
+                        if !param
+                            .options
+                            .iter()
+                            .any(|opt| opt.eq_ignore_ascii_case(value))
+                        {
                             bail!(
                                 "Parameter '{}' must be one of: {}",
                                 param.name,
                                 param.options.join(", ")
                             );
                         }
-                        value.to_string()
+                        param
+                            .options
+                            .iter()
+                            .find(|opt| opt.eq_ignore_ascii_case(value))
+                            .unwrap()
+                            .to_string()
                     }
                     CommandParameterType::Text => {
                         if let Some(pattern) = &param.validation {
@@ -187,7 +323,7 @@ pub fn validate_parameters(
     Ok(sanitized)
 }
 
-/// Execute a command, invoking the callback for each stdout/stderr chunk.
+/// Execute a one-shot capability, invoking the callback for each stdout/stderr chunk.
 pub async fn execute_command<F>(
     entry: &ServerRegistryEntry,
     command_id: &str,
@@ -205,16 +341,27 @@ where
         request_parameters.insert(key, value);
     }
 
-    let request = ExecuteCommandRequest {
-        command_id: command_id.to_string(),
-        parameters: request_parameters,
+    let open_message = SessionClientMessage {
+        session_id: String::new(),
+        payload: Some(session_client_message::Payload::Open(SessionOpen {
+            capability_id: command_id.to_string(),
+            parameters: request_parameters,
+            request_id: None,
+        })),
     };
 
+    let (tx, rx) = mpsc::channel(8);
+    tx.send(open_message)
+        .await
+        .context("Failed to send session open message")?;
+    drop(tx);
+
+    let request_stream = ReceiverStream::new(rx);
     let mut stream = client
         .inner()
-        .execute_command(Request::new(request))
+        .open_session(Request::new(request_stream))
         .await
-        .context("ExecuteCommand RPC failed")?
+        .context("OpenSession RPC failed")?
         .into_inner();
 
     let mut exit_code: Option<i32> = None;
@@ -222,90 +369,47 @@ where
     while let Some(message) = stream
         .message()
         .await
-        .context("Command stream closed unexpectedly")?
+        .context("Capability stream closed unexpectedly")?
     {
-        match message.response {
-            Some(execute_command_response::Response::Stdout(data)) => {
-                on_event(CommandStreamEvent::Stdout(data));
+        match message.payload {
+            Some(session_server_message::Payload::Ready(ready)) => {
+                let session_mode = CommandSessionMode::from_proto(ready.session_mode);
+                if session_mode != CommandSessionMode::OneShot {
+                    bail!(
+                        "Capability '{}' requires '{:?}' sessions which are not supported by this client",
+                        command_id,
+                        session_mode
+                    );
+                }
             }
-            Some(execute_command_response::Response::Stderr(data)) => {
-                on_event(CommandStreamEvent::Stderr(data));
+            Some(session_server_message::Payload::Output(output)) => {
+                let text = String::from_utf8_lossy(&output.data).to_string();
+                if output.stderr.unwrap_or(false) {
+                    on_event(CommandStreamEvent::Stderr(text));
+                } else {
+                    on_event(CommandStreamEvent::Stdout(text));
+                }
             }
-            Some(execute_command_response::Response::ExitCode(code)) => {
-                exit_code = Some(code);
+            Some(session_server_message::Payload::Exit(exit)) => {
+                exit_code = Some(exit.exit_code);
+                if let Some(message) = exit.message.filter(|m| !m.is_empty()) {
+                    on_event(CommandStreamEvent::Stderr(format!("{message}\n")));
+                }
+            }
+            Some(session_server_message::Payload::Error(err)) => {
+                bail!("Server reported capability error: {}", err.message);
+            }
+            Some(session_server_message::Payload::Heartbeat(_)) => {
+                // Ignore heartbeat acknowledgements for one-shot sessions.
+            }
+            Some(session_server_message::Payload::Closed(_)) => {
                 break;
-            }
-            Some(execute_command_response::Response::Error(err)) => {
-                bail!("Server reported command error: {}", err);
             }
             None => continue,
         }
     }
 
-    exit_code.ok_or_else(|| anyhow!("Command stream ended without exit code"))
-}
-
-impl CommandSummary {
-    fn from_proto(proto: ProtoCommand) -> Result<Self> {
-        let parameters = proto
-            .parameters
-            .into_iter()
-            .map(CommandParameter::from_proto)
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Self {
-            id: proto.id,
-            name: proto.name,
-            description: if proto.description.is_empty() {
-                None
-            } else {
-                Some(proto.description)
-            },
-            icon: if proto.icon.is_empty() {
-                None
-            } else {
-                Some(proto.icon)
-            },
-            tags: proto.tags,
-            parameters,
-            requires_confirmation: proto.requires_confirmation.unwrap_or(false),
-            show_output: proto.show_output.unwrap_or(true),
-        })
-    }
-}
-
-impl CommandParameter {
-    fn from_proto(proto: ProtoParameter) -> Result<Self> {
-        let param_type = CommandParameterType::from_proto(proto.r#type)?;
-        Ok(Self {
-            name: proto.name,
-            description: if proto.description.is_empty() {
-                None
-            } else {
-                Some(proto.description)
-            },
-            param_type,
-            min: proto.min,
-            max: proto.max,
-            default_value: proto.default_value.filter(|v| !v.is_empty()),
-            validation: proto.validation.filter(|v| !v.is_empty()),
-            options: proto.options,
-            label_on: proto.label_on.filter(|v| !v.is_empty()),
-            label_off: proto.label_off.filter(|v| !v.is_empty()),
-        })
-    }
-}
-
-impl CommandParameterType {
-    fn from_proto(value: i32) -> Result<Self> {
-        match ParameterType::try_from(value).unwrap_or(ParameterType::Unspecified) {
-            ParameterType::Slider => Ok(CommandParameterType::Slider),
-            ParameterType::Text => Ok(CommandParameterType::Text),
-            ParameterType::Toggle => Ok(CommandParameterType::Toggle),
-            ParameterType::Dropdown => Ok(CommandParameterType::Dropdown),
-            ParameterType::Unspecified => bail!("Encountered parameter with unspecified type"),
-        }
-    }
+    exit_code.ok_or_else(|| anyhow!("Capability stream ended without exit code"))
 }
 
 fn parse_bool(value: &str) -> Option<bool> {

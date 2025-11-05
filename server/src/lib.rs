@@ -1,10 +1,11 @@
+pub mod capabilities;
 pub mod cli;
-pub mod commands;
 pub mod config;
 pub mod grpc;
 pub mod mdns;
 pub mod notifications;
 pub mod relay;
 pub mod security;
+pub mod sessions;
 pub mod storage;
 pub mod utils;

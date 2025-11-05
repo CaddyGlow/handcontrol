@@ -1,13 +1,14 @@
 use super::parser::{
-    CommandConfig, Config, EnrollmentConfig, NetworkConfig, ParameterConfig, RelayConfig,
-    SecurityConfig, ServerConfig,
+    CapabilityAclConfig, CapabilityConfig, CapabilityDefinition, CapabilityParameterConfig,
+    CapabilitySessionMode, Config, EnrollmentConfig, NetworkConfig, RelayConfig, SecurityConfig,
+    ServerConfig, ShellInteractiveDefinition, ShellScriptDefinition,
 };
 use anyhow::Result;
 use std::collections::HashMap;
 
 /// Generate a default configuration with example commands for the current platform
 pub fn generate_default_config() -> Result<Config> {
-    let commands = generate_platform_commands();
+    let capabilities = generate_platform_capabilities();
 
     Ok(Config {
         server: ServerConfig {
@@ -31,7 +32,7 @@ pub fn generate_default_config() -> Result<Config> {
         },
         network: NetworkConfig::default(),
         relay: RelayConfig::default(),
-        command: commands,
+        capabilities,
     })
 }
 
@@ -44,44 +45,50 @@ pub fn generate_default_config_toml() -> Result<String> {
 
 /// Generate platform-specific example commands
 #[cfg(target_os = "linux")]
-fn generate_platform_commands() -> Vec<CommandConfig> {
+fn generate_platform_capabilities() -> Vec<CapabilityConfig> {
     vec![
-        CommandConfig {
+        CapabilityConfig {
             id: "lock-screen".to_string(),
             name: "Lock Screen".to_string(),
             description: Some("Locks the computer screen".to_string()),
-            icon: Some("lock".to_string()),
-            shell: "loginctl lock-session".to_string(),
             tags: vec!["system".to_string(), "security".to_string()],
-            timeout_seconds: 5,
-            env: HashMap::new(),
-            parameters: vec![],
             requires_confirmation: false,
-            show_output: true,
+            privileged: false,
+            parameters: vec![],
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "loginctl lock-session".to_string(),
+                timeout_seconds: 5,
+                env: HashMap::new(),
+                show_output: true,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
-        CommandConfig {
+        CapabilityConfig {
             id: "suspend".to_string(),
             name: "Suspend".to_string(),
             description: Some("Suspends the computer".to_string()),
-            icon: Some("power".to_string()),
-            shell: "systemctl suspend".to_string(),
             tags: vec!["system".to_string(), "power".to_string()],
-            timeout_seconds: 5,
-            env: HashMap::new(),
-            parameters: vec![],
             requires_confirmation: true,
-            show_output: true,
+            privileged: false,
+            parameters: vec![],
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "systemctl suspend".to_string(),
+                timeout_seconds: 5,
+                env: HashMap::new(),
+                show_output: true,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
-        CommandConfig {
+        CapabilityConfig {
             id: "set-volume".to_string(),
             name: "Set Volume".to_string(),
             description: Some("Adjust system volume".to_string()),
-            icon: Some("volume".to_string()),
-            shell: "pactl set-sink-volume @DEFAULT_SINK@ {level}%".to_string(),
             tags: vec!["media".to_string(), "audio".to_string()],
-            timeout_seconds: 3,
-            env: HashMap::new(),
-            parameters: vec![ParameterConfig {
+            requires_confirmation: false,
+            privileged: false,
+            parameters: vec![CapabilityParameterConfig {
                 name: "level".to_string(),
                 param_type: "slider".to_string(),
                 description: Some("Volume level (0-100)".to_string()),
@@ -96,19 +103,23 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 default_value_command: None,
                 default_value_pattern: None,
             }],
-            requires_confirmation: false,
-            show_output: false,
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "pactl set-sink-volume @DEFAULT_SINK@ {level}%".to_string(),
+                timeout_seconds: 3,
+                env: HashMap::new(),
+                show_output: false,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
-        CommandConfig {
+        CapabilityConfig {
             id: "toggle-mute".to_string(),
             name: "Toggle Mute".to_string(),
             description: Some("Mute or unmute audio".to_string()),
-            icon: Some("volume-mute".to_string()),
-            shell: "pactl set-sink-mute @DEFAULT_SINK@ {muted}".to_string(),
             tags: vec!["media".to_string(), "audio".to_string()],
-            timeout_seconds: 3,
-            env: HashMap::new(),
-            parameters: vec![ParameterConfig {
+            requires_confirmation: false,
+            privileged: false,
+            parameters: vec![CapabilityParameterConfig {
                 name: "muted".to_string(),
                 param_type: "toggle".to_string(),
                 description: Some("Mute state".to_string()),
@@ -123,70 +134,88 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 default_value_command: None,
                 default_value_pattern: None,
             }],
-            requires_confirmation: false,
-            show_output: false,
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "pactl set-sink-mute @DEFAULT_SINK@ {muted}".to_string(),
+                timeout_seconds: 3,
+                env: HashMap::new(),
+                show_output: false,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
+        default_interactive_shell_capability(),
     ]
 }
 
 #[cfg(target_os = "windows")]
-fn generate_platform_commands() -> Vec<CommandConfig> {
+fn generate_platform_capabilities() -> Vec<CapabilityConfig> {
     vec![
-        CommandConfig {
+        CapabilityConfig {
             id: "lock-screen".to_string(),
             name: "Lock Screen".to_string(),
             description: Some("Locks the computer screen".to_string()),
-            icon: Some("lock".to_string()),
-            shell: "rundll32.exe user32.dll,LockWorkStation".to_string(),
             tags: vec!["system".to_string(), "security".to_string()],
-            timeout_seconds: 5,
-            env: HashMap::new(),
-            parameters: vec![],
             requires_confirmation: false,
-            show_output: true,
+            privileged: false,
+            parameters: vec![],
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "rundll32.exe user32.dll,LockWorkStation".to_string(),
+                timeout_seconds: 5,
+                env: HashMap::new(),
+                show_output: true,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
-        CommandConfig {
+        CapabilityConfig {
             id: "shutdown".to_string(),
             name: "Shutdown".to_string(),
             description: Some("Shuts down the computer".to_string()),
-            icon: Some("power".to_string()),
-            shell: "shutdown /s /t 0".to_string(),
             tags: vec!["system".to_string(), "power".to_string()],
-            timeout_seconds: 5,
-            env: HashMap::new(),
-            parameters: vec![],
             requires_confirmation: true,
-            show_output: true,
+            privileged: false,
+            parameters: vec![],
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "shutdown /s /t 0".to_string(),
+                timeout_seconds: 5,
+                env: HashMap::new(),
+                show_output: true,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
+        default_interactive_shell_capability(),
     ]
 }
 
 #[cfg(target_os = "macos")]
-fn generate_platform_commands() -> Vec<CommandConfig> {
+fn generate_platform_capabilities() -> Vec<CapabilityConfig> {
     vec![
-        CommandConfig {
+        CapabilityConfig {
             id: "lock-screen".to_string(),
             name: "Lock Screen".to_string(),
             description: Some("Locks the computer screen".to_string()),
-            icon: Some("lock".to_string()),
-            shell: "/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend".to_string(),
             tags: vec!["system".to_string(), "security".to_string()],
-            timeout_seconds: 5,
-            env: HashMap::new(),
-            parameters: vec![],
             requires_confirmation: false,
-            show_output: true,
+            privileged: false,
+            parameters: vec![],
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend".to_string(),
+                timeout_seconds: 5,
+                env: HashMap::new(),
+                show_output: true,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
-        CommandConfig {
+        CapabilityConfig {
             id: "set-volume".to_string(),
             name: "Set Volume".to_string(),
             description: Some("Adjust system volume".to_string()),
-            icon: Some("volume".to_string()),
-            shell: "osascript -e 'set volume output volume {level}'".to_string(),
             tags: vec!["media".to_string(), "audio".to_string()],
-            timeout_seconds: 3,
-            env: HashMap::new(),
-            parameters: vec![ParameterConfig {
+            requires_confirmation: false,
+            privileged: false,
+            parameters: vec![CapabilityParameterConfig {
                 name: "level".to_string(),
                 param_type: "slider".to_string(),
                 description: Some("Volume level (0-100)".to_string()),
@@ -201,10 +230,47 @@ fn generate_platform_commands() -> Vec<CommandConfig> {
                 default_value_command: None,
                 default_value_pattern: None,
             }],
-            requires_confirmation: false,
-            show_output: false,
+            acl: CapabilityAclConfig::default(),
+            definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                command: "osascript -e 'set volume output volume {level}'".to_string(),
+                timeout_seconds: 3,
+                env: HashMap::new(),
+                show_output: false,
+                session_mode: CapabilitySessionMode::OneShot,
+            }),
         },
+        default_interactive_shell_capability(),
     ]
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn generate_platform_capabilities() -> Vec<CapabilityConfig> {
+    vec![default_interactive_shell_capability()]
+}
+
+fn default_interactive_shell_capability() -> CapabilityConfig {
+    CapabilityConfig {
+        id: "shell.interactive".to_string(),
+        name: "Interactive Shell".to_string(),
+        description: Some("Open an interactive shell session".to_string()),
+        tags: vec!["system".to_string(), "shell".to_string()],
+        requires_confirmation: true,
+        privileged: true,
+        parameters: vec![],
+        acl: CapabilityAclConfig::default(),
+        definition: CapabilityDefinition::ShellInteractive(ShellInteractiveDefinition {
+            shell: if cfg!(target_os = "windows") {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            },
+            working_directory: None,
+            env: HashMap::new(),
+            idle_timeout_seconds: Some(600),
+            max_duration_seconds: Some(3600),
+            session_mode: None,
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +281,7 @@ mod tests {
     fn test_generate_default_config() {
         let config = generate_default_config().unwrap();
         assert_eq!(config.server.port, 50051);
-        assert!(!config.command.is_empty());
+        assert!(!config.capabilities.is_empty());
     }
 
     #[test]
@@ -223,6 +289,6 @@ mod tests {
         let toml = generate_default_config_toml().unwrap();
         assert!(toml.contains("[server]"));
         assert!(toml.contains("[security]"));
-        assert!(toml.contains("[[command]]"));
+        assert!(toml.contains("[[capabilities]]"));
     }
 }

@@ -5,8 +5,8 @@ use handcontrol_client_lib::{
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
     list_commands as fetch_command_list,
     storage::{ServerRegistry, ServerRegistryEntry},
-    validate_parameters, ApprovalEnrollmentInput, CommandList, CommandStreamEvent, CommandSummary,
-    DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CommandKind, CommandList, CommandSessionMode,
+    CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -395,6 +395,22 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
 
     let sanitized = validate_parameters(command, &provided)?;
     let actual_command_id = command.id.clone();
+
+    if command.session_mode != CommandSessionMode::OneShot {
+        bail!(
+            "Capability '{}' requires {:?} sessions which are not supported by this CLI",
+            command.name,
+            command.session_mode
+        );
+    }
+
+    if command.kind != CommandKind::ShellScript {
+        bail!(
+            "Capability '{}' has type {:?} which is not supported by this CLI",
+            command.name,
+            command.kind
+        );
+    }
 
     if command.requires_confirmation && !quiet {
         println!(
@@ -876,7 +892,7 @@ fn print_commands_tsv(commands: &[CommandSummary], cfg: &ClientConfig) -> Result
     let mut stdout = io::BufWriter::new(io::stdout().lock());
 
     if cfg.cli.show_headers {
-        writeln!(stdout, "ID\tNAME\tDESCRIPTION\tTAGS")?;
+        writeln!(stdout, "ID\tNAME\tDESCRIPTION\tTAGS\tKIND\tSESSION_MODE")?;
     }
 
     for command in commands {
@@ -887,11 +903,13 @@ fn print_commands_tsv(commands: &[CommandSummary], cfg: &ClientConfig) -> Result
         };
         writeln!(
             stdout,
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             command.id,
             command.name,
             command.description.as_deref().unwrap_or("-"),
-            tags
+            tags,
+            format!("{:?}", command.kind).to_ascii_lowercase(),
+            format!("{:?}", command.session_mode).to_ascii_lowercase()
         )?;
     }
 

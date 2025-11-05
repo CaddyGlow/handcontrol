@@ -21,11 +21,11 @@ service RemoteControl {
   // Get server information
   rpc GetServerInfo(ServerInfoRequest) returns (ServerInfoResponse);
 
-  // List available commands
-  rpc ListCommands(ListCommandsRequest) returns (ListCommandsResponse);
+  // List available capabilities
+  rpc ListCapabilities(ListCapabilitiesRequest) returns (ListCapabilitiesResponse);
 
-  // Execute a command with streaming output
-  rpc ExecuteCommand(ExecuteCommandRequest) returns (stream ExecuteCommandResponse);
+  // Open a capability session (one-shot or realtime)
+  rpc OpenSession(stream SessionClientMessage) returns (stream SessionServerMessage);
 
   // Config hot-reload APIs
   rpc GetConfigVersion(GetConfigVersionRequest) returns (GetConfigVersionResponse);
@@ -148,70 +148,144 @@ message ServerInfoResponse {
   string os = 4;
 }
 
-// Command listing
-message ListCommandsRequest {}
+// Capability listing
+message ListCapabilitiesRequest {}
 
-message ListCommandsResponse {
-  repeated Command commands = 1;
-  uint64 config_version = 2;  // Version of config used for this list
+message ListCapabilitiesResponse {
+  repeated Capability capabilities = 1;
+  uint64 config_version = 2;
 }
 
-message Command {
+enum CapabilityKind {
+  CAPABILITY_KIND_UNSPECIFIED = 0;
+  CAPABILITY_KIND_SHELL_SCRIPT = 1;
+  CAPABILITY_KIND_SHELL_INTERACTIVE = 2;
+  CAPABILITY_KIND_FILE_TRANSFER = 3;
+}
+
+enum SessionMode {
+  SESSION_MODE_UNSPECIFIED = 0;
+  SESSION_MODE_ONE_SHOT = 1;
+  SESSION_MODE_REALTIME = 2;
+  SESSION_MODE_UPLOAD = 3;
+  SESSION_MODE_DOWNLOAD = 4;
+}
+
+message Capability {
   string id = 1;
   string name = 2;
   string description = 3;
-  string icon = 4;
-  repeated string tags = 5;
-  repeated Parameter parameters = 6;
-
-  // Execution behavior flags
-  optional bool requires_confirmation = 7;   // Show confirmation dialog before execution
-  optional bool show_output = 8;             // Show output screen after execution (default: true)
+  repeated string tags = 4;
+  CapabilityKind kind = 5;
+  SessionMode session_mode = 6;
+  repeated CapabilityParameter parameters = 7;
+  optional bool requires_confirmation = 8;
+  optional bool privileged = 9;
+  optional uint64 version = 10;
 }
 
-message Parameter {
+enum CapabilityParameterType {
+  CAPABILITY_PARAMETER_TYPE_UNSPECIFIED = 0;
+  CAPABILITY_PARAMETER_TYPE_SLIDER = 1;
+  CAPABILITY_PARAMETER_TYPE_TEXT = 2;
+  CAPABILITY_PARAMETER_TYPE_TOGGLE = 3;
+  CAPABILITY_PARAMETER_TYPE_DROPDOWN = 4;
+}
+
+message CapabilityParameter {
   string name = 1;
-  ParameterType type = 2;
+  CapabilityParameterType type = 2;
   string description = 3;
-
-  // Type-specific fields (optional, depends on type)
-  optional int32 min = 4;           // For slider
-  optional int32 max = 5;           // For slider
+  optional int32 min = 4;
+  optional int32 max = 5;
   optional string default_value = 6;
-  repeated string options = 7;      // For dropdown
-  optional string validation = 8;   // Regex for text
-  optional string label_on = 9;     // For toggle
-  optional string label_off = 10;   // For toggle
-
-  // Dynamic default value support
-  optional string default_value_command = 11;  // Shell command to get current value
-  optional string default_value_pattern = 12;  // Regex pattern to extract value from output
+  repeated string options = 7;
+  optional string validation = 8;
+  optional string label_on = 9;
+  optional string label_off = 10;
+  optional string default_value_command = 11;
+  optional string default_value_pattern = 12;
 }
 
-enum ParameterType {
-  PARAMETER_TYPE_UNSPECIFIED = 0;
-  PARAMETER_TYPE_SLIDER = 1;
-  PARAMETER_TYPE_TEXT = 2;
-  PARAMETER_TYPE_TOGGLE = 3;
-  PARAMETER_TYPE_DROPDOWN = 4;
-}
-
-// Command execution
-message ExecuteCommandRequest {
-  string command_id = 1;
-  map<string, string> parameters = 2;
-}
-
-message ExecuteCommandResponse {
-  oneof response {
-    string stdout = 1;      // Chunk of stdout
-    string stderr = 2;      // Chunk of stderr
-    int32 exit_code = 3;    // Final exit code (last message)
-    string error = 4;       // Error message if command fails to start
+// Session streaming
+message SessionClientMessage {
+  string session_id = 1;
+  oneof payload {
+    SessionOpen open = 2;
+    SessionInput input = 3;
+    SessionResize resize = 4;
+    SessionHeartbeat heartbeat = 5;
+    SessionClose close = 6;
   }
+}
 
-  // Metadata
-  optional int64 timestamp_ms = 5;
+message SessionServerMessage {
+  string session_id = 1;
+  oneof payload {
+    SessionReady ready = 2;
+    SessionOutput output = 3;
+    SessionExit exit = 4;
+    SessionError error = 5;
+    SessionHeartbeatAck heartbeat = 6;
+    SessionClosed closed = 7;
+  }
+}
+
+message SessionOpen {
+  string capability_id = 1;
+  map<string, string> parameters = 2;
+  optional string request_id = 3;
+}
+
+message SessionInput {
+  bytes data = 1;
+  optional bool binary = 2;
+}
+
+message SessionResize {
+  uint32 cols = 1;
+  uint32 rows = 2;
+}
+
+message SessionHeartbeat {
+  int64 timestamp_ms = 1;
+}
+
+message SessionClose {
+  optional string reason = 1;
+}
+
+message SessionReady {
+  string capability_id = 1;
+  SessionMode session_mode = 2;
+  optional string message = 3;
+}
+
+message SessionOutput {
+  bytes data = 1;
+  optional bool stderr = 2;
+  optional bool binary = 3;
+  optional int64 timestamp_ms = 4;
+}
+
+message SessionExit {
+  int32 exit_code = 1;
+  optional bool timed_out = 2;
+  optional string message = 3;
+}
+
+message SessionError {
+  string message = 1;
+  optional int32 code = 2;
+}
+
+message SessionHeartbeatAck {
+  int64 timestamp_ms = 1;
+  optional int64 latency_hint_ms = 2;
+}
+
+message SessionClosed {
+  optional string reason = 1;
 }
 
 // Config hot-reload messages

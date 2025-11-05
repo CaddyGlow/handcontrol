@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use async_stream::try_stream;
+use bytes::Bytes;
 use futures_util::stream::Stream;
 use socket2::{Domain, Protocol, Socket, Type};
 use std::convert::TryFrom;
@@ -19,23 +20,31 @@ use super::proto::remote_control_server::{RemoteControl, RemoteControlServer};
 use super::proto::{
     ApprovePairingRequest, ApprovePairingResponse, CheckPairingStatusRequest,
     CheckPairingStatusResponse, ConfigUpdateNotification, EnrollRequest, EnrollResponse,
-    ExecuteCommandRequest, ExecuteCommandResponse, GenerateEnrollmentQrRequest,
-    GenerateEnrollmentQrResponse, GetConfigVersionRequest, GetConfigVersionResponse,
-    ListCommandsRequest, ListCommandsResponse, ListPendingPairingsRequest,
-    ListPendingPairingsResponse, PendingPairingInfo, RequestPairingRequest, RequestPairingResponse,
-    ServerInfoRequest, ServerInfoResponse, WatchConfigUpdatesRequest,
+    GenerateEnrollmentQrRequest, GenerateEnrollmentQrResponse, GetConfigVersionRequest,
+    GetConfigVersionResponse, ListCapabilitiesRequest, ListCapabilitiesResponse,
+    ListPendingPairingsRequest, ListPendingPairingsResponse, PendingPairingInfo,
+    RequestPairingRequest, RequestPairingResponse, ServerInfoRequest, ServerInfoResponse,
+    SessionClientMessage, SessionServerMessage, WatchConfigUpdatesRequest,
 };
+use super::proto::{session_client_message, session_server_message};
 
+use crate::capabilities::{
+    CapabilityKind as CapabilityKindConfig, CapabilityMetadata as CapabilityMetadataRuntime,
+    CapabilityParameter as CapabilityParameterRuntime, CapabilityRegistry,
+    SessionMode as CapabilitySessionMode,
+};
 use crate::cli::approve::approve_pairing_request;
 use crate::config::{Config, ConfigBroadcaster};
 use crate::notifications::NotificationManager;
 use crate::security::certificates::{ClientCertificate, ServerCertificate};
 use crate::security::enrollment::EnrollmentTokenManager;
 use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
-use crate::security::tls::{build_permissive_server_config, build_server_config_no_client_auth};
+use crate::security::tls::build_permissive_server_config;
 use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
 use crate::relay::tokens::{BINDING_TYPE_CLIENT_ID, BINDING_TYPE_ENROLLMENT_TOKEN};
+use crate::sessions::manager::SessionHandle;
+use crate::sessions::{SessionClientEvent, SessionId, SessionServerEvent};
 use crate::storage::clients::ClientStore;
 use sha2::{Digest, Sha256};
 
@@ -52,6 +61,7 @@ pub struct RemoteControlService {
     config_broadcaster: Arc<ConfigBroadcaster>,
     last_config_update: Arc<AtomicU64>,
     token_issuer: Option<Arc<crate::relay::TokenIssuer>>,
+    session_manager: crate::sessions::manager::SessionManager,
 }
 
 impl RemoteControlService {
@@ -80,6 +90,7 @@ impl RemoteControlService {
             config_broadcaster,
             last_config_update,
             token_issuer,
+            session_manager: crate::sessions::manager::SessionManager::new(),
         }
     }
 
@@ -802,18 +813,17 @@ impl RemoteControl for RemoteControlService {
         Ok(Response::new(response))
     }
 
-    async fn list_commands(
+    async fn list_capabilities(
         &self,
-        request: Request<ListCommandsRequest>,
-    ) -> Result<Response<ListCommandsResponse>, Status> {
-        // Extract client IP
+        request: Request<ListCapabilitiesRequest>,
+    ) -> Result<Response<ListCapabilitiesResponse>, Status> {
         let client_ip = crate::utils::network::extract_client_ip_from_headers(
             request.metadata(),
             request.remote_addr(),
         );
 
         info!(
-            "ListCommands RPC called (IP: {})",
+            "ListCapabilities RPC called (IP: {})",
             client_ip
                 .as_ref()
                 .map(|ip| ip.to_string())
@@ -822,89 +832,58 @@ impl RemoteControl for RemoteControlService {
 
         let _ = self.ensure_enrolled_client(&request)?;
 
-        // Read config once and use it throughout
-        let config = self.config.read().unwrap();
+        let config_guard = self.config.read().unwrap();
+        let registry = CapabilityRegistry::from_config(&config_guard).map_err(|e| {
+            warn!("Failed to build capability registry: {}", e);
+            Status::internal("Failed to load capabilities")
+        })?;
         let config_version = self.config_version.load(Ordering::SeqCst);
 
-        // Convert config commands to protobuf format
-        let commands: Vec<super::proto::Command> = config
-            .command
-            .iter()
-            .map(|cmd| {
-                let parameters = cmd
-                    .parameters
-                    .iter()
-                    .map(|p| {
-                        // Map parameter type string to protobuf enum
-                        let param_type = match p.param_type.as_str() {
-                            "slider" => super::proto::ParameterType::Slider as i32,
-                            "text" => super::proto::ParameterType::Text as i32,
-                            "toggle" => super::proto::ParameterType::Toggle as i32,
-                            "dropdown" => super::proto::ParameterType::Dropdown as i32,
-                            _ => super::proto::ParameterType::Unspecified as i32,
-                        };
-
-                        super::proto::Parameter {
-                            name: p.name.clone(),
-                            r#type: param_type,
-                            description: p.description.clone().unwrap_or_default(),
-                            min: p.min,
-                            max: p.max,
-                            default_value: p.default.clone(),
-                            options: p.options.clone(),
-                            validation: p.validation.clone(),
-                            label_on: p.label_on.clone(),
-                            label_off: p.label_off.clone(),
-                            default_value_command: p.default_value_command.clone(),
-                            default_value_pattern: p.default_value_pattern.clone(),
-                        }
-                    })
-                    .collect();
-
-                super::proto::Command {
-                    id: cmd.id.clone(),
-                    name: cmd.name.clone(),
-                    description: cmd.description.clone().unwrap_or_default(),
-                    icon: cmd.icon.clone().unwrap_or_default(),
-                    tags: cmd.tags.clone(),
-                    parameters,
-                    requires_confirmation: Some(cmd.requires_confirmation),
-                    show_output: Some(cmd.show_output),
-                }
-            })
+        let capabilities = registry
+            .list_metadata()
+            .into_iter()
+            .map(proto_from_metadata)
             .collect();
 
-        info!(
-            "Returning {} commands (config version {})",
-            commands.len(),
-            config_version
-        );
-
-        Ok(Response::new(ListCommandsResponse {
-            commands,
+        Ok(Response::new(ListCapabilitiesResponse {
+            capabilities,
             config_version,
         }))
     }
 
-    type ExecuteCommandStream =
-        tokio_stream::wrappers::ReceiverStream<Result<ExecuteCommandResponse, Status>>;
+    type OpenSessionStream =
+        tokio_stream::wrappers::ReceiverStream<Result<SessionServerMessage, Status>>;
 
-    async fn execute_command(
+    async fn open_session(
         &self,
-        request: Request<ExecuteCommandRequest>,
-    ) -> Result<Response<Self::ExecuteCommandStream>, Status> {
-        // Extract client IP
+        request: Request<tonic::Streaming<SessionClientMessage>>,
+    ) -> Result<Response<Self::OpenSessionStream>, Status> {
         let client_ip = crate::utils::network::extract_client_ip_from_headers(
             request.metadata(),
             request.remote_addr(),
         );
 
         let fingerprint = self.ensure_enrolled_client(&request)?;
-        let req = request.into_inner();
+        let mut stream = request.into_inner();
+
+        let initial_message = stream
+            .message()
+            .await?
+            .ok_or_else(|| Status::invalid_argument("Missing initial session message"))?;
+
+        let open = match initial_message.payload {
+            Some(session_client_message::Payload::Open(open)) => open,
+            _ => {
+                warn!("First message for OpenSession must be SessionOpen");
+                return Err(Status::invalid_argument(
+                    "First message must be SessionOpen",
+                ));
+            }
+        };
 
         info!(
-            "ExecuteCommand RPC called: command_id={} (IP: {}, fingerprint={})",
-            req.command_id,
+            "OpenSession RPC called: capability_id={} (IP: {}, fingerprint={})",
+            open.capability_id,
             client_ip
                 .as_ref()
                 .map(|ip| ip.to_string())
@@ -912,173 +891,60 @@ impl RemoteControl for RemoteControlService {
             fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
         );
 
-        // Read config and resolve command execution details
-        let config_guard = self.config.read().unwrap();
-
-        let (command, shell_command) = if req.command_id == "_dynamic_default" {
-            let requested = req.parameters.get("_cmd").cloned().unwrap_or_default();
-            let trimmed = requested.trim().to_string();
-
-            if trimmed.is_empty() {
-                warn!("Dynamic default request missing _cmd parameter");
-                return Err(Status::invalid_argument("Missing _cmd parameter"));
-            }
-
-            let is_allowed = config_guard
-                .command
-                .iter()
-                .flat_map(|cmd| cmd.parameters.iter())
-                .filter_map(|param| param.default_value_command.as_ref())
-                .any(|value| value.trim() == trimmed);
-
-            if !is_allowed {
-                warn!("Dynamic default command not permitted: {}", trimmed);
-                return Err(Status::permission_denied(
-                    "Dynamic default command not permitted",
-                ));
-            }
-
-            (
-                crate::config::parser::CommandConfig {
-                    id: "_dynamic_default".to_string(),
-                    name: "Dynamic Default".to_string(),
-                    description: Some("Internal dynamic default executor".to_string()),
-                    icon: None,
-                    shell: trimmed.clone(),
-                    tags: vec!["internal".to_string()],
-                    timeout_seconds: 3,
-                    env: std::collections::HashMap::new(),
-                    parameters: vec![],
-                    requires_confirmation: false,
-                    show_output: false,
-                },
-                trimmed,
-            )
-        } else {
-            let command = config_guard
-                .command
-                .iter()
-                .find(|cmd| cmd.id == req.command_id)
-                .cloned()
-                .ok_or_else(|| {
-                    warn!("Command not found: {}", req.command_id);
-                    Status::not_found(format!("Command '{}' not found", req.command_id))
-                })?;
-
-            let validated_params = crate::commands::validate_parameters(&command, &req.parameters)
-                .map_err(|e| {
-                    warn!(
-                        "Parameter validation failed for command {}: {}",
-                        req.command_id, e
-                    );
-                    Status::invalid_argument(format!("Parameter validation failed: {}", e))
-                })?;
-
-            let shell_command =
-                crate::commands::substitute_parameters(&command.shell, &validated_params).map_err(
-                    |e| {
-                        warn!(
-                            "Parameter substitution failed for command {}: {}",
-                            req.command_id, e
-                        );
-                        Status::internal(format!("Parameter substitution failed: {}", e))
-                    },
-                )?;
-
-            (command, shell_command)
+        let config_snapshot = {
+            let guard = self.config.read().unwrap();
+            guard.clone()
         };
+        let registry = CapabilityRegistry::from_config(&config_snapshot).map_err(|e| {
+            warn!("Failed to build capability registry: {}", e);
+            Status::internal("Failed to load capabilities")
+        })?;
 
-        drop(config_guard);
+        let capability_handle = registry.get(&open.capability_id).ok_or_else(|| {
+            warn!("Capability not found: {}", open.capability_id);
+            Status::not_found(format!("Capability '{}' not found", open.capability_id))
+        })?;
 
-        // Create channel for streaming output
-        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let capability = capability_handle.capability();
 
-        // Clone command for async task
-        let command = command.clone();
-        let command_id = req.command_id.clone();
+        let session_handle = self
+            .session_manager
+            .open_session(capability, open.parameters.clone(), fingerprint.clone())
+            .await
+            .map_err(|e| {
+                warn!("Failed to open capability session: {}", e);
+                Status::internal("Failed to open capability session")
+            })?;
 
-        // Spawn task to execute command
-        tokio::spawn(async move {
-            let tx_clone = tx.clone();
+        let session_manager = self.session_manager.clone();
+        let SessionHandle {
+            id: session_id,
+            capability_id,
+            metadata,
+            session_mode,
+            client_sender,
+            server_receiver,
+        } = session_handle;
 
-            let result = crate::commands::execute_command(&command, shell_command, move |output| {
-                let response = match output {
-                    crate::commands::CommandOutput::Stdout(text) => ExecuteCommandResponse {
-                        response: Some(super::proto::execute_command_response::Response::Stdout(
-                            text,
-                        )),
-                        timestamp_ms: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64,
-                        ),
-                    },
-                    crate::commands::CommandOutput::Stderr(text) => ExecuteCommandResponse {
-                        response: Some(super::proto::execute_command_response::Response::Stderr(
-                            text,
-                        )),
-                        timestamp_ms: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64,
-                        ),
-                    },
-                };
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(128);
 
-                // Send output to stream (non-blocking send in callback)
-                if let Err(e) = tx_clone.try_send(Ok(response)) {
-                    // Client disconnected or channel full
-                    warn!("Failed to send output to stream: {}", e);
-                }
-            })
-            .await;
+        tokio::spawn(forward_session_events(
+            session_manager,
+            session_id.clone(),
+            capability_id,
+            metadata,
+            session_mode,
+            server_receiver,
+            response_tx.clone(),
+        ));
 
-            match result {
-                Ok(exec_result) => {
-                    info!(
-                        "Command execution completed: id={}, exit_code={}, timed_out={}",
-                        command_id, exec_result.exit_code, exec_result.timed_out
-                    );
+        tokio::spawn(forward_client_events(
+            session_id.clone(),
+            stream,
+            client_sender,
+        ));
 
-                    // Send final message with exit code
-                    let final_response = ExecuteCommandResponse {
-                        response: Some(super::proto::execute_command_response::Response::ExitCode(
-                            exec_result.exit_code,
-                        )),
-                        timestamp_ms: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64,
-                        ),
-                    };
-
-                    let _ = tx.send(Ok(final_response)).await;
-                }
-                Err(e) => {
-                    warn!("Command execution failed: id={}, error={}", command_id, e);
-
-                    // Send error message
-                    let error_response = ExecuteCommandResponse {
-                        response: Some(super::proto::execute_command_response::Response::Error(
-                            format!("Command execution failed: {}", e),
-                        )),
-                        timestamp_ms: Some(
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap()
-                                .as_millis() as i64,
-                        ),
-                    };
-
-                    let _ = tx.send(Ok(error_response)).await;
-                }
-            }
-        });
-
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
         Ok(Response::new(stream))
     }
 
@@ -1179,22 +1045,235 @@ impl RemoteControl for RemoteControlService {
     }
 }
 
+fn proto_from_metadata(metadata: CapabilityMetadataRuntime) -> super::proto::Capability {
+    let kind = match metadata.kind {
+        CapabilityKindConfig::ShellScript => super::proto::CapabilityKind::ShellScript as i32,
+        CapabilityKindConfig::ShellInteractive => {
+            super::proto::CapabilityKind::ShellInteractive as i32
+        }
+        CapabilityKindConfig::FileTransfer => super::proto::CapabilityKind::FileTransfer as i32,
+    };
+
+    let session_mode = match metadata.session_mode {
+        CapabilitySessionMode::OneShot => super::proto::SessionMode::OneShot as i32,
+        CapabilitySessionMode::Realtime => super::proto::SessionMode::Realtime as i32,
+        CapabilitySessionMode::Upload => super::proto::SessionMode::Upload as i32,
+        CapabilitySessionMode::Download => super::proto::SessionMode::Download as i32,
+    };
+
+    let parameters = metadata
+        .parameters
+        .iter()
+        .map(proto_from_parameter)
+        .collect();
+
+    super::proto::Capability {
+        id: metadata.id,
+        name: metadata.name,
+        description: metadata.description.unwrap_or_default(),
+        tags: metadata.tags,
+        kind,
+        session_mode,
+        parameters,
+        requires_confirmation: Some(metadata.requires_confirmation),
+        privileged: Some(metadata.privileged),
+        version: None,
+    }
+}
+
+fn proto_from_parameter(param: &CapabilityParameterRuntime) -> super::proto::CapabilityParameter {
+    let param_type = match param.param_type.as_str() {
+        "slider" => super::proto::CapabilityParameterType::Slider as i32,
+        "text" => super::proto::CapabilityParameterType::Text as i32,
+        "toggle" => super::proto::CapabilityParameterType::Toggle as i32,
+        "dropdown" => super::proto::CapabilityParameterType::Dropdown as i32,
+        _ => super::proto::CapabilityParameterType::Unspecified as i32,
+    };
+
+    super::proto::CapabilityParameter {
+        name: param.name.clone(),
+        r#type: param_type,
+        description: param.description.clone().unwrap_or_default(),
+        min: param.min,
+        max: param.max,
+        default_value: param.default_value.clone(),
+        options: param.options.clone(),
+        validation: param.validation.clone(),
+        label_on: param.label_on.clone(),
+        label_off: param.label_off.clone(),
+        default_value_command: param.default_value_command.clone(),
+        default_value_pattern: param.default_value_pattern.clone(),
+    }
+}
+
+async fn forward_session_events(
+    session_manager: crate::sessions::manager::SessionManager,
+    session_id: SessionId,
+    capability_id: String,
+    metadata: CapabilityMetadataRuntime,
+    session_mode: CapabilitySessionMode,
+    mut receiver: tokio::sync::mpsc::Receiver<SessionServerEvent>,
+    tx: tokio::sync::mpsc::Sender<Result<SessionServerMessage, Status>>,
+) {
+    let session_id_str = session_id.to_string();
+
+    while let Some(event) = receiver.recv().await {
+        let message = session_event_to_proto(
+            &session_id_str,
+            &capability_id,
+            &metadata,
+            session_mode,
+            event,
+        );
+        if tx.send(Ok(message)).await.is_err() {
+            break;
+        }
+    }
+
+    session_manager.remove(&session_id);
+}
+
+async fn forward_client_events(
+    session_id: SessionId,
+    mut stream: tonic::Streaming<SessionClientMessage>,
+    sender: tokio::sync::mpsc::Sender<SessionClientEvent>,
+) {
+    let session_id_str = session_id.to_string();
+
+    loop {
+        match stream.message().await {
+            Ok(Some(message)) => {
+                if !message.session_id.is_empty() && message.session_id != session_id_str {
+                    warn!(
+                        "Received session message for mismatched session_id={} (expected {})",
+                        message.session_id, session_id_str
+                    );
+                    continue;
+                }
+
+                if let Some(event) = client_message_to_event(message) {
+                    if sender.send(event).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            Ok(None) => {
+                let _ = sender
+                    .send(SessionClientEvent::Close {
+                        reason: Some("Client stream closed".to_string()),
+                    })
+                    .await;
+                break;
+            }
+            Err(status) => {
+                warn!("Error reading client session stream: {}", status);
+                let _ = sender
+                    .send(SessionClientEvent::Close {
+                        reason: Some("Stream error".to_string()),
+                    })
+                    .await;
+                break;
+            }
+        }
+    }
+}
+
+fn client_message_to_event(message: SessionClientMessage) -> Option<SessionClientEvent> {
+    match message.payload {
+        Some(session_client_message::Payload::Input(input)) => Some(SessionClientEvent::Input {
+            data: Bytes::from(input.data),
+            binary: input.binary.unwrap_or_default(),
+        }),
+        Some(session_client_message::Payload::Resize(resize)) => Some(SessionClientEvent::Resize {
+            cols: resize.cols,
+            rows: resize.rows,
+        }),
+        Some(session_client_message::Payload::Heartbeat(heartbeat)) => {
+            Some(SessionClientEvent::Heartbeat {
+                timestamp_ms: heartbeat.timestamp_ms,
+            })
+        }
+        Some(session_client_message::Payload::Close(close)) => Some(SessionClientEvent::Close {
+            reason: close.reason,
+        }),
+        None => None,
+        Some(session_client_message::Payload::Open(_)) => None,
+    }
+}
+
+fn session_event_to_proto(
+    session_id: &str,
+    capability_id: &str,
+    _metadata: &CapabilityMetadataRuntime,
+    session_mode: CapabilitySessionMode,
+    event: SessionServerEvent,
+) -> SessionServerMessage {
+    let session_mode_proto = match session_mode {
+        CapabilitySessionMode::OneShot => super::proto::SessionMode::OneShot as i32,
+        CapabilitySessionMode::Realtime => super::proto::SessionMode::Realtime as i32,
+        CapabilitySessionMode::Upload => super::proto::SessionMode::Upload as i32,
+        CapabilitySessionMode::Download => super::proto::SessionMode::Download as i32,
+    };
+
+    let payload = match event {
+        SessionServerEvent::Ready { message } => {
+            session_server_message::Payload::Ready(super::proto::SessionReady {
+                capability_id: capability_id.to_string(),
+                session_mode: session_mode_proto,
+                message,
+            })
+        }
+        SessionServerEvent::Output {
+            data,
+            stderr,
+            binary,
+            timestamp_ms,
+        } => session_server_message::Payload::Output(super::proto::SessionOutput {
+            data: data.to_vec(),
+            stderr: Some(stderr),
+            binary: Some(binary),
+            timestamp_ms,
+        }),
+        SessionServerEvent::Exit {
+            exit_code,
+            timed_out,
+            message,
+        } => session_server_message::Payload::Exit(super::proto::SessionExit {
+            exit_code,
+            timed_out: Some(timed_out),
+            message,
+        }),
+        SessionServerEvent::Error { message, code } => {
+            session_server_message::Payload::Error(super::proto::SessionError { message, code })
+        }
+        SessionServerEvent::HeartbeatAck {
+            timestamp_ms,
+            latency_hint_ms,
+        } => session_server_message::Payload::Heartbeat(super::proto::SessionHeartbeatAck {
+            timestamp_ms,
+            latency_hint_ms,
+        }),
+        SessionServerEvent::Closed { reason } => {
+            session_server_message::Payload::Closed(super::proto::SessionClosed { reason })
+        }
+    };
+
+    SessionServerMessage {
+        session_id: session_id.to_string(),
+        payload: Some(payload),
+    }
+}
+
 /// Start the gRPC server with TLS
 pub async fn start_server(
     addr: SocketAddr,
     service: RemoteControlService,
     server_cert: Arc<ServerCertificate>,
-    require_client_cert: bool,
 ) -> Result<()> {
     info!("Starting gRPC server with TLS on {}", addr);
 
-    let tls_config = if require_client_cert {
-        build_permissive_server_config(&server_cert)
-            .context("Failed to build TLS server configuration")?
-    } else {
-        build_server_config_no_client_auth(&server_cert)
-            .context("Failed to build TLS server configuration")?
-    };
+    let tls_config = build_permissive_server_config(&server_cert)
+        .context("Failed to build TLS server configuration")?;
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     let std_listener =
@@ -1275,10 +1354,11 @@ mod tests {
     use super::*;
     use crate::config::ConfigBroadcaster;
     use crate::config::parser::{
-        CommandConfig, Config, EnrollmentConfig, NetworkConfig, RelayConfig, SecurityConfig,
-        ServerConfig,
+        CapabilityAclConfig, CapabilityConfig, CapabilityDefinition, CapabilitySessionMode, Config,
+        EnrollmentConfig, NetworkConfig, RelayConfig, SecurityConfig, ServerConfig,
+        ShellScriptDefinition,
     };
-    use crate::grpc::proto::ListCommandsRequest;
+    use crate::grpc::proto::ListCapabilitiesRequest;
     use crate::grpc::proto::remote_control_client::RemoteControlClient;
     use crate::notifications::{NotificationManager, NotificationProvider};
     use crate::security::certificates::ClientCertificate;
@@ -1329,21 +1409,25 @@ mod tests {
                 ClientStore::new(clients_dir).expect("create client store"),
             ));
 
-            let command = CommandConfig {
+            let capability = CapabilityConfig {
                 id: "echo".to_string(),
                 name: "Echo".to_string(),
                 description: Some("test".to_string()),
-                icon: None,
-                shell: "echo test".to_string(),
                 tags: Vec::new(),
-                timeout_seconds: 5,
-                env: std::collections::HashMap::new(),
-                parameters: Vec::new(),
                 requires_confirmation: false,
-                show_output: true,
+                privileged: false,
+                parameters: Vec::new(),
+                acl: CapabilityAclConfig::default(),
+                definition: CapabilityDefinition::ShellScript(ShellScriptDefinition {
+                    command: "echo test".to_string(),
+                    timeout_seconds: 5,
+                    env: std::collections::HashMap::new(),
+                    show_output: true,
+                    session_mode: CapabilitySessionMode::OneShot,
+                }),
             };
 
-            let mut config = Config {
+            let config = Config {
                 server: ServerConfig {
                     port: 0,
                     bind_address: "127.0.0.1".to_string(),
@@ -1360,10 +1444,8 @@ mod tests {
                 },
                 network: NetworkConfig::default(),
                 relay: RelayConfig::default(),
-                command: vec![command],
+                capabilities: vec![capability],
             };
-            // Ensure we enforce client certificates in tests
-            config.security.require_client_cert = true;
 
             let config_arc = Arc::new(RwLock::new(config));
             let server_cert =
@@ -1501,7 +1583,7 @@ mod tests {
         let mut client = make_client(&harness, None).await;
 
         let status = client
-            .list_commands(Request::new(ListCommandsRequest {}))
+            .list_capabilities(Request::new(ListCapabilitiesRequest {}))
             .await
             .expect_err("unauthenticated client should be rejected");
 
@@ -1521,7 +1603,7 @@ mod tests {
         let mut client = make_client(&harness, Some(identity)).await;
 
         let status = client
-            .list_commands(Request::new(ListCommandsRequest {}))
+            .list_capabilities(Request::new(ListCapabilitiesRequest {}))
             .await
             .expect_err("unenrolled client should be rejected");
 
@@ -1549,12 +1631,12 @@ mod tests {
 
         let mut client = make_client(&harness, Some(identity)).await;
         let response = client
-            .list_commands(Request::new(ListCommandsRequest {}))
+            .list_capabilities(Request::new(ListCapabilitiesRequest {}))
             .await
             .expect("enrolled client should succeed")
             .into_inner();
 
-        assert_eq!(response.commands.len(), 1);
+        assert_eq!(response.capabilities.len(), 1);
 
         harness.shutdown().await;
     }

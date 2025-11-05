@@ -13,8 +13,8 @@ pub mod proto {
 
 pub use certificates::CertificatePaths;
 pub use commands::{
-    execute_command, list_commands, validate_parameters, CommandList, CommandParameter,
-    CommandParameterType, CommandStreamEvent, CommandSummary,
+    execute_command, list_commands, validate_parameters, CommandKind, CommandList,
+    CommandParameter, CommandParameterType, CommandSessionMode, CommandStreamEvent, CommandSummary,
 };
 pub use config::{
     CliConfig, ClientConfig, ConnectionConfig, DeviceConfig, DiscoveryConfig, NetworkConfig,

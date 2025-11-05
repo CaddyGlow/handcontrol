@@ -442,7 +442,7 @@ private fun handleLibraryDrop(
                     id = UUID.randomUUID().toString(),
                     commandId = item.command.id,
                     labelOverride = null,
-                    iconOverride = item.command.icon.takeIf { it.isNotBlank() },
+                    iconOverride = item.command.icon?.takeIf { it.isNotBlank() },
                     requiresConfirmationOverride = null,
                     showOutputOverride = null
                 )

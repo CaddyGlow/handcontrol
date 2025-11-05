@@ -4,12 +4,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
-import com.handcontrol.grpc.Parameter
+import com.handcontrol.grpc.CapabilityParameter
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DropdownParameterInput(
-    parameter: Parameter,
+    parameter: CapabilityParameter,
     currentValue: String,
     onValueChange: (String) -> Unit,
     isError: Boolean,

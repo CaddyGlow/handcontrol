@@ -10,11 +10,11 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.handcontrol.grpc.Parameter
+import com.handcontrol.grpc.CapabilityParameter
 
 @Composable
 fun SliderParameterInput(
-    parameter: Parameter,
+    parameter: CapabilityParameter,
     currentValue: String,
     onValueChange: (String) -> Unit,
     isError: Boolean,

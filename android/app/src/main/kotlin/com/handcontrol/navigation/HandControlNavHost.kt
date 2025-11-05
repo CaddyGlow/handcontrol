@@ -135,6 +135,9 @@ fun HandControlNavHost(
                 onNavigateToCommandExecution = { serverId, commandId ->
                     navController.navigate(Route.CommandExecution(serverId, commandId))
                 },
+                onNavigateToShellSession = { serverId, commandId ->
+                    navController.navigate(Route.ShellSession(serverId, commandId))
+                },
                 onNavigateBack = {
                     navController.popBackStack()
                 },
@@ -152,6 +155,17 @@ fun HandControlNavHost(
         composable<Route.CommandExecution> { backStackEntry ->
             val route = backStackEntry.toRoute<Route.CommandExecution>()
             com.handcontrol.feature.commands.CommandExecutionScreen(
+                serverId = route.serverId,
+                commandId = route.commandId,
+                onNavigateBack = {
+                    navController.popBackStack()
+                }
+            )
+        }
+
+        composable<Route.ShellSession> { backStackEntry ->
+            val route = backStackEntry.toRoute<Route.ShellSession>()
+            com.handcontrol.feature.commands.shell.ShellSessionScreen(
                 serverId = route.serverId,
                 commandId = route.commandId,
                 onNavigateBack = {

@@ -65,7 +65,10 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import com.handcontrol.data.commands.Command
+import com.handcontrol.data.commands.CommandKind
+import com.handcontrol.data.commands.CommandSessionMode
 import com.handcontrol.data.commands.ParameterType
+import com.handcontrol.data.commands.defaultValueFor
 import com.handcontrol.ui.components.CommandConfirmationDialog
 import com.handcontrol.ui.components.CommandExecutionFeedback
 import com.handcontrol.ui.components.SingleParameterDialog
@@ -82,6 +85,7 @@ import com.handcontrol.feature.commands.remote.RemoteQuickAction
 fun CommandListScreen(
     serverId: String,
     onNavigateToCommandExecution: (String, String) -> Unit,
+    onNavigateToShellSession: (String, String) -> Unit,
     onNavigateBack: () -> Unit = {},
     onNavigateToServerList: () -> Unit = {},
     modifier: Modifier = Modifier,
@@ -309,6 +313,9 @@ fun CommandListScreen(
                                         onShowSingleParameter = {
                                             selectedCommand = command
                                             showSingleParameterDialog = true
+                                        },
+                                        onNavigateToShell = {
+                                            onNavigateToShellSession(serverId, command.id)
                                         }
                                     )
                                 },
@@ -581,8 +588,17 @@ private fun handleCommandClick(
     onNavigateToExecution: () -> Unit,
     onShowConfirmation: () -> Unit,
     onShowFeedback: () -> Unit = {},
-    onShowSingleParameter: () -> Unit = {}
+    onShowSingleParameter: () -> Unit = {},
+    onNavigateToShell: () -> Unit
 ) {
+    val isOneShot = command.kind == CommandKind.SHELL_SCRIPT &&
+        command.sessionMode == CommandSessionMode.ONE_SHOT
+
+    if (!isOneShot) {
+        onNavigateToShell()
+        return
+    }
+
     when {
         // Single parameter - show inline dialog
         command.parameters.size == 1 -> {
@@ -909,11 +925,5 @@ private fun EmptyCommandsPreview() {
  * Get default value for a parameter type
  */
 private fun getDefaultForParameterType(type: ParameterType): String {
-    return when (type) {
-        ParameterType.SLIDER -> "0"
-        ParameterType.TEXT -> ""
-        ParameterType.TOGGLE -> "false"
-        ParameterType.DROPDOWN -> ""
-        ParameterType.UNSPECIFIED -> ""
-    }
+    return defaultValueFor(type)
 }

@@ -32,6 +32,7 @@ tokio-rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"
+libc = { workspace = true }
 thiserror = "2.0"
 time = { version = "0.3", features = ["serde", "std", "formatting", "parsing"] }
 tokio = { workspace = true }

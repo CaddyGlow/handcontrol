@@ -3,22 +3,29 @@ use clap::{Parser, Subcommand};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
-    list_commands as fetch_command_list,
+    list_commands as fetch_command_list, open_capability_session,
     storage::{ServerRegistry, ServerRegistryEntry},
-    validate_parameters, ApprovalEnrollmentInput, CommandKind, CommandList, CommandSessionMode,
-    CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CapabilitySessionEvent, CommandKind, CommandList,
+    CommandSessionMode, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
 };
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::IsTerminal;
 use std::io::{self, Read, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
-use tracing::debug;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tracing::{debug, warn};
 use uuid::Uuid;
+
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size as terminal_size};
+
+#[cfg(unix)]
+use tokio::signal::unix::{signal, SignalKind};
 
 #[derive(Parser)]
 #[command(
@@ -396,64 +403,256 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
     let sanitized = validate_parameters(command, &provided)?;
     let actual_command_id = command.id.clone();
 
-    if command.session_mode != CommandSessionMode::OneShot {
-        bail!(
+    match command.session_mode {
+        CommandSessionMode::OneShot => {
+            if command.kind != CommandKind::ShellScript {
+                bail!(
+                    "Capability '{}' has type {:?} which is not supported by this CLI",
+                    command.name,
+                    command.kind
+                );
+            }
+
+            if command.requires_confirmation && !quiet {
+                println!(
+                    "Command '{}' requires confirmation on the server before execution",
+                    command.name
+                );
+            }
+
+            let exit_code = if stream {
+                let mut on_event = |event: CommandStreamEvent| {
+                    if quiet {
+                        return;
+                    }
+                    print_stream_event(&event);
+                };
+                execute_command(entry, &actual_command_id, sanitized, &mut on_event).await?
+            } else {
+                let mut captured: Vec<CommandStreamEvent> = Vec::new();
+                let mut capture = |event: CommandStreamEvent| {
+                    if quiet {
+                        return;
+                    }
+                    captured.push(event);
+                };
+                let exit =
+                    execute_command(entry, &actual_command_id, sanitized, &mut capture).await?;
+
+                if !quiet {
+                    replay_buffered_events(&captured)?;
+                }
+
+                exit
+            };
+
+            if !quiet {
+                if stream {
+                    println!("EXIT {}", exit_code);
+                } else {
+                    println!("Exit code: {}", exit_code);
+                }
+            }
+
+            if exit_code != 0 {
+                bail!("Remote command exited with code {}", exit_code);
+            }
+
+            Ok(())
+        }
+        CommandSessionMode::Realtime => {
+            if command.kind != CommandKind::ShellInteractive {
+                bail!(
+                    "Capability '{}' has type {:?} which is not supported by this CLI",
+                    command.name,
+                    command.kind
+                );
+            }
+            if quiet {
+                bail!("--quiet is not supported for realtime capabilities");
+            }
+            if command.requires_confirmation {
+                println!(
+                    "Capability '{}' requires confirmation on the server before execution",
+                    command.name
+                );
+            }
+            run_interactive_shell(entry, command, sanitized).await
+        }
+        _ => bail!(
             "Capability '{}' requires {:?} sessions which are not supported by this CLI",
             command.name,
             command.session_mode
-        );
+        ),
+    }
+}
+
+async fn run_interactive_shell(
+    entry: &ServerRegistryEntry,
+    command: &CommandSummary,
+    parameters: HashMap<String, String>,
+) -> Result<()> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        bail!("Realtime capabilities require an interactive TTY");
     }
 
-    if command.kind != CommandKind::ShellScript {
+    let mut session = open_capability_session(entry, &command.id, parameters).await?;
+    if session.session_mode() != CommandSessionMode::Realtime {
         bail!(
-            "Capability '{}' has type {:?} which is not supported by this CLI",
+            "Capability '{}' reported unsupported session mode {:?}",
             command.name,
-            command.kind
+            session.session_mode()
         );
     }
 
-    if command.requires_confirmation && !quiet {
+    if let Some(message) = session.ready_message() {
+        if !message.is_empty() {
+            println!("{message}");
+        }
+    } else {
         println!(
-            "Command '{}' requires confirmation on the server before execution",
+            "Interactive session '{}' ready. Press Ctrl+C to terminate.",
             command.name
         );
     }
 
-    let exit_code = if stream {
-        let mut on_event = |event: CommandStreamEvent| {
-            if quiet {
-                return;
-            }
-            print_stream_event(&event);
-        };
-        execute_command(entry, &actual_command_id, sanitized, &mut on_event).await?
-    } else {
-        let mut captured: Vec<CommandStreamEvent> = Vec::new();
-        let mut capture = |event: CommandStreamEvent| {
-            if quiet {
-                return;
-            }
-            captured.push(event);
-        };
-        let exit = execute_command(entry, &actual_command_id, sanitized, &mut capture).await?;
+    let raw_guard = RawModeGuard::new()?;
 
-        if !quiet {
-            replay_buffered_events(&captured)?;
-        }
+    let sender = session.sender();
 
-        exit
-    };
-
-    if !quiet {
-        if stream {
-            println!("EXIT {}", exit_code);
-        } else {
-            println!("Exit code: {}", exit_code);
+    if let Ok((cols, rows)) = terminal_size() {
+        if let Err(err) = sender.send_resize(u32::from(cols), u32::from(rows)).await {
+            warn!("Failed to send initial terminal size: {}", err);
         }
     }
 
-    if exit_code != 0 {
-        bail!("Remote command exited with code {}", exit_code);
+    let input_sender = sender.clone();
+    let input_handle = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = input_sender.close(None).await;
+                    break;
+                }
+                Ok(n) => {
+                    if input_sender
+                        .send_input(buf[..n].to_vec(), false)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = input_sender
+                        .close(Some("stdin read error".to_string()))
+                        .await;
+                    break;
+                }
+            }
+        }
+    });
+
+    #[cfg(unix)]
+    let resize_handle = {
+        let resize_sender = sender.clone();
+        tokio::spawn(async move {
+            if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
+                while sigwinch.recv().await.is_some() {
+                    if let Ok((cols, rows)) = terminal_size() {
+                        if resize_sender
+                            .send_resize(u32::from(cols), u32::from(rows))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+
+    let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
+    let mut exit_code: Option<i32> = None;
+    let mut timed_out = false;
+
+    while let Some(event) = session.recv().await? {
+        match event {
+            CapabilitySessionEvent::Output {
+                data,
+                stderr: is_stderr,
+                ..
+            } => {
+                if is_stderr {
+                    if stderr.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = stderr.flush().await;
+                } else {
+                    if stdout.write_all(&data).await.is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush().await;
+                }
+            }
+            CapabilitySessionEvent::Exit {
+                exit_code: code,
+                timed_out: was_timeout,
+                message,
+            } => {
+                exit_code = Some(code);
+                timed_out = was_timeout;
+                if let Some(message) = message {
+                    let mut bytes = message.into_bytes();
+                    if !bytes.ends_with(&[b'\n']) {
+                        bytes.push(b'\n');
+                    }
+                    let _ = stderr.write_all(&bytes).await;
+                    let _ = stderr.flush().await;
+                }
+            }
+            CapabilitySessionEvent::Error { message, .. } => {
+                return Err(anyhow!("Server reported capability error: {}", message));
+            }
+            CapabilitySessionEvent::HeartbeatAck { .. } => {
+                // Ignore keep-alives.
+            }
+            CapabilitySessionEvent::Closed { reason } => {
+                if exit_code.is_none() {
+                    if let Some(reason) = reason {
+                        return Err(anyhow!("Capability session closed: {}", reason));
+                    } else {
+                        return Err(anyhow!("Capability session closed unexpectedly"));
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    drop(raw_guard);
+
+    let _ = sender.close(None).await;
+    input_handle.abort();
+    let _ = input_handle.await;
+
+    #[cfg(unix)]
+    {
+        resize_handle.abort();
+        let _ = resize_handle.await;
+    }
+
+    if timed_out {
+        bail!("Realtime capability timed out");
+    }
+
+    let code = exit_code.ok_or_else(|| anyhow!("Realtime capability ended without exit code"))?;
+    if code != 0 {
+        bail!("Realtime capability exited with code {}", code);
     }
 
     Ok(())
@@ -960,6 +1159,23 @@ fn print_prefixed_chunk(prefix: &str, data: &str) {
         }
     }
     let _ = handle.flush();
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("failed to enable raw terminal mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        if let Err(err) = disable_raw_mode() {
+            warn!("Failed to restore terminal state: {}", err);
+        }
+    }
 }
 
 fn parse_parameter_pairs(values: &[String]) -> Result<HashMap<String, String>> {

@@ -24,7 +24,12 @@ class CommandModelsTest {
             description = "A test command",
             icon = "test_icon",
             tags = listOf("test", "sample"),
-            parameters = listOf(param)
+            parameters = listOf(param),
+            requiresConfirmation = true,
+            showOutput = false,
+            privileged = true,
+            kind = CommandKind.SHELL_SCRIPT,
+            sessionMode = CommandSessionMode.ONE_SHOT
         )
 
         assertEquals("test-cmd", command.id)
@@ -34,6 +39,11 @@ class CommandModelsTest {
         assertEquals(2, command.tags.size)
         assertEquals(1, command.parameters.size)
         assertEquals(param, command.parameters[0])
+        assertTrue(command.requiresConfirmation)
+        assertFalse(command.showOutput)
+        assertTrue(command.privileged)
+        assertEquals(CommandKind.SHELL_SCRIPT, command.kind)
+        assertEquals(CommandSessionMode.ONE_SHOT, command.sessionMode)
     }
 
     @Test

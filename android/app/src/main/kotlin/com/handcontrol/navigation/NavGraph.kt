@@ -44,5 +44,11 @@ sealed interface Route {
     ) : Route
 
     @Serializable
+    data class ShellSession(
+        val serverId: String,
+        val commandId: String
+    ) : Route
+
+    @Serializable
     data object Settings : Route
 }

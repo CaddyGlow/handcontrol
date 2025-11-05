@@ -1,0 +1,22 @@
+Capability session refactor progress
+====================================
+
+Server
+------
+- Added capability registry/session manager and removed legacy shell command modules.
+- gRPC now exposes ListCapabilities/OpenSession and bridges capability streams to clients.
+- Config defaults/validation/watchers converted to typed capability schema.
+- Interactive shell capability uses a PTY backend on Unix for proper terminal behaviour.
+
+Client
+------
+- Client lib maps ListCapabilities/OpenSession and exposes compatibility metadata.
+- Client lib now returns reusable capability session handles for realtime streaming (input/output/resize).
+- CLI bridges realtime shell capabilities with raw terminal input/output over OpenSession.
+- CLI/TUI guard against unsupported capability kinds/session modes.
+- Android app now consumes ListCapabilities/OpenSession and filters out unsupported capability kinds/session modes.
+
+Testing
+-------
+- `cargo test` (relay integration requires privileged sockets; expected permission errors).
+- `cargo run --bin=handcontrol-cli -- --help` (OK).

@@ -11,11 +11,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.handcontrol.grpc.Parameter
+import com.handcontrol.grpc.CapabilityParameter
 
 @Composable
 fun ToggleParameterInput(
-    parameter: Parameter,
+    parameter: CapabilityParameter,
     currentValue: String,
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier

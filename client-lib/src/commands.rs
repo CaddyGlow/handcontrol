@@ -5,7 +5,8 @@ use crate::{
         session_client_message, session_server_message, Capability as ProtoCapability,
         CapabilityKind as ProtoCapabilityKind, CapabilityParameter as ProtoCapabilityParameter,
         CapabilityParameterType as ProtoCapabilityParameterType, ListCapabilitiesRequest,
-        SessionClientMessage, SessionMode as ProtoSessionMode, SessionOpen,
+        SessionClientMessage, SessionClose, SessionHeartbeat, SessionInput,
+        SessionMode as ProtoSessionMode, SessionOpen, SessionResize, SessionServerMessage,
     },
     storage::ServerRegistryEntry,
 };
@@ -16,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
+use tonic::{Request, Streaming};
 
 /// Summary information about available capabilities on a server.
 #[derive(Debug, Clone, Serialize)]
@@ -94,6 +95,182 @@ pub enum CommandSessionMode {
 pub enum CommandStreamEvent {
     Stdout(String),
     Stderr(String),
+}
+
+impl CapabilitySession {
+    /// Returns the session identifier assigned by the server.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Returns the capability identifier associated with this session.
+    pub fn capability_id(&self) -> &str {
+        &self.capability_id
+    }
+
+    /// Returns the session mode reported by the server.
+    pub fn session_mode(&self) -> CommandSessionMode {
+        self.session_mode
+    }
+
+    /// Optional human-readable message from the capability when the session was readied.
+    pub fn ready_message(&self) -> Option<&str> {
+        self.ready_message.as_deref()
+    }
+
+    /// Returns a cloneable sender for pushing input/control messages to the server.
+    pub fn sender(&self) -> CapabilitySessionSender {
+        CapabilitySessionSender {
+            session_id: self.session_id.clone(),
+            sender: self.sender.clone(),
+        }
+    }
+
+    /// Receive the next event from the capability session.
+    pub async fn recv(&mut self) -> Result<Option<CapabilitySessionEvent>> {
+        loop {
+            let message = match self
+                .stream
+                .message()
+                .await
+                .context("Capability stream closed unexpectedly")?
+            {
+                None => return Ok(None),
+                Some(message) => message,
+            };
+
+            match message.payload {
+                Some(session_server_message::Payload::Output(output)) => {
+                    return Ok(Some(CapabilitySessionEvent::Output {
+                        data: output.data,
+                        stderr: output.stderr.unwrap_or(false),
+                        binary: output.binary.unwrap_or(false),
+                        timestamp_ms: output.timestamp_ms,
+                    }));
+                }
+                Some(session_server_message::Payload::Exit(exit)) => {
+                    return Ok(Some(CapabilitySessionEvent::Exit {
+                        exit_code: exit.exit_code,
+                        timed_out: exit.timed_out.unwrap_or(false),
+                        message: exit.message,
+                    }));
+                }
+                Some(session_server_message::Payload::Error(err)) => {
+                    return Ok(Some(CapabilitySessionEvent::Error {
+                        message: err.message,
+                        code: err.code,
+                    }));
+                }
+                Some(session_server_message::Payload::Heartbeat(ack)) => {
+                    return Ok(Some(CapabilitySessionEvent::HeartbeatAck {
+                        timestamp_ms: ack.timestamp_ms,
+                        latency_hint_ms: ack.latency_hint_ms,
+                    }));
+                }
+                Some(session_server_message::Payload::Closed(closed)) => {
+                    return Ok(Some(CapabilitySessionEvent::Closed {
+                        reason: closed.reason,
+                    }));
+                }
+                Some(session_server_message::Payload::Ready(_)) => {
+                    // Should not arrive after initial handshake; ignore gracefully.
+                    continue;
+                }
+                None => continue,
+            }
+        }
+    }
+}
+
+impl CapabilitySessionSender {
+    async fn send_message(&self, payload: session_client_message::Payload) -> Result<()> {
+        self.sender
+            .send(SessionClientMessage {
+                session_id: self.session_id.clone(),
+                payload: Some(payload),
+            })
+            .await
+            .context("Failed to send capability session message")
+    }
+
+    /// Send input bytes to the capability session.
+    pub async fn send_input(&self, data: Vec<u8>, binary: bool) -> Result<()> {
+        self.send_message(session_client_message::Payload::Input(SessionInput {
+            data,
+            binary: Some(binary),
+        }))
+        .await
+    }
+
+    /// Notify the capability session about terminal size changes.
+    pub async fn send_resize(&self, cols: u32, rows: u32) -> Result<()> {
+        self.send_message(session_client_message::Payload::Resize(SessionResize {
+            cols,
+            rows,
+        }))
+        .await
+    }
+
+    /// Send a heartbeat to keep the session alive.
+    pub async fn send_heartbeat(&self, timestamp_ms: i64) -> Result<()> {
+        self.send_message(session_client_message::Payload::Heartbeat(
+            SessionHeartbeat { timestamp_ms },
+        ))
+        .await
+    }
+
+    /// Request graceful session shutdown.
+    pub async fn close(&self, reason: Option<String>) -> Result<()> {
+        self.send_message(session_client_message::Payload::Close(SessionClose {
+            reason,
+        }))
+        .await
+    }
+}
+
+/// Bidirectional capability session handle returned by `open_capability_session`.
+#[derive(Debug)]
+pub struct CapabilitySession {
+    session_id: String,
+    capability_id: String,
+    session_mode: CommandSessionMode,
+    ready_message: Option<String>,
+    sender: mpsc::Sender<SessionClientMessage>,
+    stream: Streaming<SessionServerMessage>,
+}
+
+/// Cloneable helper for sending input/control messages to an active capability session.
+#[derive(Clone, Debug)]
+pub struct CapabilitySessionSender {
+    session_id: String,
+    sender: mpsc::Sender<SessionClientMessage>,
+}
+
+/// Events emitted by an active capability session.
+#[derive(Debug)]
+pub enum CapabilitySessionEvent {
+    Output {
+        data: Vec<u8>,
+        stderr: bool,
+        binary: bool,
+        timestamp_ms: Option<i64>,
+    },
+    Exit {
+        exit_code: i32,
+        timed_out: bool,
+        message: Option<String>,
+    },
+    Error {
+        message: String,
+        code: Option<i32>,
+    },
+    HeartbeatAck {
+        timestamp_ms: i64,
+        latency_hint_ms: Option<i64>,
+    },
+    Closed {
+        reason: Option<String>,
+    },
 }
 
 impl CommandSummary {
@@ -323,6 +500,95 @@ pub fn validate_parameters(
     Ok(sanitized)
 }
 
+/// Open a capability session and return a bidirectional handle.
+pub async fn open_capability_session(
+    entry: &ServerRegistryEntry,
+    capability_id: &str,
+    parameters: HashMap<String, String>,
+) -> Result<CapabilitySession> {
+    let cert_paths = CertificatePaths::for_server(&entry.id)?;
+    let mut client = connect_registered(entry, &cert_paths).await?;
+
+    let (tx, rx) = mpsc::channel(32);
+    tx.send(SessionClientMessage {
+        session_id: String::new(),
+        payload: Some(session_client_message::Payload::Open(SessionOpen {
+            capability_id: capability_id.to_string(),
+            parameters,
+            request_id: None,
+        })),
+    })
+    .await
+    .context("Failed to send session open message")?;
+
+    let request_stream = ReceiverStream::new(rx);
+    let mut stream = client
+        .inner()
+        .open_session(Request::new(request_stream))
+        .await
+        .context("OpenSession RPC failed")?
+        .into_inner();
+
+    let (session_id, ready) = loop {
+        let message = stream
+            .message()
+            .await
+            .context("Capability stream closed unexpectedly")?
+            .ok_or_else(|| anyhow!("Capability stream ended before ready message"))?;
+
+        match message.payload {
+            Some(session_server_message::Payload::Ready(ready)) => {
+                let session_id = if message.session_id.is_empty() {
+                    bail!("Session ready message missing session id");
+                } else {
+                    message.session_id
+                };
+                break (session_id, ready);
+            }
+            Some(session_server_message::Payload::Error(err)) => {
+                bail!("Server reported capability error: {}", err.message);
+            }
+            Some(session_server_message::Payload::Closed(closed)) => {
+                let reason = closed
+                    .reason
+                    .unwrap_or_else(|| "session closed before ready".to_string());
+                bail!(reason);
+            }
+            Some(session_server_message::Payload::Heartbeat(_)) => {
+                continue;
+            }
+            Some(other) => {
+                bail!(
+                    "Received unexpected session payload before ready: {:?}",
+                    other
+                );
+            }
+            None => continue,
+        }
+    };
+
+    let session_mode = CommandSessionMode::from_proto(ready.session_mode);
+    if session_mode == CommandSessionMode::Unknown {
+        bail!(
+            "Capability '{}' reported unknown session mode",
+            capability_id
+        );
+    }
+
+    Ok(CapabilitySession {
+        session_id,
+        capability_id: if ready.capability_id.is_empty() {
+            capability_id.to_string()
+        } else {
+            ready.capability_id
+        },
+        session_mode,
+        ready_message: ready.message.filter(|m| !m.is_empty()),
+        sender: tx,
+        stream,
+    })
+}
+
 /// Execute a one-shot capability, invoking the callback for each stdout/stderr chunk.
 pub async fn execute_command<F>(
     entry: &ServerRegistryEntry,
@@ -333,79 +599,59 @@ pub async fn execute_command<F>(
 where
     F: FnMut(CommandStreamEvent),
 {
-    let cert_paths = CertificatePaths::for_server(&entry.id)?;
-    let mut client = connect_registered(entry, &cert_paths).await?;
+    let mut session = open_capability_session(entry, command_id, parameters).await?;
 
-    let mut request_parameters = HashMap::new();
-    for (key, value) in parameters {
-        request_parameters.insert(key, value);
+    if session.session_mode() != CommandSessionMode::OneShot {
+        bail!(
+            "Capability '{}' requires '{:?}' sessions which are not supported by this client",
+            command_id,
+            session.session_mode()
+        );
     }
-
-    let open_message = SessionClientMessage {
-        session_id: String::new(),
-        payload: Some(session_client_message::Payload::Open(SessionOpen {
-            capability_id: command_id.to_string(),
-            parameters: request_parameters,
-            request_id: None,
-        })),
-    };
-
-    let (tx, rx) = mpsc::channel(8);
-    tx.send(open_message)
-        .await
-        .context("Failed to send session open message")?;
-    drop(tx);
-
-    let request_stream = ReceiverStream::new(rx);
-    let mut stream = client
-        .inner()
-        .open_session(Request::new(request_stream))
-        .await
-        .context("OpenSession RPC failed")?
-        .into_inner();
 
     let mut exit_code: Option<i32> = None;
 
-    while let Some(message) = stream
-        .message()
-        .await
-        .context("Capability stream closed unexpectedly")?
-    {
-        match message.payload {
-            Some(session_server_message::Payload::Ready(ready)) => {
-                let session_mode = CommandSessionMode::from_proto(ready.session_mode);
-                if session_mode != CommandSessionMode::OneShot {
-                    bail!(
-                        "Capability '{}' requires '{:?}' sessions which are not supported by this client",
-                        command_id,
-                        session_mode
-                    );
-                }
-            }
-            Some(session_server_message::Payload::Output(output)) => {
-                let text = String::from_utf8_lossy(&output.data).to_string();
-                if output.stderr.unwrap_or(false) {
+    while let Some(event) = session.recv().await? {
+        match event {
+            CapabilitySessionEvent::Output { data, stderr, .. } => {
+                let text = String::from_utf8_lossy(&data).to_string();
+                if stderr {
                     on_event(CommandStreamEvent::Stderr(text));
                 } else {
                     on_event(CommandStreamEvent::Stdout(text));
                 }
             }
-            Some(session_server_message::Payload::Exit(exit)) => {
-                exit_code = Some(exit.exit_code);
-                if let Some(message) = exit.message.filter(|m| !m.is_empty()) {
+            CapabilitySessionEvent::Exit {
+                exit_code: code,
+                timed_out,
+                message,
+            } => {
+                exit_code = Some(code);
+                if timed_out {
+                    on_event(CommandStreamEvent::Stderr(
+                        "Session timed out\n".to_string(),
+                    ));
+                }
+                if let Some(message) = message.filter(|m| !m.is_empty()) {
                     on_event(CommandStreamEvent::Stderr(format!("{message}\n")));
                 }
             }
-            Some(session_server_message::Payload::Error(err)) => {
-                bail!("Server reported capability error: {}", err.message);
+            CapabilitySessionEvent::Error { message, .. } => {
+                bail!("Server reported capability error: {}", message);
             }
-            Some(session_server_message::Payload::Heartbeat(_)) => {
-                // Ignore heartbeat acknowledgements for one-shot sessions.
+            CapabilitySessionEvent::HeartbeatAck { .. } => {
+                // Ignore keep-alive acknowledgements for one-shot sessions.
             }
-            Some(session_server_message::Payload::Closed(_)) => {
-                break;
+            CapabilitySessionEvent::Closed { reason } => {
+                if exit_code.is_some() {
+                    break;
+                }
+                if let Some(reason) = reason {
+                    bail!("Capability session closed early: {}", reason);
+                } else {
+                    bail!("Capability session closed unexpectedly");
+                }
             }
-            None => continue,
         }
     }
 

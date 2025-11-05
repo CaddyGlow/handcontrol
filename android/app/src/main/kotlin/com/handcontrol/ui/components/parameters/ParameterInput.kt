@@ -17,15 +17,15 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.handcontrol.data.commands.ParameterInputState
 import com.handcontrol.data.commands.ValidationResult
-import com.handcontrol.grpc.Parameter
-import com.handcontrol.grpc.ParameterType
+import com.handcontrol.grpc.CapabilityParameter
+import com.handcontrol.grpc.CapabilityParameterType
 
 /**
  * Renders the appropriate parameter input based on parameter type
  */
 @Composable
 fun ParameterInput(
-    parameter: Parameter,
+    parameter: CapabilityParameter,
     inputState: ParameterInputState,
     onValueChange: (String) -> Unit,
     modifier: Modifier = Modifier,
@@ -77,7 +77,7 @@ fun ParameterInput(
         // Type-specific input control with loading overlay
         Box {
             when (parameter.type) {
-                ParameterType.PARAMETER_TYPE_SLIDER -> {
+                CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_SLIDER -> {
                     SliderParameterInput(
                         parameter = parameter,
                         currentValue = inputState.currentValue,
@@ -85,7 +85,7 @@ fun ParameterInput(
                         isError = inputState.validationResult is ValidationResult.Invalid
                     )
                 }
-                ParameterType.PARAMETER_TYPE_TEXT -> {
+                CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_TEXT -> {
                     TextParameterInput(
                         parameter = parameter,
                         currentValue = inputState.currentValue,
@@ -93,14 +93,14 @@ fun ParameterInput(
                         isError = inputState.validationResult is ValidationResult.Invalid
                     )
                 }
-                ParameterType.PARAMETER_TYPE_TOGGLE -> {
+                CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_TOGGLE -> {
                     ToggleParameterInput(
                         parameter = parameter,
                         currentValue = inputState.currentValue,
                         onValueChange = onValueChange
                     )
                 }
-                ParameterType.PARAMETER_TYPE_DROPDOWN -> {
+                CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_DROPDOWN -> {
                     DropdownParameterInput(
                         parameter = parameter,
                         currentValue = inputState.currentValue,

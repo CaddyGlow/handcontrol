@@ -4,9 +4,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.CommandExecutionResult
+import com.handcontrol.data.commands.CommandKind
 import com.handcontrol.data.commands.CommandRepository
-import com.handcontrol.data.commands.ServerInfo
+import com.handcontrol.data.commands.CommandSessionMode
 import com.handcontrol.data.commands.ParameterType
+import com.handcontrol.data.commands.ServerInfo
 import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
@@ -160,6 +162,18 @@ class CommandListViewModel @Inject constructor(
 
     fun executeCommand(commandId: String, commandName: String, parameters: Map<String, String>) {
         val serverId = currentServerId ?: return
+        val command = (uiState.value as? CommandListUiState.Success)
+            ?.commands
+            ?.find { it.id == commandId }
+
+        if (command != null && !command.isOneShotCommand()) {
+            viewModelScope.launch {
+                _executionState.value = CommandExecutionState.Failed(
+                    unsupportedCapabilityMessage(command)
+                )
+            }
+            return
+        }
 
         viewModelScope.launch {
             try {
@@ -225,6 +239,21 @@ class CommandListViewModel @Inject constructor(
         showOutput: Boolean
     ) {
         val serverId = currentServerId ?: return
+        val command = (uiState.value as? CommandListUiState.Success)
+            ?.commands
+            ?.find { it.id == commandId }
+
+        if (command != null && !command.isOneShotCommand()) {
+            viewModelScope.launch {
+                val message = unsupportedCapabilityMessage(command)
+                if (showOutput) {
+                    _executionState.value = CommandExecutionState.Failed(message)
+                } else {
+                    _toastMessage.emit(message)
+                }
+            }
+            return
+        }
 
         viewModelScope.launch {
             try {
@@ -404,6 +433,13 @@ class CommandListViewModel @Inject constructor(
         parameters: Map<String, String> = emptyMap(),
         showOutputOverride: Boolean? = null
     ) {
+        if (!command.isOneShotCommand()) {
+            viewModelScope.launch {
+                _toastMessage.emit(unsupportedCapabilityMessage(command))
+            }
+            return
+        }
+
         val showOutput = showOutputOverride ?: command.showOutput
 
         // Visual feedback is handled by UI component
@@ -422,15 +458,34 @@ class CommandListViewModel @Inject constructor(
         telemetryJobs.clear()
     }
 
+    private fun Command.isOneShotCommand(): Boolean {
+        return sessionMode == CommandSessionMode.ONE_SHOT && kind == CommandKind.SHELL_SCRIPT
+    }
+
+    private fun unsupportedCapabilityMessage(command: Command): String {
+        return when {
+            command.sessionMode != CommandSessionMode.ONE_SHOT -> {
+                "${command.name} requires a ${command.sessionMode.name.lowercase()} session, which isn't supported on Android yet."
+            }
+            command.kind != CommandKind.SHELL_SCRIPT -> {
+                "${command.name} uses an unsupported capability kind (${command.kind.name.lowercase()})."
+            }
+            else -> {
+                "${command.name} can't run on this client yet."
+            }
+        }
+    }
+
     private fun buildRemotePanelModel(
         commands: List<Command>,
         layoutSpec: RemoteLayoutSpec?
     ): RemotePanelUiModel {
+        val availableCommands = commands.filter { it.isOneShotCommand() }
         if (layoutSpec == null || layoutSpec.sections.isEmpty()) {
-            return buildDefaultRemotePanel(commands)
+            return buildDefaultRemotePanel(availableCommands)
         }
 
-        val commandMap = commands.associateBy { it.id }
+        val commandMap = availableCommands.associateBy { it.id }
         val quickActions = mutableListOf<RemoteQuickAction>()
         val adjustmentGroups = mutableListOf<RemoteAdjustmentGroup>()
         val telemetryCards = mutableListOf<RemoteTelemetryCard>()
@@ -448,7 +503,7 @@ class CommandListViewModel @Inject constructor(
                                 id = command.id,
                                 title = entry.labelOverride ?: command.name,
                                 subtitle = command.description.takeIf { it.isNotBlank() },
-                                iconKey = entry.iconOverride ?: command.icon.takeIf { it.isNotBlank() },
+                                iconKey = entry.iconOverride ?: command.icon?.takeIf { it.isNotBlank() },
                                 isEnabled = true,
                                 isBusy = false,
                                 requiresConfirmation = entry.requiresConfirmationOverride
@@ -495,7 +550,7 @@ class CommandListViewModel @Inject constructor(
         refreshTelemetrySources(newTelemetrySources)
 
         if (quickActions.isEmpty() && adjustmentGroups.isEmpty() && telemetryCards.isEmpty()) {
-            return buildDefaultRemotePanel(commands)
+            return buildDefaultRemotePanel(availableCommands)
         }
 
         return RemotePanelUiModel(
@@ -509,6 +564,7 @@ class CommandListViewModel @Inject constructor(
         refreshTelemetrySources(emptyMap())
 
         val quickActions = commands
+            .filter { it.isOneShotCommand() }
             .filter { it.parameters.isEmpty() }
             .take(6)
             .map { command ->
@@ -516,7 +572,7 @@ class CommandListViewModel @Inject constructor(
                     id = command.id,
                     title = command.name,
                     subtitle = command.description.takeIf { it.isNotBlank() },
-                    iconKey = command.icon.takeIf { it.isNotBlank() },
+                    iconKey = command.icon?.takeIf { it.isNotBlank() },
                     isEnabled = true,
                     isBusy = false,
                     requiresConfirmation = command.requiresConfirmation,

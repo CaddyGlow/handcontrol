@@ -46,6 +46,9 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import com.handcontrol.data.commands.defaultValueFor
+import com.handcontrol.data.commands.toProtoParameter
+import com.handcontrol.data.commands.validateParameterValue
 import com.handcontrol.ui.theme.HandControlTheme
 import kotlinx.coroutines.launch
 
@@ -85,7 +88,7 @@ fun CommandExecutionScreen(
                     val protoParam = param.toProtoParameter()
                     param.name to com.handcontrol.data.commands.ParameterInputState(
                         parameter = protoParam,
-                        currentValue = param.defaultValue ?: getDefaultForDataType(param.type),
+                        currentValue = param.defaultValue ?: defaultValueFor(param.type),
                         validationResult = com.handcontrol.data.commands.ValidationResult.Pending,
                         isDirty = false
                     )
@@ -100,7 +103,7 @@ fun CommandExecutionScreen(
                             val value = viewModel.fetchDynamicDefault(
                                 command = param.defaultValueCommand,
                                 pattern = param.defaultValuePattern,
-                                fallback = param.defaultValue ?: getDefaultForDataType(param.type)
+                                fallback = param.defaultValue ?: defaultValueFor(param.type)
                             )
 
                             // Update parameter state with fetched value
@@ -108,7 +111,7 @@ fun CommandExecutionScreen(
                             if (currentState != null) {
                                 parameterStates = parameterStates + (param.name to currentState.copy(
                                     currentValue = value,
-                                    validationResult = validateParameter(currentState.parameter, value)
+                                    validationResult = validateParameterValue(currentState.parameter, value)
                                 ))
                             }
 
@@ -169,7 +172,7 @@ fun CommandExecutionScreen(
                                 dynamicDefaultLoadingStates = dynamicDefaultLoadingStates,
                                 onParameterChange = { paramName, value ->
                                     val currentState = parameterStates[paramName] ?: return@ReadyToExecuteWithParametersView
-                                    val validationResult = validateParameter(currentState.parameter, value)
+                                    val validationResult = validateParameterValue(currentState.parameter, value)
                                     parameterStates = parameterStates + (paramName to currentState.copy(
                                         currentValue = value,
                                         validationResult = validationResult,
@@ -185,14 +188,14 @@ fun CommandExecutionScreen(
                                             val value = viewModel.fetchDynamicDefault(
                                                 command = param.defaultValueCommand,
                                                 pattern = param.defaultValuePattern,
-                                                fallback = param.defaultValue ?: getDefaultForDataType(param.type)
+                                                fallback = param.defaultValue ?: defaultValueFor(param.type)
                                             )
 
                                             val currentState = parameterStates[paramName]
                                             if (currentState != null) {
                                                 parameterStates = parameterStates + (paramName to currentState.copy(
                                                     currentValue = value,
-                                                    validationResult = validateParameter(currentState.parameter, value)
+                                                    validationResult = validateParameterValue(currentState.parameter, value)
                                                 ))
                                             }
 
@@ -258,65 +261,6 @@ fun CommandExecutionScreen(
                 listState.animateScrollToItem(output.size - 1)
             }
         }
-    }
-}
-
-// Helper functions for parameter validation
-private fun getDefaultForDataType(type: com.handcontrol.data.commands.ParameterType): String {
-    return when (type) {
-        com.handcontrol.data.commands.ParameterType.SLIDER -> "0"
-        com.handcontrol.data.commands.ParameterType.TEXT -> ""
-        com.handcontrol.data.commands.ParameterType.TOGGLE -> "false"
-        com.handcontrol.data.commands.ParameterType.DROPDOWN -> ""
-        com.handcontrol.data.commands.ParameterType.UNSPECIFIED -> ""
-    }
-}
-
-private fun validateParameter(
-    parameter: com.handcontrol.grpc.Parameter,
-    value: String
-): com.handcontrol.data.commands.ValidationResult {
-    return when (parameter.type) {
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_SLIDER -> {
-            val numValue = value.toIntOrNull()
-                ?: return com.handcontrol.data.commands.ValidationResult.Invalid("Must be a number")
-
-            if (parameter.hasMin() && numValue < parameter.min) {
-                return com.handcontrol.data.commands.ValidationResult.Invalid("Minimum value is ${parameter.min}")
-            }
-            if (parameter.hasMax() && numValue > parameter.max) {
-                return com.handcontrol.data.commands.ValidationResult.Invalid("Maximum value is ${parameter.max}")
-            }
-            com.handcontrol.data.commands.ValidationResult.Valid
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TEXT -> {
-            if (parameter.hasValidation() && parameter.validation.isNotBlank()) {
-                try {
-                    val regex = Regex(parameter.validation)
-                    if (!regex.matches(value)) {
-                        return com.handcontrol.data.commands.ValidationResult.Invalid("Invalid format")
-                    }
-                } catch (e: Exception) {
-                    return com.handcontrol.data.commands.ValidationResult.Invalid("Invalid validation pattern")
-                }
-            }
-            com.handcontrol.data.commands.ValidationResult.Valid
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TOGGLE -> {
-            if (value == "true" || value == "false") {
-                com.handcontrol.data.commands.ValidationResult.Valid
-            } else {
-                com.handcontrol.data.commands.ValidationResult.Invalid("Must be true or false")
-            }
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_DROPDOWN -> {
-            if (parameter.optionsList.contains(value)) {
-                com.handcontrol.data.commands.ValidationResult.Valid
-            } else {
-                com.handcontrol.data.commands.ValidationResult.Invalid("Invalid selection")
-            }
-        }
-        else -> com.handcontrol.data.commands.ValidationResult.Invalid("Unknown parameter type")
     }
 }
 
@@ -450,32 +394,6 @@ private fun ReadyToExecuteWithParametersView(
             Text("Execute Command")
         }
     }
-}
-
-// Helper extension to convert data model CommandParameter to proto Parameter
-private fun com.handcontrol.data.commands.CommandParameter.toProtoParameter(): com.handcontrol.grpc.Parameter {
-    val protoType = when (this.type) {
-        com.handcontrol.data.commands.ParameterType.SLIDER -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_SLIDER
-        com.handcontrol.data.commands.ParameterType.TEXT -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TEXT
-        com.handcontrol.data.commands.ParameterType.TOGGLE -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TOGGLE
-        com.handcontrol.data.commands.ParameterType.DROPDOWN -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_DROPDOWN
-        com.handcontrol.data.commands.ParameterType.UNSPECIFIED -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_UNSPECIFIED
-    }
-
-    return com.handcontrol.grpc.Parameter.newBuilder()
-        .setName(this.name)
-        .setType(protoType)
-        .setDescription(this.description)
-        .apply {
-            this@toProtoParameter.min?.let { setMin(it) }
-            this@toProtoParameter.max?.let { setMax(it) }
-            this@toProtoParameter.defaultValue?.let { setDefaultValue(it) }
-            this@toProtoParameter.validation?.let { setValidation(it) }
-            this@toProtoParameter.labelOn?.let { setLabelOn(it) }
-            this@toProtoParameter.labelOff?.let { setLabelOff(it) }
-            addAllOptions(this@toProtoParameter.options)
-        }
-        .build()
 }
 
 @Composable

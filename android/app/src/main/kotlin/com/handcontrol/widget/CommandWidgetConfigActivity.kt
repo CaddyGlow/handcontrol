@@ -47,7 +47,9 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
 import com.handcontrol.data.commands.Command
+import com.handcontrol.data.commands.CommandKind
 import com.handcontrol.data.commands.CommandRepository
+import com.handcontrol.data.commands.CommandSessionMode
 import com.handcontrol.data.database.EnrolledServerEntity
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.ui.theme.HandControlTheme
@@ -214,7 +216,11 @@ private fun WidgetConfigScreen(
                                 scope.launch {
                                     try {
                                         val result = commandRepository.listCommands(server.serverId)
-                                        commands = result.getOrElse { emptyList() }
+                                        val loaded = result.getOrElse { emptyList() }
+                                        commands = loaded.filter {
+                                            it.sessionMode == CommandSessionMode.ONE_SHOT &&
+                                                it.kind == CommandKind.SHELL_SCRIPT
+                                        }
                                         isLoadingCommands = false
                                     } catch (e: Exception) {
                                         errorMessage = "Failed to load commands: ${e.message}"

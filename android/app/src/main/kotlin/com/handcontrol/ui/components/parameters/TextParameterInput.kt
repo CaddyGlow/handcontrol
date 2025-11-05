@@ -9,11 +9,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
-import com.handcontrol.grpc.Parameter
+import com.handcontrol.grpc.CapabilityParameter
 
 @Composable
 fun TextParameterInput(
-    parameter: Parameter,
+    parameter: CapabilityParameter,
     currentValue: String,
     onValueChange: (String) -> Unit,
     isError: Boolean,

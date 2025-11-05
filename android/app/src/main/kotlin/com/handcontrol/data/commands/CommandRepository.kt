@@ -22,4 +22,14 @@ interface CommandRepository {
         commandId: String,
         parameters: Map<String, String>
     ): Flow<CommandExecutionResult>
+
+    /**
+     * Open a realtime shell session for interactive capabilities.
+     */
+    suspend fun openShellSession(
+        serverId: String,
+        commandId: String,
+        parameters: Map<String, String>,
+        terminalSize: TerminalSize? = null
+    ): Result<ShellSession>
 }

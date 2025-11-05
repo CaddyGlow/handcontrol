@@ -1223,6 +1223,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "crossterm",
  "handcontrol-client-lib",
  "serde",
  "serde_json",
@@ -1332,6 +1333,7 @@ dependencies = [
  "hostname",
  "if-addrs",
  "jsonwebtoken",
+ "libc",
  "mdns-sd",
  "notify",
  "notify-rust",

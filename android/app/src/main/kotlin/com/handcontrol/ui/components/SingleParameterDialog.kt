@@ -20,6 +20,9 @@ import kotlinx.coroutines.delay
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterInputState
 import com.handcontrol.data.commands.ValidationResult
+import com.handcontrol.data.commands.defaultValueFor
+import com.handcontrol.data.commands.toProtoParameter
+import com.handcontrol.data.commands.validateParameterValue
 import com.handcontrol.ui.components.parameters.ParameterInput
 
 /**
@@ -61,7 +64,7 @@ fun SingleParameterDialog(
 
     // Validate on value change
     LaunchedEffect(parameterState.currentValue) {
-        val validationResult = validateParameter(protoParam, parameterState.currentValue)
+        val validationResult = validateParameterValue(protoParam, parameterState.currentValue)
         if (parameterState.validationResult != validationResult) {
             parameterState = parameterState.copy(validationResult = validationResult)
         }
@@ -142,79 +145,4 @@ fun SingleParameterDialog(
         },
         modifier = modifier
     )
-}
-
-/**
- * Extension function to convert domain parameter to proto parameter for validation
- */
-private fun com.handcontrol.data.commands.CommandParameter.toProtoParameter(): com.handcontrol.grpc.Parameter {
-    return com.handcontrol.grpc.Parameter.newBuilder().apply {
-        name = this@toProtoParameter.name
-        type = when (this@toProtoParameter.type) {
-            com.handcontrol.data.commands.ParameterType.SLIDER -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_SLIDER
-            com.handcontrol.data.commands.ParameterType.TEXT -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TEXT
-            com.handcontrol.data.commands.ParameterType.TOGGLE -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TOGGLE
-            com.handcontrol.data.commands.ParameterType.DROPDOWN -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_DROPDOWN
-            com.handcontrol.data.commands.ParameterType.UNSPECIFIED -> com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_UNSPECIFIED
-        }
-        description = this@toProtoParameter.description
-        this@toProtoParameter.min?.let { min = it }
-        this@toProtoParameter.max?.let { max = it }
-        this@toProtoParameter.defaultValue?.let { defaultValue = it }
-        addAllOptions(this@toProtoParameter.options)
-        this@toProtoParameter.validation?.let { validation = it }
-        this@toProtoParameter.labelOn?.let { labelOn = it }
-        this@toProtoParameter.labelOff?.let { labelOff = it }
-    }.build()
-}
-
-/**
- * Validate parameter value
- */
-private fun validateParameter(
-    parameter: com.handcontrol.grpc.Parameter,
-    value: String
-): ValidationResult {
-    return when (parameter.type) {
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_SLIDER -> {
-            val numValue = value.toIntOrNull()
-            when {
-                numValue == null -> ValidationResult.Invalid("Must be a number")
-                parameter.hasMin() && numValue < parameter.min -> ValidationResult.Invalid("Minimum value is ${parameter.min}")
-                parameter.hasMax() && numValue > parameter.max -> ValidationResult.Invalid("Maximum value is ${parameter.max}")
-                else -> ValidationResult.Valid
-            }
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TEXT -> {
-            if (parameter.hasValidation()) {
-                try {
-                    val regex = Regex(parameter.validation)
-                    if (regex.matches(value)) {
-                        ValidationResult.Valid
-                    } else {
-                        ValidationResult.Invalid("Invalid format")
-                    }
-                } catch (e: Exception) {
-                    ValidationResult.Valid
-                }
-            } else {
-                ValidationResult.Valid
-            }
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_TOGGLE -> {
-            if (value == "true" || value == "false") {
-                ValidationResult.Valid
-            } else {
-                ValidationResult.Invalid("Must be true or false")
-            }
-        }
-        com.handcontrol.grpc.ParameterType.PARAMETER_TYPE_DROPDOWN -> {
-            if (parameter.optionsList.contains(value)) {
-                ValidationResult.Valid
-            } else {
-                ValidationResult.Invalid("Invalid option")
-            }
-        }
-        else -> ValidationResult.Valid
-    }
 }

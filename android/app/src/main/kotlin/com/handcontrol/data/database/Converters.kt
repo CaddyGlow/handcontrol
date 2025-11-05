@@ -1,8 +1,18 @@
 package com.handcontrol.data.database
 
 import androidx.room.TypeConverter
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.decodeFromString
 
 class Converters {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = false
+        classDiscriminator = "kind"
+    }
+
     @TypeConverter
     fun fromStringList(value: List<String>?): String {
         return value?.joinToString(",") ?: ""
@@ -38,6 +48,21 @@ class Converters {
             ConnectionPreference.valueOf(value)
         } catch (e: IllegalArgumentException) {
             ConnectionPreference.AUTO
+        }
+    }
+
+    @TypeConverter
+    fun fromRemoteLayoutSpec(spec: RemoteLayoutSpec?): String? {
+        return spec?.let { json.encodeToString(it) }
+    }
+
+    @TypeConverter
+    fun toRemoteLayoutSpec(value: String?): RemoteLayoutSpec? {
+        if (value.isNullOrBlank()) return null
+        return try {
+            json.decodeFromString<RemoteLayoutSpec>(value)
+        } catch (_: Exception) {
+            null
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.handcontrol.data.database
 
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -96,5 +97,17 @@ class EnrolledServerRepository @Inject constructor(
 
     suspend fun mergeServerIps(serverId: String, discoveredIps: List<String>) {
         enrolledServerDao.mergeServerIpsTransactional(serverId, discoveredIps)
+    }
+
+    fun observeRemoteLayoutSpec(serverId: String): Flow<RemoteLayoutSpec?> {
+        return enrolledServerDao.observeRemoteLayoutSpec(serverId)
+    }
+
+    suspend fun getRemoteLayoutSpec(serverId: String): RemoteLayoutSpec? {
+        return enrolledServerDao.getRemoteLayoutSpec(serverId)
+    }
+
+    suspend fun saveRemoteLayoutSpec(serverId: String, spec: RemoteLayoutSpec?) {
+        enrolledServerDao.updateRemoteLayoutSpec(serverId, spec)
     }
 }

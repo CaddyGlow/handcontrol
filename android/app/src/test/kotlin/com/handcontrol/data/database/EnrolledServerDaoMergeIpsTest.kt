@@ -146,6 +146,10 @@ class EnrolledServerDaoMergeIpsTest {
             throw NotImplementedError("Not needed for this test")
         }
 
+        override suspend fun updateCertFingerprint(serverId: String, fingerprint: String) {
+            throw NotImplementedError("Not needed for this test")
+        }
+
         override suspend fun getServerByHostAndPort(host: String, port: Int): EnrolledServerEntity? {
             throw NotImplementedError("Not needed for this test")
         }

@@ -4,6 +4,7 @@ import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 
 enum class ConnectionMode {
     DIRECT,      // Connected via direct IP
@@ -48,6 +49,7 @@ data class EnrolledServerEntity(
     val relayToken: String? = null,
     val connectionPreference: ConnectionPreference = ConnectionPreference.AUTO,
     val lastConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN,
+    val remoteLayoutSpec: RemoteLayoutSpec? = null,
 
     // Deprecated but kept for migration compatibility
     @Deprecated("Use ips instead")

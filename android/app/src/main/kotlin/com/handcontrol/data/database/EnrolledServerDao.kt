@@ -6,6 +6,7 @@ import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Transaction
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import kotlinx.coroutines.flow.Flow
 
 @Dao
@@ -18,6 +19,9 @@ interface EnrolledServerDao {
 
     @Query("SELECT * FROM enrolled_servers WHERE serverId = :serverId")
     fun observeServerById(serverId: String): Flow<EnrolledServerEntity?>
+
+    @Query("SELECT remoteLayoutSpec FROM enrolled_servers WHERE serverId = :serverId")
+    fun observeRemoteLayoutSpec(serverId: String): Flow<RemoteLayoutSpec?>
 
     @Query("SELECT * FROM enrolled_servers ORDER BY (last_connected IS NULL), last_connected DESC LIMIT 1")
     suspend fun getLastConnectedServer(): EnrolledServerEntity?
@@ -54,6 +58,12 @@ interface EnrolledServerDao {
 
     @Query("SELECT * FROM enrolled_servers WHERE serverHost = :host AND serverPort = :port")
     suspend fun getServerByHostAndPort(host: String, port: Int): EnrolledServerEntity?
+
+    @Query("SELECT remoteLayoutSpec FROM enrolled_servers WHERE serverId = :serverId")
+    suspend fun getRemoteLayoutSpec(serverId: String): RemoteLayoutSpec?
+
+    @Query("UPDATE enrolled_servers SET remoteLayoutSpec = :layoutSpec WHERE serverId = :serverId")
+    suspend fun updateRemoteLayoutSpec(serverId: String, layoutSpec: RemoteLayoutSpec?)
 
     @Query(
         """

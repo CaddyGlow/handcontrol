@@ -19,6 +19,10 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
+import com.handcontrol.feature.commands.remote.RemoteLayoutEntry
+import com.handcontrol.feature.commands.remote.RemoteLayoutEntry.AdjustmentControl
+import com.handcontrol.feature.commands.remote.RemoteLayoutEntry.TelemetryDisplay
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import com.handcontrol.feature.commands.remote.RemotePanelUiModel
 import com.handcontrol.feature.commands.remote.RemoteQuickAction
 import com.handcontrol.feature.commands.remote.RemoteAdjustmentGroup
@@ -107,11 +111,13 @@ class CommandListViewModel @Inject constructor(
                 val commands = commandsResult.getOrThrow()
                 Timber.i("Loaded ${commands.size} commands")
 
+                val layoutSpec = enrolledServerRepository.getRemoteLayoutSpec(serverId)
+
                 _uiState.value = CommandListUiState.Success(
                     serverInfo = serverInfo,
                     commands = commands,
                     filteredCommands = commands,
-                    remotePanel = buildRemotePanelModel(commands)
+                    remotePanel = buildRemotePanelModel(commands, layoutSpec)
                 )
 
                 // Note: Connection mode is already updated by repository
@@ -349,7 +355,85 @@ class CommandListViewModel @Inject constructor(
         }
     }
 
-    private fun buildRemotePanelModel(commands: List<Command>): RemotePanelUiModel {
+    private fun buildRemotePanelModel(
+        commands: List<Command>,
+        layoutSpec: RemoteLayoutSpec?
+    ): RemotePanelUiModel {
+        if (layoutSpec == null || layoutSpec.sections.isEmpty()) {
+            return buildDefaultRemotePanel(commands)
+        }
+
+        val commandMap = commands.associateBy { it.id }
+        val quickActions = mutableListOf<RemoteQuickAction>()
+        val adjustmentGroups = mutableListOf<RemoteAdjustmentGroup>()
+        val telemetryCards = mutableListOf<RemoteTelemetryCard>()
+
+        layoutSpec.sections.forEach { section ->
+            when (section.type) {
+                RemoteLayoutSpec.SectionType.QUICK_ACTIONS -> {
+                    val sectionActions = section.entries
+                        .filterIsInstance<RemoteLayoutEntry.QuickActionEntry>()
+                        .mapNotNull { entry ->
+                            val command = commandMap[entry.commandId] ?: return@mapNotNull null
+
+                            RemoteQuickAction(
+                                id = command.id,
+                                title = entry.labelOverride ?: command.name,
+                                subtitle = command.description.takeIf { it.isNotBlank() },
+                                iconKey = entry.iconOverride ?: command.icon.takeIf { it.isNotBlank() },
+                                isEnabled = true,
+                                isBusy = false,
+                                requiresConfirmation = entry.requiresConfirmationOverride
+                                    ?: command.requiresConfirmation,
+                                showOutput = entry.showOutputOverride ?: command.showOutput
+                            )
+                        }
+                    quickActions.addAll(sectionActions)
+                }
+
+                RemoteLayoutSpec.SectionType.ADJUSTMENTS -> {
+                    val controls = section.entries
+                        .filterIsInstance<RemoteLayoutEntry.AdjustmentEntry>()
+                        .mapNotNull { entry ->
+                            val command = commandMap[entry.commandId] ?: return@mapNotNull null
+                            mapAdjustmentEntry(entry, command)
+                        }
+
+                    if (controls.isNotEmpty()) {
+                        adjustmentGroups.add(
+                            RemoteAdjustmentGroup(
+                                id = section.id,
+                                title = section.title,
+                                controls = controls
+                            )
+                        )
+                    }
+                }
+
+                RemoteLayoutSpec.SectionType.TELEMETRY -> {
+                    section.entries
+                        .filterIsInstance<RemoteLayoutEntry.TelemetryEntry>()
+                        .mapNotNull { entry ->
+                            val command = commandMap[entry.sourceCommandId] ?: return@mapNotNull null
+                            mapTelemetryEntry(entry, command)
+                        }
+                        .also { telemetryCards.addAll(it) }
+                }
+            }
+        }
+
+        if (quickActions.isEmpty() && adjustmentGroups.isEmpty() && telemetryCards.isEmpty()) {
+            return buildDefaultRemotePanel(commands)
+        }
+
+        return RemotePanelUiModel(
+            quickActions = quickActions,
+            adjustments = adjustmentGroups,
+            telemetry = telemetryCards
+        )
+    }
+
+    private fun buildDefaultRemotePanel(commands: List<Command>): RemotePanelUiModel {
         val quickActions = commands
             .filter { it.parameters.isEmpty() }
             .take(6)
@@ -393,7 +477,7 @@ class CommandListViewModel @Inject constructor(
                             id = "${command.id}:${parameter.name}",
                             label = parameter.name,
                             isEnabled = true,
-                            isChecked = parameter.defaultValue?.toBooleanStrictOrNull() ?: false,
+                            isChecked = parseBoolean(parameter.defaultValue) ?: false,
                             helperText = parameter.description.takeIf { it.isNotBlank() }
                         )
 
@@ -431,5 +515,140 @@ class CommandListViewModel @Inject constructor(
             adjustments = adjustmentGroups,
             telemetry = telemetry
         )
+    }
+
+    private fun mapAdjustmentEntry(
+        entry: RemoteLayoutEntry.AdjustmentEntry,
+        command: Command
+    ): RemoteAdjustment? {
+        val parameter = command.parameters.find { it.name == entry.parameterName } ?: return null
+        val helperText = entry.helperText ?: parameter.description.takeIf { it.isNotBlank() }
+
+        val resolvedControl = when (entry.control) {
+            AdjustmentControl.AUTO -> when (parameter.type) {
+                ParameterType.SLIDER -> AdjustmentControl.SLIDER
+                ParameterType.TOGGLE -> AdjustmentControl.TOGGLE
+                else -> AdjustmentControl.COUNTER
+            }
+
+            else -> entry.control
+        }
+
+        return when (resolvedControl) {
+            AdjustmentControl.SLIDER -> {
+                val min = entry.slider?.min ?: parameter.min?.toFloat() ?: 0f
+                val max = entry.slider?.max ?: parameter.max?.toFloat() ?: (if (min < 100f) 100f else min + 1f)
+                val (start, end) = if (min < max) min to max else 0f to 100f
+                val value = parameter.defaultValue?.toFloatOrNull()
+                    ?.takeIf { it in start..end }
+                    ?: start
+
+                RemoteAdjustment.Slider(
+                    id = "${command.id}:${parameter.name}",
+                    label = entry.labelOverride ?: parameter.name,
+                    isEnabled = true,
+                    value = value,
+                    range = start..end,
+                    step = entry.slider?.step,
+                    helperText = helperText
+                )
+            }
+
+            AdjustmentControl.TOGGLE -> {
+                val isChecked = parseBoolean(parameter.defaultValue) ?: false
+                val derivedHelper = helperText ?: run {
+                    val toggleOverrides = entry.toggle
+                    when {
+                        toggleOverrides == null -> null
+                        isChecked -> toggleOverrides.checkedLabel
+                        else -> toggleOverrides.uncheckedLabel
+                    }
+                }
+
+                RemoteAdjustment.Toggle(
+                    id = "${command.id}:${parameter.name}",
+                    label = entry.labelOverride ?: parameter.name,
+                    isEnabled = true,
+                    isChecked = isChecked,
+                    helperText = derivedHelper
+                )
+            }
+
+            AdjustmentControl.COUNTER -> {
+                val counterOverrides = entry.counter
+                val min = counterOverrides?.min ?: parameter.min
+                val max = counterOverrides?.max ?: parameter.max
+                val value = parameter.defaultValue?.toIntOrNull() ?: min ?: 0
+
+                RemoteAdjustment.Counter(
+                    id = "${command.id}:${parameter.name}",
+                    label = entry.labelOverride ?: parameter.name,
+                    isEnabled = true,
+                    value = value,
+                    min = min,
+                    max = max,
+                    helperText = helperText
+                )
+            }
+
+            AdjustmentControl.AUTO -> null
+        }
+    }
+
+    private fun mapTelemetryEntry(
+        entry: RemoteLayoutEntry.TelemetryEntry,
+        command: Command
+    ): RemoteTelemetryCard {
+        val title = entry.titleOverride ?: command.name
+
+        return when (entry.display) {
+            TelemetryDisplay.COUNTER -> RemoteTelemetryCard.Counter(
+                id = entry.id,
+                title = title,
+                isLoading = true,
+                lastUpdatedTimestamp = null,
+                value = 0,
+                unit = entry.unit,
+                delta = null
+            )
+
+            TelemetryDisplay.GAUGE -> {
+                val min = entry.min ?: 0f
+                val max = entry.max?.takeIf { it > min } ?: 100f
+
+                RemoteTelemetryCard.Gauge(
+                    id = entry.id,
+                    title = title,
+                    isLoading = true,
+                    lastUpdatedTimestamp = null,
+                    value = min,
+                    min = min,
+                    max = max,
+                    unit = entry.unit,
+                    trend = null
+                )
+            }
+
+            TelemetryDisplay.TEXT -> RemoteTelemetryCard.Text(
+                id = entry.id,
+                title = title,
+                isLoading = true,
+                lastUpdatedTimestamp = null,
+                body = entry.textTemplate
+                    ?: command.description.takeIf { it.isNotBlank() }
+                    ?: ""
+            )
+        }
+    }
+
+    private fun parseBoolean(value: String?): Boolean? {
+        if (value == null) return null
+        return when {
+            value.equals("true", ignoreCase = true) -> true
+            value.equals("false", ignoreCase = true) -> false
+            value == "1" -> true
+            value == "0" -> false
+            else -> null
+        }
     }
 }

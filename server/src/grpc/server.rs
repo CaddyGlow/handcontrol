@@ -120,11 +120,25 @@ impl RemoteControlService {
             binding_type,
             binding_value,
         ) {
-            Ok(token) => Some(super::proto::RelayInfo {
-                relay_url: relay_url.clone(),
-                relay_token: token,
-                relay_required: false,
-            }),
+            Ok(token) => {
+                let binding_hash = {
+                    let digest = Sha256::digest(binding_value.as_bytes());
+                    let hex = hex::encode(digest);
+                    hex.chars().take(16).collect::<String>()
+                };
+                tracing::info!(
+                    server_id = %self.server_id,
+                    relay_binding_type = binding_type,
+                    relay_binding_hash = %binding_hash,
+                    relay_ttl_secs = ttl.as_secs(),
+                    "Issued relay token"
+                );
+                Some(super::proto::RelayInfo {
+                    relay_url: relay_url.clone(),
+                    relay_token: token,
+                    relay_required: false,
+                })
+            }
             Err(e) => {
                 tracing::error!(
                     "Failed to generate relay token for subject {} (binding_type={}, binding_value={}): {}",

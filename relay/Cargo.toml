@@ -40,6 +40,8 @@ ed25519-dalek = { workspace = true }
 subtle = "2.5"
 url = { workspace = true }
 rand = "0.9"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio-stream = { workspace = true }

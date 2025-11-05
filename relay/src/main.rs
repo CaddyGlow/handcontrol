@@ -21,6 +21,7 @@ use handcontrol_relay::tunnel::state::TunnelState;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
@@ -598,6 +599,13 @@ struct RelayClaims {
     exp: u64,
     iat: u64,
     server_id: String,
+    #[serde(default)]
+    server_audience: Option<String>,
+    #[serde(default)]
+    binding_type: Option<String>,
+    #[serde(default)]
+    binding_value: Option<String>,
+    #[serde(default)]
     permissions: Vec<String>,
 }
 
@@ -802,6 +810,7 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     };
 
     trace!("Relay token validated");
+
     if !state.is_allowed_audience(&claims.aud) {
         warn!(
             "Relay token audience '{}' did not match expected host '{}'",
@@ -813,6 +822,28 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
                     "type": "connect_ack",
                     "status": "error",
                     "error": "invalid_token"
+                })
+                .to_string(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return Ok(());
+    }
+
+    let binding_type = claims.binding_type.as_deref().unwrap_or("client_id");
+    let binding_value = claims.binding_value.as_deref().unwrap_or(&claims.sub);
+
+    if claims.sub != binding_value {
+        warn!(
+            "Relay token subject '{}' mismatch binding value '{}'",
+            claims.sub, binding_value
+        );
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "connect_ack",
+                    "status": "error",
+                    "error": "binding_mismatch"
                 })
                 .to_string(),
             ))
@@ -838,6 +869,64 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             .await;
         let _ = socket.close().await;
         return Ok(());
+    }
+
+    match binding_type {
+        "client_id" => {
+            if binding_value != client_id_str {
+                warn!(
+                    "Relay token binding value '{}' did not match client {}",
+                    binding_value, client_id
+                );
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "connect_ack",
+                            "status": "error",
+                            "error": "binding_mismatch"
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                return Ok(());
+            }
+        }
+        "enrollment_token" => {
+            if binding_value != client_id_str {
+                warn!(
+                    "Relay token enrollment binding '{}' did not match client {}",
+                    binding_value, client_id
+                );
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::json!({
+                            "type": "connect_ack",
+                            "status": "error",
+                            "error": "binding_mismatch"
+                        })
+                        .to_string(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+                return Ok(());
+            }
+        }
+        other => {
+            warn!("Unsupported relay token binding type '{}'", other);
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "connect_ack",
+                        "status": "error",
+                        "error": "invalid_token"
+                    })
+                    .to_string(),
+                ))
+                .await;
+            let _ = socket.close().await;
+            return Ok(());
+        }
     }
 
     let claims_server = match Uuid::parse_str(&claims.server_id) {
@@ -871,6 +960,63 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         let _ = socket.close().await;
         return Ok(());
     }
+
+    let server_audience = claims
+        .server_audience
+        .as_deref()
+        .unwrap_or(&claims.server_id);
+    let audience_uuid = match Uuid::parse_str(server_audience) {
+        Ok(uuid) => uuid,
+        Err(_) => {
+            warn!(
+                "Relay token server_audience '{}' is not a UUID",
+                server_audience
+            );
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "connect_ack",
+                        "status": "error",
+                        "error": "invalid_token"
+                    })
+                    .to_string(),
+                ))
+                .await;
+            let _ = socket.close().await;
+            return Ok(());
+        }
+    };
+    if audience_uuid != server_id {
+        warn!(
+            "Relay token server_audience {} did not match requested server {}",
+            audience_uuid, server_id
+        );
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({
+                    "type": "connect_ack",
+                    "status": "error",
+                    "error": "server_mismatch"
+                })
+                .to_string(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return Ok(());
+    }
+
+    let binding_fingerprint = {
+        let digest = Sha256::digest(binding_value.as_bytes());
+        let hex = hex::encode(digest);
+        hex.chars().take(16).collect::<String>()
+    };
+    debug!(
+        server_id = %server_id,
+        client_id = %client_id,
+        relay_binding_type = binding_type,
+        relay_binding_hash = %binding_fingerprint,
+        "Relay token binding validated"
+    );
 
     if !claims.permissions.iter().any(|p| p == "connect") {
         trace!("Relay token missing connect permission");
@@ -2253,8 +2399,18 @@ mod tests {
         }
 
         let client_id = Uuid::new_v4();
-        let relay_token =
-            create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
+        let relay_token = {
+            let client_id_str = client_id.to_string();
+            create_client_token(
+                &signing_key,
+                server_id,
+                &client_id_str,
+                "127.0.0.1",
+                "client_id",
+                &client_id_str,
+            )
+        }
+        .unwrap();
 
         let connect_url = format!("{}/connect", base_ws_url);
         let (client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
@@ -2311,6 +2467,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn relay_rejects_binding_mismatch() {
+        let server_id = Uuid::new_v4();
+        let secret = Base64.encode(b"relayed-secret".as_ref());
+        let config = test_config(server_id, &secret, 5);
+        let state = Arc::new(AppState::new(config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = listener.local_addr().unwrap();
+        let app_state = state.clone();
+        let relay_handle = tokio::spawn(async move {
+            axum::serve(listener, build_router(app_state).into_make_service())
+                .await
+                .unwrap();
+        });
+
+        let signing_key_bytes = [33u8; 32];
+        let signing_key = SigningKey::from_bytes(&signing_key_bytes);
+        let verifying_key = signing_key.verifying_key();
+        let public_key_base64 = Base64.encode(verifying_key.to_bytes());
+
+        let base_ws_url = format!("ws://{}", relay_addr);
+        let register_url = format!("{}/register", base_ws_url);
+
+        let (control_closed_tx, control_closed_rx) = oneshot::channel();
+        let server_task = tokio::spawn(run_test_server_control(
+            register_url,
+            base_ws_url.clone(),
+            server_id,
+            secret.clone(),
+            public_key_base64.clone(),
+            control_closed_tx,
+        ));
+
+        let mut attempts = 0;
+        loop {
+            if state.server_entry(&server_id).await.is_some() {
+                break;
+            }
+            attempts += 1;
+            if attempts > 200 {
+                panic!("Server did not register with relay");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let client_id = Uuid::new_v4();
+        let relay_token = {
+            let subject = client_id.to_string();
+            let mismatched = Uuid::new_v4().to_string();
+            create_client_token(
+                &signing_key,
+                server_id,
+                &subject,
+                "127.0.0.1",
+                "client_id",
+                &mismatched,
+            )
+        }
+        .unwrap();
+
+        let connect_url = format!("{}/connect", base_ws_url);
+        let (client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
+        let (mut client_sink, mut client_stream) = client_ws.split();
+
+        let connect_msg = json!({
+            "type": "connect",
+            "server_id": server_id.to_string(),
+            "relay_token": relay_token,
+            "client_id": client_id.to_string(),
+            "client_version": "integration-test",
+        });
+        client_sink
+            .send(WsMessage::Text(connect_msg.to_string().into()))
+            .await
+            .unwrap();
+
+        let ack_msg = client_stream.next().await.unwrap().unwrap();
+        let ack_text = match ack_msg {
+            WsMessage::Text(text) => text,
+            other => panic!("Expected text ack, got {:?}", other),
+        };
+        let ack_value: Value = serde_json::from_str(ack_text.as_str()).unwrap();
+        assert_eq!(ack_value["status"], "error");
+        assert_eq!(ack_value["error"], "binding_mismatch");
+
+        drop(client_sink);
+        drop(client_stream);
+
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = control_closed_rx => {}
+        }
+
+        relay_handle.abort();
+        let _ = relay_handle.await;
+        server_task.abort();
+        let _ = server_task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
     async fn control_connection_handles_abrupt_tunnel_close() {
         let server_id = Uuid::new_v4();
         let secret = Base64.encode(b"relayed-secret".as_ref());
@@ -2357,8 +2613,18 @@ mod tests {
         }
 
         let client_id = Uuid::new_v4();
-        let relay_token =
-            create_client_token(&signing_key, server_id, client_id, "127.0.0.1").unwrap();
+        let relay_token = {
+            let client_id_str = client_id.to_string();
+            create_client_token(
+                &signing_key,
+                server_id,
+                &client_id_str,
+                "127.0.0.1",
+                "client_id",
+                &client_id_str,
+            )
+        }
+        .unwrap();
 
         let connect_url = format!("{}/connect", base_ws_url);
         let (client_ws, _) = connect_with_protocol(&connect_url).await.unwrap();
@@ -2535,8 +2801,10 @@ mod tests {
     fn create_client_token(
         signing_key: &SigningKey,
         server_id: Uuid,
-        client_id: Uuid,
+        subject: &str,
         audience: &str,
+        binding_type: &str,
+        binding_value: &str,
     ) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2548,6 +2816,9 @@ mod tests {
             exp: u64,
             iat: u64,
             server_id: String,
+            server_audience: String,
+            binding_type: String,
+            binding_value: String,
             permissions: Vec<&'static str>,
         }
 
@@ -2559,11 +2830,14 @@ mod tests {
 
         let claims = RelayTokenClaims {
             iss: "handcontrol-server",
-            sub: client_id.to_string(),
+            sub: subject.to_string(),
             aud: audience,
             exp,
             iat: now,
             server_id: server_id.to_string(),
+            server_audience: server_id.to_string(),
+            binding_type: binding_type.to_string(),
+            binding_value: binding_value.to_string(),
             permissions: vec!["connect"],
         };
 

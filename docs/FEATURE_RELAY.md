@@ -572,7 +572,8 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
 #### 1.3 Authentication & JWT Handling
 
 - Registration now expects the server to send a base64 Ed25519 public key. The relay converts it to DER, caches a `DecodingKey`, and associates a control channel with the server ID.
-- During `/connect`, the relay validates JWTs with `decode::<RelayClaims>` and emits explicit error codes (`invalid_token`, `server_not_registered`, `permission_denied`, `server_unreachable`). The `connect_ack` response carries a server-generated tunnel id plus an expiration deadline.
+- During `/connect`, the relay validates JWTs with `decode::<RelayClaims>`, enforces `aud`/`server_id`/`server_audience` consistency, and now checks the new binding contract (`binding_type` ∈ {`client_id`, `enrollment_token`} and `binding_value == sub == presented client`). Violations yield precise errors (`binding_mismatch`, `client_mismatch`, `invalid_token`). The `connect_ack` response carries a server-generated tunnel id plus an expiration deadline.
+- Both the server and relay emit structured telemetry (server logs hash-prefixes of the binding value; relay logs binding metadata per tunnel request) so operators can audit issuance/consumption without exposing secrets.
 - Tunnel state is tracked via `TunnelHandle`, ensuring both client and server deliver `tunnel_ready` before frames are forwarded. Additional cleanup (removing tunnel state, notifying clients) is handled after completion.
 
 #### 1.4 Configuration

@@ -98,7 +98,7 @@ QR enrollment currently assumes the enrolling client can reach the server over o
 2. **Token Scope**
    - Amend `generate_relay_token` to embed binding metadata (`binding_type`, `binding_value`) that records whether the JWT is tied to an enrollment token or a persistent client ID, preventing reuse across contexts.
    - Include `server_audience` alongside the existing `server_id` claim so the relay can assert which server issued the token while still validating the `aud` (relay URL).
-   - Emit structured logs (`info!`) with server ID, binding info, and expires-at (no secrets).
+   - Emit structured logs (`info!`) with server ID, binding type, a hashed binding fingerprint, and expiry so operators can audit issuance without leaking secrets.
 3. **Approval Mode Parity**
    - Confirm `CheckPairingStatusResponse` delivers relay info on approval completion; document in `docs/FEATURE_PERSISTENT_ENROLLMENT.md`.
 4. **Revocation Hooks**

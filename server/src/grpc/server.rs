@@ -912,38 +912,83 @@ impl RemoteControl for RemoteControlService {
             fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
         );
 
-        // Read config and find command
-        let config = self.config.read().unwrap();
-        let command = config
-            .command
-            .iter()
-            .find(|cmd| cmd.id == req.command_id)
-            .ok_or_else(|| {
-                warn!("Command not found: {}", req.command_id);
-                Status::not_found(format!("Command '{}' not found", req.command_id))
-            })?;
+        // Read config and resolve command execution details
+        let config_guard = self.config.read().unwrap();
 
-        // Validate parameters
-        let validated_params = crate::commands::validate_parameters(command, &req.parameters)
-            .map_err(|e| {
-                warn!(
-                    "Parameter validation failed for command {}: {}",
-                    req.command_id, e
-                );
-                Status::invalid_argument(format!("Parameter validation failed: {}", e))
-            })?;
+        let (command, shell_command) = if req.command_id == "_dynamic_default" {
+            let requested = req.parameters.get("_cmd").cloned().unwrap_or_default();
+            let trimmed = requested.trim().to_string();
 
-        // Substitute parameters into shell command
-        let shell_command =
-            crate::commands::substitute_parameters(&command.shell, &validated_params).map_err(
-                |e| {
+            if trimmed.is_empty() {
+                warn!("Dynamic default request missing _cmd parameter");
+                return Err(Status::invalid_argument("Missing _cmd parameter"));
+            }
+
+            let is_allowed = config_guard
+                .command
+                .iter()
+                .flat_map(|cmd| cmd.parameters.iter())
+                .filter_map(|param| param.default_value_command.as_ref())
+                .any(|value| value.trim() == trimmed);
+
+            if !is_allowed {
+                warn!("Dynamic default command not permitted: {}", trimmed);
+                return Err(Status::permission_denied(
+                    "Dynamic default command not permitted",
+                ));
+            }
+
+            (
+                crate::config::parser::CommandConfig {
+                    id: "_dynamic_default".to_string(),
+                    name: "Dynamic Default".to_string(),
+                    description: Some("Internal dynamic default executor".to_string()),
+                    icon: None,
+                    shell: trimmed.clone(),
+                    tags: vec!["internal".to_string()],
+                    timeout_seconds: 3,
+                    env: std::collections::HashMap::new(),
+                    parameters: vec![],
+                    requires_confirmation: false,
+                    show_output: false,
+                },
+                trimmed,
+            )
+        } else {
+            let command = config_guard
+                .command
+                .iter()
+                .find(|cmd| cmd.id == req.command_id)
+                .cloned()
+                .ok_or_else(|| {
+                    warn!("Command not found: {}", req.command_id);
+                    Status::not_found(format!("Command '{}' not found", req.command_id))
+                })?;
+
+            let validated_params = crate::commands::validate_parameters(&command, &req.parameters)
+                .map_err(|e| {
                     warn!(
-                        "Parameter substitution failed for command {}: {}",
+                        "Parameter validation failed for command {}: {}",
                         req.command_id, e
                     );
-                    Status::internal(format!("Parameter substitution failed: {}", e))
-                },
-            )?;
+                    Status::invalid_argument(format!("Parameter validation failed: {}", e))
+                })?;
+
+            let shell_command =
+                crate::commands::substitute_parameters(&command.shell, &validated_params).map_err(
+                    |e| {
+                        warn!(
+                            "Parameter substitution failed for command {}: {}",
+                            req.command_id, e
+                        );
+                        Status::internal(format!("Parameter substitution failed: {}", e))
+                    },
+                )?;
+
+            (command, shell_command)
+        };
+
+        drop(config_guard);
 
         // Create channel for streaming output
         let (tx, rx) = tokio::sync::mpsc::channel(128);

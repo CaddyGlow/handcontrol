@@ -50,6 +50,8 @@ import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import timber.log.Timber
+import java.time.Instant
+import java.time.format.DateTimeParseException
 import java.util.concurrent.Executors
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -184,14 +186,26 @@ fun QrScannerScreen(
                                     throw IllegalArgumentException("QR code missing required server_id")
                                 }
 
-                                Timber.i("QR code scanned: ips=$ips, port=$port, fingerprint=$fingerprint, server_id=$serverId")
+                                val validUntil = if (json.has("valid_until")) {
+                                    try {
+                                        Instant.parse(json.getString("valid_until"))
+                                    } catch (parseError: DateTimeParseException) {
+                                        Timber.w(parseError, "Invalid valid_until timestamp in QR payload")
+                                        null
+                                    }
+                                } else {
+                                    null
+                                }
+
+                                Timber.i("QR code scanned: ips=$ips, port=$port, fingerprint=$fingerprint, server_id=$serverId, valid_until=$validUntil")
 
                                 viewModel.enrollWithQrCode(
                                     hosts = ips,
                                     port = port,
                                     token = token,
                                     certFingerprint = fingerprint,
-                                    serverId = serverId
+                                    serverId = serverId,
+                                    validUntil = validUntil
                                 )
                             } catch (e: Exception) {
                                 Timber.e(e, "Failed to parse QR code")

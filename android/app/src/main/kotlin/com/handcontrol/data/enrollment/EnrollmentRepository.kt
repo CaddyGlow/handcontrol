@@ -1,6 +1,7 @@
 package com.handcontrol.data.enrollment
 
 import com.handcontrol.core.security.ClientCertificate
+import java.time.Instant
 
 sealed interface EnrollmentResult {
     data class Success(val clientId: String, val serverId: String) : EnrollmentResult
@@ -15,7 +16,8 @@ interface EnrollmentRepository {
         token: String,
         deviceName: String,
         expectedCertFingerprint: String,
-        expectedServerId: String
+        expectedServerId: String,
+        validUntil: Instant?
     ): EnrollmentResult
 
     suspend fun requestApproval(

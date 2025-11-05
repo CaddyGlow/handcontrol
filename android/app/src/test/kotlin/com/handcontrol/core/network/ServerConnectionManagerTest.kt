@@ -48,7 +48,7 @@ class ServerConnectionManagerTest {
         mockRelayChannel = mockk(relaxed = true)
 
         every { mockDirectChannel.getState(any()) } returns ConnectivityState.READY
-        coEvery { directChannelFactory.forceShutdownChannel(any()) } returns Unit
+        coEvery { directChannelFactory.forceShutdownChannel(any()) } returns null
 
         testServer = EnrolledServerEntity(
             serverId = "test-server-id",

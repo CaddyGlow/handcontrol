@@ -36,6 +36,7 @@ import timber.log.Timber
 import java.io.IOException
 import java.security.MessageDigest
 import java.security.cert.X509Certificate
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -65,11 +66,17 @@ class GrpcEnrollmentRepository @Inject constructor(
         token: String,
         deviceName: String,
         expectedCertFingerprint: String,
-        expectedServerId: String
+        expectedServerId: String,
+        validUntil: Instant?
     ): EnrollmentResult {
         require(hosts.isNotEmpty()) { "At least one host is required" }
         require(expectedCertFingerprint.isNotEmpty()) { "Certificate fingerprint is required for secure enrollment" }
         require(expectedServerId.isNotEmpty()) { "Server ID is required for secure enrollment" }
+
+        if (validUntil != null && Instant.now().isAfter(validUntil)) {
+            Timber.w("Enrollment token expired before attempting enrollment: validUntil=%s", validUntil)
+            return EnrollmentResult.Error("This enrollment QR code has expired. Generate a new code and try again.")
+        }
 
         Timber.i("Enrolling with ${hosts.size} IP(s): ${hosts.take(3).joinToString()}")
         Timber.i("Expected cert fingerprint: $expectedCertFingerprint")
@@ -82,15 +89,16 @@ class GrpcEnrollmentRepository @Inject constructor(
         val firstHost = hosts[0]
         try {
             Timber.d("Trying primary IP (IPv6): $firstHost")
-            return tryEnrollWithHost(
-                host = firstHost,
-                port = port,
-                token = token,
-                deviceName = deviceName,
-                timeoutMs = 3000L,
-                expectedCertFingerprint = expectedCertFingerprint,
-                expectedServerId = expectedServerId
-            )
+                return tryEnrollWithHost(
+                    host = firstHost,
+                    port = port,
+                    token = token,
+                    deviceName = deviceName,
+                    timeoutMs = 3000L,
+                    expectedCertFingerprint = expectedCertFingerprint,
+                    expectedServerId = expectedServerId,
+                    validUntil = validUntil
+                )
         } catch (e: Exception) {
             Timber.w(e, "Primary IP $firstHost failed: ${e.javaClass.simpleName}")
         }
@@ -107,7 +115,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                     deviceName = deviceName,
                     timeoutMs = 3000L,
                     expectedCertFingerprint = expectedCertFingerprint,
-                    expectedServerId = expectedServerId
+                    expectedServerId = expectedServerId,
+                    validUntil = validUntil
                 )
             } catch (e: Exception) {
                 Timber.w(e, "Fallback IP $secondHost failed: ${e.javaClass.simpleName}")
@@ -131,7 +140,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                                 deviceName = deviceName,
                                 timeoutMs = 5000L,
                                 expectedCertFingerprint = expectedCertFingerprint,
-                                expectedServerId = expectedServerId
+                                expectedServerId = expectedServerId,
+                                validUntil = validUntil
                             )
                         } catch (e: Exception) {
                             Timber.w(e, "Alternative IP $host failed: ${e.javaClass.simpleName}")
@@ -168,9 +178,19 @@ class GrpcEnrollmentRepository @Inject constructor(
         deviceName: String,
         timeoutMs: Long,
         expectedCertFingerprint: String,
-        expectedServerId: String
+        expectedServerId: String,
+        validUntil: Instant?
     ): EnrollmentResult {
         return withTimeout(timeoutMs) {
+            if (validUntil != null && Instant.now().isAfter(validUntil)) {
+                Timber.w(
+                    "Enrollment token expired during attempt to host=%s port=%d", host, port
+                )
+                return@withTimeout EnrollmentResult.Error(
+                    "This enrollment QR code has expired. Generate a new code and try again."
+                )
+            }
+
             var enrollmentChannel: EnrollmentChannel? = null
             try {
                 Timber.d(

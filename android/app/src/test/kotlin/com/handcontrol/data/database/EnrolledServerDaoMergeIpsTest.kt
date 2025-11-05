@@ -106,6 +106,10 @@ class EnrolledServerDaoMergeIpsTest {
             throw NotImplementedError("Not needed for this test")
         }
 
+        override fun observeRemoteLayoutSpec(serverId: String): Flow<com.handcontrol.feature.commands.remote.RemoteLayoutSpec?> {
+            throw NotImplementedError("Not needed for this test")
+        }
+
         override suspend fun getLastConnectedServer(): EnrolledServerEntity? {
             throw NotImplementedError("Not needed for this test")
         }
@@ -151,6 +155,14 @@ class EnrolledServerDaoMergeIpsTest {
         }
 
         override suspend fun getServerByHostAndPort(host: String, port: Int): EnrolledServerEntity? {
+            throw NotImplementedError("Not needed for this test")
+        }
+
+        override suspend fun getRemoteLayoutSpec(serverId: String): com.handcontrol.feature.commands.remote.RemoteLayoutSpec? {
+            throw NotImplementedError("Not needed for this test")
+        }
+
+        override suspend fun updateRemoteLayoutSpec(serverId: String, layoutSpec: com.handcontrol.feature.commands.remote.RemoteLayoutSpec?) {
             throw NotImplementedError("Not needed for this test")
         }
 

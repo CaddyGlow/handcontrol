@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.time.Instant
 import javax.inject.Inject
 
 sealed interface EnrollmentUiState {
@@ -43,10 +44,22 @@ class EnrollmentViewModel @Inject constructor(
         port: Int,
         token: String,
         certFingerprint: String,
-        serverId: String
+        serverId: String,
+        validUntil: Instant?
     ) {
         viewModelScope.launch {
             try {
+                if (validUntil != null && Instant.now().isAfter(validUntil)) {
+                    Timber.w(
+                        "Enrollment token expired before enrollment attempt: validUntil=%s",
+                        validUntil
+                    )
+                    _uiState.value = EnrollmentUiState.Error(
+                        "This enrollment QR code has expired. Generate a new code and try again."
+                    )
+                    return@launch
+                }
+
                 // Check if server is already enrolled (check first host)
                 val primaryHost = hosts.firstOrNull() ?: run {
                     _uiState.value = EnrollmentUiState.Error("No valid IP addresses provided")
@@ -70,7 +83,8 @@ class EnrollmentViewModel @Inject constructor(
                     token = token,
                     deviceName = deviceName,
                     expectedCertFingerprint = certFingerprint,
-                    expectedServerId = serverId
+                    expectedServerId = serverId,
+                    validUntil = validUntil
                 )
 
                 when (result) {

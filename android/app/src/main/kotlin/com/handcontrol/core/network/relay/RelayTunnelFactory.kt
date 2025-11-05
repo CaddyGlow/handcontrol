@@ -12,15 +12,22 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.CertificatePinner
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import okio.ByteString
+import okio.ByteString.Companion.decodeHex
+import okio.ByteString.Companion.toByteString
 import timber.log.Timber
 import java.io.IOException
+import java.security.MessageDigest
+import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.util.Collections
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -29,6 +36,7 @@ import javax.inject.Singleton
 import javax.net.ssl.SSLContext
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 
 /**
  * Message sent by client to initiate tunnel connection
@@ -74,7 +82,8 @@ data class RelayTunnel(
     val incomingData: Channel<ByteArray>,
     val relayHost: String?,
     val serverAuthority: String?,
-    val healthMonitor: TunnelHealthMonitor
+    val healthMonitor: TunnelHealthMonitor,
+    val cleanup: (() -> Unit)? = null
 ) {
     suspend fun sendData(data: ByteArray) {
         healthMonitor.recordActivity()
@@ -83,8 +92,12 @@ data class RelayTunnel(
 
     fun close() {
         healthMonitor.stop()
-        webSocket.close(1000, "Tunnel closed")
-        incomingData.close()
+        try {
+            webSocket.close(1000, "Tunnel closed")
+        } finally {
+            incomingData.close()
+            cleanup?.invoke()
+        }
     }
 
     fun isHealthy(): Boolean = healthMonitor.isHealthy()
@@ -146,6 +159,7 @@ class TunnelHealthMonitor(
 class RelayTunnelFactory @Inject constructor() {
 
     private val scope = CoroutineScope(Dispatchers.IO)
+    private val activeClients = Collections.synchronizedSet(mutableSetOf<OkHttpClient>())
 
     // encodeDefaults ensures we transmit required control fields like "type" even when defaults are used
     private val json = Json {
@@ -153,29 +167,93 @@ class RelayTunnelFactory @Inject constructor() {
         encodeDefaults = true
     }
 
-    private val okHttpClient by lazy {
-        createOkHttpClient()
+    private fun registerClient(client: OkHttpClient): () -> Unit {
+        activeClients.add(client)
+        val closed = AtomicBoolean(false)
+        return {
+            if (closed.compareAndSet(false, true)) {
+                runCatching { client.dispatcher.executorService.shutdown() }
+                runCatching { client.connectionPool.evictAll() }
+                activeClients.remove(client)
+            }
+        }
     }
 
-    private fun createOkHttpClient(): OkHttpClient {
-        // Create a trust manager that accepts all certificates (for self-signed relay certs)
-        val trustAllCerts = arrayOf<TrustManager>(object : X509TrustManager {
-            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
-        })
-
-        val sslContext = SSLContext.getInstance("TLS")
-        sslContext.init(null, trustAllCerts, java.security.SecureRandom())
-
-        return OkHttpClient.Builder()
+    private fun buildOkHttpClient(
+        relayUrl: String,
+        allowSelfSignedTls: Boolean,
+        pinnedCertSha256: String?
+    ): Pair<OkHttpClient, () -> Unit> {
+        val builder = OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS) // No read timeout for persistent connection
+            .readTimeout(0, TimeUnit.SECONDS)
             .writeTimeout(10, TimeUnit.SECONDS)
-            .pingInterval(20, TimeUnit.SECONDS) // WebSocket ping every 20 seconds
-            .sslSocketFactory(sslContext.socketFactory, trustAllCerts[0] as X509TrustManager)
-            .hostnameVerifier { _, _ -> true } // Accept all hostnames for self-signed certs
-            .build()
+            .pingInterval(20, TimeUnit.SECONDS)
+
+        val cleanup: () -> Unit
+
+        if (allowSelfSignedTls) {
+            val pinnedBytes = parsePinnedSha256(pinnedCertSha256)
+            val trustManager = object : X509TrustManager {
+                override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+
+                override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                    if (chain.isNullOrEmpty()) {
+                        throw javax.net.ssl.SSLException("Relay certificate chain is empty")
+                    }
+                    val cert = chain[0]
+                    if (pinnedBytes != null) {
+                        val digest = MessageDigest.getInstance("SHA-256").digest(cert.encoded)
+                        if (!digest.contentEquals(pinnedBytes)) {
+                            throw javax.net.ssl.SSLException("Relay certificate pin mismatch")
+                        }
+                    }
+                }
+
+                override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            }
+
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(null, arrayOf<TrustManager>(trustManager), SecureRandom())
+            }
+
+            builder.sslSocketFactory(sslContext.socketFactory, trustManager)
+                .hostnameVerifier { _, _ -> true }
+            val client = builder.build()
+            cleanup = registerClient(client)
+            return client to cleanup
+        } else {
+            val host = relayUrl.toHttpUrlOrNull()?.host
+            val pinBytes = parsePinnedSha256(pinnedCertSha256)
+            if (pinBytes != null && !host.isNullOrBlank()) {
+                val pin = pinBytes.toByteString().base64()
+                builder.certificatePinner(
+                    CertificatePinner.Builder()
+                        .add(host, "sha256/$pin")
+                        .build()
+                )
+            } else if (pinBytes != null) {
+                Timber.w("Relay certificate pin provided but host could not be determined for $relayUrl")
+            }
+            val client = builder.build()
+            cleanup = registerClient(client)
+            return client to cleanup
+        }
+    }
+
+    private fun parsePinnedSha256(raw: String?): ByteArray? {
+        if (raw.isNullOrBlank()) return null
+        val normalized = raw.filter { it.isLetterOrDigit() }.lowercase(Locale.US)
+        if (normalized.isEmpty() || normalized.length % 2 != 0) {
+            Timber.w("Invalid relay pinned SHA-256 value: $raw")
+            return null
+        }
+        return try {
+            normalized.decodeHex().toByteArray()
+        } catch (e: IllegalArgumentException) {
+            Timber.w(e, "Failed to decode relay pinned SHA-256")
+            null
+        }
     }
 
     /**
@@ -193,7 +271,9 @@ class RelayTunnelFactory @Inject constructor() {
         serverId: String,
         relayToken: String,
         clientId: String,
-        clientVersion: String
+        clientVersion: String,
+        allowSelfSignedTls: Boolean,
+        pinnedCertSha256: String?
     ): RelayTunnel = withContext(Dispatchers.IO) {
         Timber.i("Opening relay tunnel to $serverId via $relayUrl")
 
@@ -202,6 +282,7 @@ class RelayTunnelFactory @Inject constructor() {
         val incomingData = Channel<ByteArray>(capacity = Channel.BUFFERED)
 
         var healthMonitor: TunnelHealthMonitor? = null
+        val (httpClient, cleanupClient) = buildOkHttpClient(relayUrl, allowSelfSignedTls, pinnedCertSha256)
 
         val listener = object : WebSocketListener() {
             private var tunnelId: String? = null
@@ -268,7 +349,8 @@ class RelayTunnelFactory @Inject constructor() {
                                     incomingData = incomingData,
                                     relayHost = ack.relay_host,
                                     serverAuthority = ack.server_authority,
-                                    healthMonitor = monitor
+                                    healthMonitor = monitor,
+                                    cleanup = cleanupClient
                                 )
 
                                 // Start health monitoring
@@ -346,12 +428,14 @@ class RelayTunnelFactory @Inject constructor() {
                 } else {
                     incomingData.close(IOException(errorMsg, t))
                 }
+                cleanupClient()
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                 Timber.i("WebSocket closed: code=$code, reason=$reason")
                 healthMonitor?.stop()
                 incomingData.close()
+                cleanupClient()
             }
         }
 
@@ -360,19 +444,24 @@ class RelayTunnelFactory @Inject constructor() {
             .addHeader("Sec-WebSocket-Protocol", "handcontrol-relay.v1")
             .build()
 
-        val webSocket = okHttpClient.newWebSocket(request, listener)
+        val webSocket = httpClient.newWebSocket(request, listener)
 
         try {
             tunnelReady.await()
         } catch (e: Exception) {
             webSocket.close(1000, "Failed to establish tunnel")
+            cleanupClient()
             throw e
         }
     }
 
     fun shutdown() {
-        okHttpClient.dispatcher.executorService.shutdown()
-        okHttpClient.connectionPool.evictAll()
+        val snapshot = activeClients.toList()
+        snapshot.forEach { client ->
+            runCatching { client.dispatcher.executorService.shutdown() }
+            runCatching { client.connectionPool.evictAll() }
+            activeClients.remove(client)
+        }
     }
 }
 

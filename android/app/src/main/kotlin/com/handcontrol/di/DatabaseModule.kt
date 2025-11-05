@@ -28,7 +28,8 @@ object DatabaseModule {
             .addMigrations(
                 HandControlDatabase.MIGRATION_1_2,
                 HandControlDatabase.MIGRATION_2_3,
-                HandControlDatabase.MIGRATION_3_4
+                HandControlDatabase.MIGRATION_3_4,
+                HandControlDatabase.MIGRATION_4_5
             )
             .build()
     }

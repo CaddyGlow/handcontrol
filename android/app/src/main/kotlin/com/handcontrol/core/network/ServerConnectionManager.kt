@@ -118,14 +118,20 @@ class ServerConnectionManager @Inject constructor(
 
         // Direct connection failed or was skipped, try relay if available
         if (server.relayEnabled && server.relayUrl != null && server.relayToken != null) {
-            if (!settings.enableRelayFallback || !allowRelayFallback) {
-                val reason = if (!settings.enableRelayFallback) {
-                    "user settings"
-                } else {
-                    "connection preference"
-                }
-                Timber.i("Relay fallback disabled by $reason; skipping relay attempt")
-                throw Exception("Relay fallback disabled by $reason")
+            val fallbackDisabledByPreference = !allowRelayFallback && !preferRelay
+            if (fallbackDisabledByPreference) {
+                Timber.i("Connection preference set to direct-only; skipping relay attempt")
+                throw Exception("Relay disabled by connection preference")
+            }
+
+            val fallbackDisabledBySettings = !settings.enableRelayFallback && !preferRelay
+            if (fallbackDisabledBySettings) {
+                Timber.i("Relay fallback disabled by user settings; skipping relay attempt")
+                throw Exception("Relay fallback disabled by user settings")
+            }
+
+            if (!settings.enableRelayFallback && preferRelay) {
+                Timber.i("Proceeding with relay-only connection despite disabled fallback setting")
             }
 
             Timber.i("Direct connection ${if (preferRelay) "skipped" else "failed"}, attempting relay connection")
@@ -317,7 +323,9 @@ class ServerConnectionManager @Inject constructor(
                     relayToken = server.relayToken,
                     clientId = server.clientId,
                     defaultAuthority = defaultRelayAuthority(server),
-                    expectedFingerprint = server.certFingerprint
+                    expectedFingerprint = server.certFingerprint,
+                    allowSelfSignedTls = server.relayAllowSelfSigned,
+                    pinnedCertSha256 = server.relayPinnedCertSha256
                 )
             }
 

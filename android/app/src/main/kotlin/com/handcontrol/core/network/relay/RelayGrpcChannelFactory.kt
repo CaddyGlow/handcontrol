@@ -64,7 +64,9 @@ class RelayGrpcChannelFactory @Inject constructor(
         relayToken: String,
         clientId: String,
         defaultAuthority: String,
-        expectedFingerprint: String? = null
+        expectedFingerprint: String? = null,
+        allowSelfSignedTls: Boolean = false,
+        pinnedCertSha256: String? = null
     ): ManagedChannel = withContext(Dispatchers.IO) {
         Timber.i("Creating gRPC channel via relay for server $serverId")
 
@@ -74,7 +76,9 @@ class RelayGrpcChannelFactory @Inject constructor(
             serverId = serverId,
             relayToken = relayToken,
             clientId = clientId,
-            clientVersion = "0.1.0"
+            clientVersion = "0.1.0",
+            allowSelfSignedTls = allowSelfSignedTls,
+            pinnedCertSha256 = pinnedCertSha256
         )
 
         Timber.d(

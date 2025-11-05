@@ -12,6 +12,7 @@ import com.handcontrol.core.security.ClientCertificate
 import com.handcontrol.core.security.ClientCertificateManager
 import com.handcontrol.core.security.VerificationCodeGenerator
 import com.handcontrol.data.database.ConnectionMode
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.CheckPairingStatusRequest
 import com.handcontrol.grpc.EnrollRequest
@@ -67,7 +68,8 @@ class GrpcEnrollmentRepository @Inject constructor(
         deviceName: String,
         expectedCertFingerprint: String,
         expectedServerId: String,
-        validUntil: Instant?
+        validUntil: Instant?,
+        relayOptions: RelayEnrollmentOptions?
     ): EnrollmentResult {
         require(hosts.isNotEmpty()) { "At least one host is required" }
         require(expectedCertFingerprint.isNotEmpty()) { "Certificate fingerprint is required for secure enrollment" }
@@ -97,7 +99,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                     timeoutMs = 3000L,
                     expectedCertFingerprint = expectedCertFingerprint,
                     expectedServerId = expectedServerId,
-                    validUntil = validUntil
+                    validUntil = validUntil,
+                    allHosts = hosts,
+                    relayOptions = relayOptions
                 )
         } catch (e: Exception) {
             Timber.w(e, "Primary IP $firstHost failed: ${e.javaClass.simpleName}")
@@ -116,7 +120,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                     timeoutMs = 3000L,
                     expectedCertFingerprint = expectedCertFingerprint,
                     expectedServerId = expectedServerId,
-                    validUntil = validUntil
+                    validUntil = validUntil,
+                    allHosts = hosts,
+                    relayOptions = relayOptions
                 )
             } catch (e: Exception) {
                 Timber.w(e, "Fallback IP $secondHost failed: ${e.javaClass.simpleName}")
@@ -141,7 +147,9 @@ class GrpcEnrollmentRepository @Inject constructor(
                                 timeoutMs = 5000L,
                                 expectedCertFingerprint = expectedCertFingerprint,
                                 expectedServerId = expectedServerId,
-                                validUntil = validUntil
+                                validUntil = validUntil,
+                                allHosts = hosts,
+                                relayOptions = relayOptions
                             )
                         } catch (e: Exception) {
                             Timber.w(e, "Alternative IP $host failed: ${e.javaClass.simpleName}")
@@ -179,7 +187,9 @@ class GrpcEnrollmentRepository @Inject constructor(
         timeoutMs: Long,
         expectedCertFingerprint: String,
         expectedServerId: String,
-        validUntil: Instant?
+        validUntil: Instant?,
+        allHosts: List<String>,
+        relayOptions: RelayEnrollmentOptions?
     ): EnrollmentResult {
         return withTimeout(timeoutMs) {
             if (validUntil != null && Instant.now().isAfter(validUntil)) {
@@ -276,9 +286,19 @@ class GrpcEnrollmentRepository @Inject constructor(
                         Timber.i("Relay info received: url=%s", relayUrl)
                     }
 
+                    val relayAllowSelfSigned =
+                        relayEnabled && (relayOptions?.allowSelfSignedTls ?: false)
+                    val relayPinned = if (relayEnabled) {
+                        relayOptions?.pinnedCertSha256?.let { value ->
+                            value.takeIf { it.isNotBlank() }
+                        }
+                    } else {
+                        null
+                    }
+
                     enrolledServerRepository.saveServer(
                         serverId = serverId,
-                        serverHost = host,
+                        ips = allHosts,
                         serverPort = port,
                         clientId = response.clientId,
                         serverName = serverInfo.hostname,
@@ -286,6 +306,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                         relayEnabled = relayEnabled,
                         relayUrl = relayUrl,
                         relayToken = relayToken,
+                        relayAllowSelfSigned = relayAllowSelfSigned,
+                        relayPinnedCertSha256 = relayPinned,
                         initialConnectionMode = ConnectionMode.DIRECT
                     )
                     Timber.i(
@@ -294,6 +316,13 @@ class GrpcEnrollmentRepository @Inject constructor(
                         serverInfo.hostname,
                         relayEnabled
                     )
+
+                    if (relayEnabled && (response.relayInfo.relayRequired || relayOptions?.relayRequired == true)) {
+                        enrolledServerRepository.updateConnectionPreference(
+                            serverId,
+                            ConnectionPreference.RELAY_ONLY
+                        )
+                    }
 
                     saveClientId(response.clientId)
                     Timber.i(
@@ -507,9 +536,12 @@ class GrpcEnrollmentRepository @Inject constructor(
                             Timber.i("Relay info received: url=$relayUrl")
                         }
 
+                        val relayAllowSelfSigned = false
+                        val relayPinned: String? = null
+
                         enrolledServerRepository.saveServer(
                             serverId = serverId,
-                            serverHost = host,
+                            ips = listOf(host),
                             serverPort = port,
                             clientId = response.clientId,
                             serverName = serverInfo.hostname,
@@ -517,9 +549,18 @@ class GrpcEnrollmentRepository @Inject constructor(
                             relayEnabled = relayEnabled,
                             relayUrl = relayUrl,
                             relayToken = relayToken,
+                            relayAllowSelfSigned = relayAllowSelfSigned,
+                            relayPinnedCertSha256 = relayPinned,
                             initialConnectionMode = ConnectionMode.DIRECT
                         )
                         Timber.i("Server info saved: serverId=$serverId, hostname=${serverInfo.hostname}, relay=${relayEnabled}")
+
+                        if (relayEnabled && response.relayInfo.relayRequired) {
+                            enrolledServerRepository.updateConnectionPreference(
+                                serverId,
+                                ConnectionPreference.RELAY_ONLY
+                            )
+                        }
                     } catch (e: Exception) {
                         Timber.e(e, "Failed to fetch/save server info")
                         channelFactory.shutdownChannel(channel)

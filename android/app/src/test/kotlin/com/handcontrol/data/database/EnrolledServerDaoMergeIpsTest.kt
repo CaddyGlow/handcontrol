@@ -83,6 +83,8 @@ class EnrolledServerDaoMergeIpsTest {
             relayEnabled = false,
             relayUrl = null,
             relayToken = null,
+            relayAllowSelfSigned = false,
+            relayPinnedCertSha256 = null,
             lastConnectionMode = ConnectionMode.UNKNOWN,
             serverHost = serverHost
         )

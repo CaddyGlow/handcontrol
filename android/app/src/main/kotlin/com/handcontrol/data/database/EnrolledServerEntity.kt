@@ -47,6 +47,8 @@ data class EnrolledServerEntity(
     val relayEnabled: Boolean = false,
     val relayUrl: String? = null,
     val relayToken: String? = null,
+    val relayAllowSelfSigned: Boolean = false,
+    val relayPinnedCertSha256: String? = null,
     val connectionPreference: ConnectionPreference = ConnectionPreference.AUTO,
     val lastConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN,
     val remoteLayoutSpec: RemoteLayoutSpec? = null,

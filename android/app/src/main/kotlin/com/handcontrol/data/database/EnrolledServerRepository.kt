@@ -17,7 +17,7 @@ class EnrolledServerRepository @Inject constructor(
 
     suspend fun saveServer(
         serverId: String,
-        serverHost: String,
+        ips: List<String>,
         serverPort: Int,
         clientId: String,
         serverName: String,
@@ -25,22 +25,31 @@ class EnrolledServerRepository @Inject constructor(
         relayEnabled: Boolean = false,
         relayUrl: String? = null,
         relayToken: String? = null,
+        relayAllowSelfSigned: Boolean = false,
+        relayPinnedCertSha256: String? = null,
         initialConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN
     ) {
-        // Convert single host to list for backward compatibility
+        val sanitizedIps = ips
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+        val primaryHost = sanitizedIps.firstOrNull()
+
         val server = EnrolledServerEntity(
             serverId = serverId,
-            ips = listOf(serverHost),
+            ips = if (sanitizedIps.isEmpty()) emptyList() else sanitizedIps,
             serverPort = serverPort,
             clientId = clientId,
             serverName = serverName,
             certFingerprint = certFingerprint,
             enrolledAt = System.currentTimeMillis(),
             lastConnected = System.currentTimeMillis(),
-            serverHost = serverHost,  // Keep for migration compatibility
+            serverHost = primaryHost,  // Keep for migration compatibility
             relayEnabled = relayEnabled,
             relayUrl = relayUrl,
             relayToken = relayToken,
+            relayAllowSelfSigned = relayAllowSelfSigned,
+            relayPinnedCertSha256 = relayPinnedCertSha256,
             connectionPreference = ConnectionPreference.AUTO,
             lastConnectionMode = initialConnectionMode
         )

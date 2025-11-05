@@ -62,6 +62,8 @@ class ServerConnectionManagerTest {
             relayEnabled = true,
             relayUrl = "wss://relay.example.com",
             relayToken = "test-relay-token",
+            relayAllowSelfSigned = false,
+            relayPinnedCertSha256 = null,
             lastConnectionMode = ConnectionMode.UNKNOWN
         )
     }
@@ -93,7 +95,7 @@ class ServerConnectionManagerTest {
             )
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -139,7 +141,7 @@ class ServerConnectionManagerTest {
             )
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -190,7 +192,9 @@ class ServerConnectionManagerTest {
                 relayToken = "test-relay-token",
                 clientId = "test-client-id",
                 defaultAuthority = any(),
-                expectedFingerprint = testServer.certFingerprint
+                expectedFingerprint = testServer.certFingerprint,
+                allowSelfSignedTls = false,
+                pinnedCertSha256 = null
             )
         }
     }
@@ -203,7 +207,7 @@ class ServerConnectionManagerTest {
         } throws Exception("Connection timeout")
 
         coEvery {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         } throws Exception("Relay connection failed")
 
         // When/Then
@@ -255,7 +259,7 @@ class ServerConnectionManagerTest {
         assertEquals("All connection attempts failed", exception.message)
 
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -278,7 +282,7 @@ class ServerConnectionManagerTest {
         assertEquals("Relay disabled by connection preference", exception.message)
 
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -292,7 +296,9 @@ class ServerConnectionManagerTest {
                 relayToken = "test-relay-token",
                 clientId = "test-client-id",
                 defaultAuthority = any(),
-                expectedFingerprint = testServer.certFingerprint
+                expectedFingerprint = testServer.certFingerprint,
+                allowSelfSignedTls = false,
+                pinnedCertSha256 = null
             )
         } returns mockRelayChannel
 
@@ -307,7 +313,40 @@ class ServerConnectionManagerTest {
             directChannelFactory.createChannel(any(), any(), any())
         }
         coVerify(exactly = 1) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
+        }
+
+        // Restore default settings for subsequent tests
+        every { settingsRepository.settings } returns flowOf(AppSettings())
+        connectionManager = ServerConnectionManager(directChannelFactory, relayChannelFactory, settingsRepository)
+    }
+
+    @Test
+    fun `relay-only preference still uses relay when fallback disabled in settings`() = runTest {
+        every { settingsRepository.settings } returns flowOf(AppSettings(enableRelayFallback = false))
+        connectionManager = ServerConnectionManager(directChannelFactory, relayChannelFactory, settingsRepository)
+
+        coEvery {
+            relayChannelFactory.createChannelViaRelay(
+                relayUrl = "wss://relay.example.com",
+                serverId = "test-server-id",
+                relayToken = "test-relay-token",
+                clientId = "test-client-id",
+                defaultAuthority = any(),
+                expectedFingerprint = testServer.certFingerprint,
+                allowSelfSignedTls = false,
+                pinnedCertSha256 = null
+            )
+        } returns mockRelayChannel
+
+        val result = connectionManager.connect(testServer, preferenceOverride = ConnectionPreference.RELAY_ONLY)
+
+        assertEquals(ConnectionMode.RELAY, result.mode)
+        coVerify(exactly = 0) {
+            directChannelFactory.createChannel(any(), any(), any())
+        }
+        coVerify(exactly = 1) {
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -342,7 +381,7 @@ class ServerConnectionManagerTest {
             directChannelFactory.createChannel(any(), any(), any())
         }
         coVerify(exactly = 0) {
-            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any())
+            relayChannelFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 
@@ -414,7 +453,9 @@ class ServerConnectionManagerTest {
                 relayToken = any(),
                 clientId = any(),
                 defaultAuthority = any(),
-                expectedFingerprint = any()
+                expectedFingerprint = any(),
+                allowSelfSignedTls = any(),
+                pinnedCertSha256 = any()
             )
         } returns mockRelayChannel
 

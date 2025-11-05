@@ -9,6 +9,12 @@ sealed interface EnrollmentResult {
     data class Error(val message: String) : EnrollmentResult
 }
 
+data class RelayEnrollmentOptions(
+    val relayRequired: Boolean,
+    val allowSelfSignedTls: Boolean,
+    val pinnedCertSha256: String?
+)
+
 interface EnrollmentRepository {
     suspend fun enrollWithToken(
         hosts: List<String>,
@@ -17,7 +23,8 @@ interface EnrollmentRepository {
         deviceName: String,
         expectedCertFingerprint: String,
         expectedServerId: String,
-        validUntil: Instant?
+        validUntil: Instant?,
+        relayOptions: RelayEnrollmentOptions? = null
     ): EnrollmentResult
 
     suspend fun requestApproval(

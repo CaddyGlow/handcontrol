@@ -49,6 +49,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.handcontrol.data.enrollment.RelayEnrollmentOptions
 import timber.log.Timber
 import java.time.Instant
 import java.time.format.DateTimeParseException
@@ -199,13 +200,30 @@ fun QrScannerScreen(
 
                                 Timber.i("QR code scanned: ips=$ips, port=$port, fingerprint=$fingerprint, server_id=$serverId, valid_until=$validUntil")
 
+                                val relayOptions = if (json.has("relay") && !json.isNull("relay")) {
+                                    val relayJson = json.getJSONObject("relay")
+                                    val relayUrl = relayJson.optString("relay_url")
+                                    if (relayUrl.isNullOrBlank()) {
+                                        null
+                                    } else {
+                                        RelayEnrollmentOptions(
+                                            relayRequired = relayJson.optBoolean("relay_required", false),
+                                            allowSelfSignedTls = relayJson.optBoolean("allow_self_signed_tls", false),
+                                            pinnedCertSha256 = relayJson.optString("pinned_cert_sha256").takeIf { it.isNotBlank() }
+                                        )
+                                    }
+                                } else {
+                                    null
+                                }
+
                                 viewModel.enrollWithQrCode(
                                     hosts = ips,
                                     port = port,
                                     token = token,
                                     certFingerprint = fingerprint,
                                     serverId = serverId,
-                                    validUntil = validUntil
+                                    validUntil = validUntil,
+                                    relayOptions = relayOptions
                                 )
                             } catch (e: Exception) {
                                 Timber.e(e, "Failed to parse QR code")

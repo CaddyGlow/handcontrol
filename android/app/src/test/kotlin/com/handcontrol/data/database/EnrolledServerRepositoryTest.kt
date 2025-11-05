@@ -155,6 +155,8 @@ class EnrolledServerRepositoryTest {
             relayEnabled = true,
             relayUrl = "wss://relay.example.com",
             relayToken = "test-token",
+            relayAllowSelfSigned = false,
+            relayPinnedCertSha256 = null,
             lastConnectionMode = ConnectionMode.DIRECT
         )
 

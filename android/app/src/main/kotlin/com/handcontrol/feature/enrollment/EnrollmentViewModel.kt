@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.data.enrollment.EnrollmentRepository
 import com.handcontrol.data.enrollment.EnrollmentResult
+import com.handcontrol.data.enrollment.RelayEnrollmentOptions
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,7 +46,8 @@ class EnrollmentViewModel @Inject constructor(
         token: String,
         certFingerprint: String,
         serverId: String,
-        validUntil: Instant?
+        validUntil: Instant?,
+        relayOptions: RelayEnrollmentOptions?
     ) {
         viewModelScope.launch {
             try {
@@ -84,7 +86,8 @@ class EnrollmentViewModel @Inject constructor(
                     deviceName = deviceName,
                     expectedCertFingerprint = certFingerprint,
                     expectedServerId = serverId,
-                    validUntil = validUntil
+                    validUntil = validUntil,
+                    relayOptions = relayOptions
                 )
 
                 when (result) {

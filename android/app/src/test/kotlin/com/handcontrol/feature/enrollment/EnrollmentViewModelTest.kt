@@ -50,7 +50,8 @@ class EnrollmentViewModelTest {
             token = "test-token",
             certFingerprint = "SHA256:deadbeef",
             serverId = "server-1234",
-            validUntil = expired
+            validUntil = expired,
+            relayOptions = null
         )
 
         advanceUntilIdle()
@@ -71,7 +72,8 @@ class EnrollmentViewModelTest {
             deviceName: String,
             expectedCertFingerprint: String,
             expectedServerId: String,
-            validUntil: Instant?
+            validUntil: Instant?,
+            relayOptions: com.handcontrol.data.enrollment.RelayEnrollmentOptions?
         ): EnrollmentResult {
             enrollCallCount += 1
             return EnrollmentResult.Success(

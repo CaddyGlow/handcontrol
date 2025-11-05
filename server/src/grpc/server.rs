@@ -35,6 +35,7 @@ use crate::security::pairing::{PairingRequestManager, PairingRequestStatus};
 use crate::security::tls::{build_permissive_server_config, build_server_config_no_client_auth};
 use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
+use crate::relay::tokens::{BINDING_TYPE_CLIENT_ID, BINDING_TYPE_ENROLLMENT_TOKEN};
 use crate::storage::clients::ClientStore;
 use sha2::{Digest, Sha256};
 
@@ -85,7 +86,9 @@ impl RemoteControlService {
     /// Generate relay info for enrollment responses
     fn generate_relay_info(
         &self,
-        client_id: &str,
+        subject: &str,
+        binding_type: &str,
+        binding_value: &str,
         ttl_override: Option<StdDuration>,
     ) -> Option<super::proto::RelayInfo> {
         let config = self.config.read().unwrap();
@@ -102,7 +105,7 @@ impl RemoteControlService {
             Some(override_ttl) if override_ttl.is_zero() => {
                 tracing::warn!(
                     "Skipping relay token generation for {}: override TTL is zero",
-                    client_id
+                    subject
                 );
                 return None;
             }
@@ -110,14 +113,26 @@ impl RemoteControlService {
             None => config_ttl,
         };
 
-        match token_issuer.generate_relay_token(client_id, relay_url, ttl) {
+        match token_issuer.generate_relay_token(
+            subject,
+            relay_url,
+            ttl,
+            binding_type,
+            binding_value,
+        ) {
             Ok(token) => Some(super::proto::RelayInfo {
                 relay_url: relay_url.clone(),
                 relay_token: token,
                 relay_required: false,
             }),
             Err(e) => {
-                tracing::error!("Failed to generate relay token for {}: {}", client_id, e);
+                tracing::error!(
+                    "Failed to generate relay token for subject {} (binding_type={}, binding_value={}): {}",
+                    subject,
+                    binding_type,
+                    binding_value,
+                    e
+                );
                 None
             }
         }
@@ -245,7 +260,8 @@ impl RemoteControl for RemoteControlService {
             req.device_name, client_id
         );
 
-        let relay_info = self.generate_relay_info(&client_id, None);
+        let relay_info =
+            self.generate_relay_info(&client_id, BINDING_TYPE_CLIENT_ID, &client_id, None);
 
         Ok(Response::new(EnrollResponse {
             success: true,
@@ -330,7 +346,12 @@ impl RemoteControl for RemoteControlService {
         } else {
             None
         };
-        let relay_info_proto = self.generate_relay_info(&token.token, enrollment_ttl);
+        let relay_info_proto = self.generate_relay_info(
+            &token.token,
+            BINDING_TYPE_ENROLLMENT_TOKEN,
+            &token.token,
+            enrollment_ttl,
+        );
         let relay_qr_info = relay_info_proto
             .as_ref()
             .map(|info| crate::utils::qr::RelayQrInfo {
@@ -622,11 +643,12 @@ impl RemoteControl for RemoteControlService {
             }
         };
 
-        let relay_info = if status == super::proto::PairingStatus::Approved as i32 {
-            self.generate_relay_info(&client_id, None)
-        } else {
-            None
-        };
+        let relay_info =
+            if status == super::proto::PairingStatus::Approved as i32 && !client_id.is_empty() {
+                self.generate_relay_info(&client_id, BINDING_TYPE_CLIENT_ID, &client_id, None)
+            } else {
+                None
+            };
 
         Ok(Response::new(CheckPairingStatusResponse {
             status,

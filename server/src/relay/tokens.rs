@@ -18,6 +18,9 @@ pub struct RelayClaims {
     pub exp: u64,
     pub iat: u64,
     pub server_id: String,
+    pub server_audience: String,
+    pub binding_type: String,
+    pub binding_value: String,
     pub permissions: Vec<String>,
 }
 
@@ -100,16 +103,19 @@ impl TokenIssuer {
     /// Generate a relay JWT token for a client
     pub fn generate_relay_token(
         &self,
-        client_id: &str,
+        subject: &str,
         relay_url: &str,
         ttl: Duration,
+        binding_type: &str,
+        binding_value: &str,
     ) -> Result<String> {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         tracing::debug!(
-            client_id = %client_id,
+            subject = %subject,
             relay_url = %relay_url,
             ttl_seconds = %ttl.as_secs(),
+            binding_type = binding_type,
             "Generating relay JWT token"
         );
 
@@ -139,11 +145,14 @@ impl TokenIssuer {
 
         let claims = RelayClaims {
             iss: "handcontrol-server".to_string(),
-            sub: client_id.to_string(),
+            sub: subject.to_string(),
             aud: relay_url.to_string(),
             exp,
             iat: now,
             server_id: self.server_id.to_string(),
+            server_audience: self.server_id.to_string(),
+            binding_type: binding_type.to_string(),
+            binding_value: binding_value.to_string(),
             permissions: vec!["connect".to_string()],
         };
 
@@ -152,6 +161,8 @@ impl TokenIssuer {
             iat = %now,
             exp = %exp,
             ttl_seconds = %ttl_total,
+            binding_type,
+            binding_value,
             "JWT claims prepared"
         );
 
@@ -167,7 +178,8 @@ impl TokenIssuer {
             .context("Failed to encode JWT token")?;
 
         tracing::debug!(
-            client_id = %client_id,
+            subject = %subject,
+            binding_type = binding_type,
             token_length = %token.len(),
             "JWT token generated successfully"
         );
@@ -190,6 +202,9 @@ impl TokenIssuer {
         )
     }
 }
+
+pub const BINDING_TYPE_ENROLLMENT_TOKEN: &str = "enrollment_token";
+pub const BINDING_TYPE_CLIENT_ID: &str = "client_id";
 
 #[cfg(test)]
 mod tests {
@@ -229,6 +244,8 @@ mod tests {
                 "test-client",
                 "https://relay.example.com",
                 Duration::from_secs(24 * 3600),
+                BINDING_TYPE_CLIENT_ID,
+                "test-client",
             )
             .unwrap();
 
@@ -247,7 +264,13 @@ mod tests {
 
         let relay_url = "https://relay.example.com";
         let token = issuer
-            .generate_relay_token("client", relay_url, Duration::from_secs(300))
+            .generate_relay_token(
+                "client",
+                relay_url,
+                Duration::from_secs(300),
+                BINDING_TYPE_CLIENT_ID,
+                "client",
+            )
             .unwrap();
 
         let pubkey_pem = issuer.public_key_pem().unwrap();
@@ -259,6 +282,9 @@ mod tests {
         let decoded = decode::<RelayClaims>(&token, &decoding_key, &validation).unwrap();
         let ttl = decoded.claims.exp - decoded.claims.iat;
         assert!((300..=301).contains(&ttl));
+        assert_eq!(decoded.claims.binding_type, BINDING_TYPE_CLIENT_ID);
+        assert_eq!(decoded.claims.binding_value, "client");
+        assert_eq!(decoded.claims.server_audience, server_id.to_string());
     }
 
     #[test]
@@ -273,6 +299,8 @@ mod tests {
             "client",
             "https://relay.example.com",
             Duration::from_secs(0),
+            BINDING_TYPE_CLIENT_ID,
+            "client",
         );
 
         assert!(result.is_err());

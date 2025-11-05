@@ -768,17 +768,22 @@ impl TokenIssuer {
 
     pub fn generate_relay_token(
         &self,
-        client_id: &str,
+        subject: &str,
         relay_url: &str,
-        ttl_hours: u64,
+        ttl: Duration,
+        binding_type: &str,
+        binding_value: &str,
     ) -> Result<String> {
         let claims = Claims {
             iss: "handcontrol-server".to_string(),
-            sub: client_id.to_string(),
+            sub: subject.to_string(),
             aud: relay_url.to_string(),
-            exp: (Utc::now() + Duration::hours(ttl_hours)).timestamp() as u64,
+            exp: (Utc::now() + ttl).timestamp() as u64,
             iat: Utc::now().timestamp() as u64,
             server_id: self.server_id.to_string(),
+            server_audience: self.server_id.to_string(),
+            binding_type: binding_type.to_string(),
+            binding_value: binding_value.to_string(),
             permissions: vec!["connect".to_string()],
         };
 
@@ -805,6 +810,20 @@ impl TokenIssuer {
         base64::engine::general_purpose::STANDARD.encode(self.verifying_key.to_bytes())
     }
 }
+
+// Claim payload (for reference)
+// {
+//   "iss": "handcontrol-server",
+//   "sub": "<subject>",                 // provisional client identifier or enrolled client_id
+//   "aud": "wss://relay.example.com",   // relay audience
+//   "server_audience": "<server_id>",   // server UUID asserted separately from aud for auditing
+//   "binding_type": "enrollment_token", // or "client_id"
+//   "binding_value": "...",             // identifier tied to the binding_type
+//   "exp": 1700000000,
+//   "iat": 1699999700,
+//   "permissions": ["connect"],
+//   "server_id": "<server_id>"
+// }
 ```
 
 #### 2.4 Update Enrollment Responses

@@ -322,4 +322,58 @@ class GrpcEnrollmentRepositoryTest {
             relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
+
+    @Test
+    fun `relay enrollment fails fast when token expired`() = runTest {
+        val context = mockk<Context>(relaxed = true)
+        val certificateManager = mockk<ClientCertificateManager>()
+        val mtlsFactory = mockk<MtlsGrpcChannelFactory>(relaxed = true)
+        val relayFactory = mockk<RelayGrpcChannelFactory>(relaxed = true)
+        val serverRepo = mockk<EnrolledServerRepository>(relaxed = true)
+
+        val expectedFingerprint = "SHA256:deadbeef"
+        coEvery { certificateManager.loadOrCreate() } returns ClientCertificate(byteArrayOf(), "alias")
+
+        val repository = object : GrpcEnrollmentRepository(
+            context,
+            certificateManager,
+            mtlsFactory,
+            relayFactory,
+            serverRepo
+        ) {
+            override suspend fun openEnrollmentChannel(
+                host: String,
+                port: Int,
+                expectedFingerprint: String?
+            ): EnrollmentChannel {
+                throw AssertionError("Direct enrollment should not be attempted when expired")
+            }
+        }
+
+        val options = RelayEnrollmentOptions(
+            relayUrl = "wss://relay.example.com",
+            relayToken = "relay-token",
+            relayRequired = true,
+            allowSelfSignedTls = false,
+            pinnedCertSha256 = null
+        )
+
+        val result = repository.enrollWithToken(
+            hosts = listOf("10.0.0.1"),
+            port = 50051,
+            token = UUID.randomUUID().toString(),
+            deviceName = "Expired Token Test",
+            expectedCertFingerprint = expectedFingerprint,
+            expectedServerId = "11111111-2222-3333-4444-555555555555",
+            validUntil = Instant.now().minusSeconds(30),
+            relayOptions = options
+        )
+
+        assertTrue(result is EnrollmentResult.Error)
+        result as EnrollmentResult.Error
+        assertTrue(result.message.contains("expired", ignoreCase = true))
+        coVerify(exactly = 0) {
+            relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
+        }
+    }
 }

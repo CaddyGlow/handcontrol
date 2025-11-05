@@ -471,6 +471,31 @@ mod tests {
     }
 
     #[test]
+    fn test_txt_records_content() {
+        let service = MdnsService::new(
+            "record-check".to_string(),
+            50054,
+            Uuid::nil(),
+            "SHA256:test-fingerprint".to_string(),
+        );
+
+        let records = service.build_txt_records();
+        assert_eq!(records.len(), 3);
+
+        let mut map = std::collections::HashMap::new();
+        for (key, value) in records {
+            map.insert(key, value);
+        }
+
+        assert_eq!(map.get("version"), Some(&TXT_RECORD_VERSION.to_string()));
+        assert_eq!(map.get("server_id"), Some(&Uuid::nil().to_string()));
+        assert_eq!(
+            map.get("cert_fingerprint"),
+            Some(&"SHA256:test-fingerprint".to_string())
+        );
+    }
+
+    #[test]
     fn test_service_type_constant() {
         assert_eq!(SERVICE_TYPE, "_handcontrol._tcp.local.");
     }

@@ -36,6 +36,8 @@ import com.handcontrol.ui.theme.HandControlTheme
 fun RemotePanelScreen(
     uiModel: RemotePanelUiModel,
     modifier: Modifier = Modifier,
+    feedbackCommandId: String? = null,
+    onDismissFeedback: () -> Unit = {},
     onQuickActionClick: (RemoteQuickAction) -> Unit = {},
     onAdjustmentChange: (RemoteAdjustment) -> Unit = {},
     onTelemetryClick: (RemoteTelemetryCard) -> Unit = {}
@@ -49,6 +51,8 @@ fun RemotePanelScreen(
         if (uiModel.quickActions.isNotEmpty()) {
             QuickActionsSection(
                 actions = uiModel.quickActions,
+                feedbackCommandId = feedbackCommandId,
+                onDismissFeedback = onDismissFeedback,
                 onQuickActionClick = onQuickActionClick
             )
         }
@@ -72,6 +76,8 @@ fun RemotePanelScreen(
 @Composable
 private fun QuickActionsSection(
     actions: List<RemoteQuickAction>,
+    feedbackCommandId: String?,
+    onDismissFeedback: () -> Unit,
     onQuickActionClick: (RemoteQuickAction) -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -90,6 +96,8 @@ private fun QuickActionsSection(
                 rowActions.forEach { action ->
                     RemoteQuickActionCard(
                         action = action,
+                        showFeedback = feedbackCommandId == action.id,
+                        onDismissFeedback = onDismissFeedback,
                         onClick = onQuickActionClick,
                         modifier = Modifier
                             .weight(1f)
@@ -107,47 +115,60 @@ private fun QuickActionsSection(
 @Composable
 private fun RemoteQuickActionCard(
     action: RemoteQuickAction,
+    showFeedback: Boolean,
+    onDismissFeedback: () -> Unit,
     onClick: (RemoteQuickAction) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val alpha = if (action.isEnabled) 1f else 0.4f
-    Card(
-        modifier = modifier,
-        enabled = action.isEnabled,
-        onClick = { onClick(action) },
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        )
-    ) {
-        Column(
-            modifier = Modifier
-                .padding(20.dp)
-                .alpha(alpha),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Icon(
-                imageVector = Icons.Default.Bolt,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(24.dp)
+    Box(modifier = modifier) {
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            enabled = action.isEnabled,
+            onClick = { onClick(action) },
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
             )
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    text = action.title,
-                    style = MaterialTheme.typography.titleMedium,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+        ) {
+            Column(
+                modifier = Modifier
+                    .padding(20.dp)
+                    .alpha(alpha),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Bolt,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(24.dp)
                 )
-                action.subtitle?.let {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
-                        text = it,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 2,
+                        text = action.title,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
+                    action.subtitle?.let {
+                        Text(
+                            text = it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
+        }
+
+        // Visual feedback overlay
+        if (showFeedback) {
+            com.handcontrol.ui.components.CommandExecutionFeedback(
+                visible = true,
+                onDismiss = onDismissFeedback,
+                modifier = Modifier.matchParentSize()
+            )
         }
     }
 }

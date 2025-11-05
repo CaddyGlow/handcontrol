@@ -63,12 +63,15 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewModelScope
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.ui.components.CommandConfirmationDialog
 import com.handcontrol.ui.components.CommandExecutionFeedback
+import com.handcontrol.ui.components.SingleParameterDialog
 import com.handcontrol.ui.theme.HandControlTheme
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
 import com.handcontrol.feature.commands.remote.RemoteLayoutBuilderScreen
 import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import com.handcontrol.feature.commands.remote.RemotePanelScreen
@@ -93,6 +96,9 @@ fun CommandListScreen(
     var isEditingRemote by rememberSaveable { mutableStateOf(false) }
     var layoutDraft by remember(serverId) { mutableStateOf(RemoteLayoutSpec.withDefaultSections()) }
     var feedbackCommandId by remember { mutableStateOf<String?>(null) }
+    var showSingleParameterDialog by remember { mutableStateOf(false) }
+    var singleParameterValue by remember { mutableStateOf("") }
+    var isLoadingSingleParamDefault by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         viewModel.loadCommands(serverId)
@@ -117,6 +123,29 @@ fun CommandListScreen(
             }
         } else if (selectedTab == CommandListTab.Remote) {
             selectedTab = CommandListTab.List
+        }
+    }
+
+    // Fetch dynamic default for single parameter dialog
+    LaunchedEffect(showSingleParameterDialog, selectedCommand) {
+        if (showSingleParameterDialog && selectedCommand != null) {
+            val parameter = selectedCommand!!.parameters.firstOrNull()
+            if (parameter != null) {
+                // Set initial value from static default
+                singleParameterValue = parameter.defaultValue ?: getDefaultForParameterType(parameter.type)
+
+                // Fetch dynamic default if available
+                if (parameter.defaultValueCommand != null) {
+                    isLoadingSingleParamDefault = true
+                    val value = viewModel.fetchDynamicDefault(
+                        command = parameter.defaultValueCommand,
+                        pattern = parameter.defaultValuePattern,
+                        fallback = singleParameterValue
+                    )
+                    singleParameterValue = value
+                    isLoadingSingleParamDefault = false
+                }
+            }
         }
     }
 
@@ -209,6 +238,8 @@ fun CommandListScreen(
                                 state = state,
                                 isEditing = isEditingRemote,
                                 layoutDraft = layoutDraft,
+                                feedbackCommandId = feedbackCommandId,
+                                onDismissFeedback = { feedbackCommandId = null },
                                 onEditToggle = { editing ->
                                     if (editing) {
                                         layoutDraft = state.remoteLayoutSpec ?: RemoteLayoutSpec.withDefaultSections()
@@ -226,7 +257,11 @@ fun CommandListScreen(
                                 onQuickAction = { action ->
                                     val command = state.commands.find { it.id == action.id } ?: return@RemoteTabContent
                                     when {
-                                        command.parameters.isNotEmpty() -> {
+                                        command.parameters.size == 1 -> {
+                                            selectedCommand = command
+                                            showSingleParameterDialog = true
+                                        }
+                                        command.parameters.size > 1 -> {
                                             onNavigateToCommandExecution(serverId, command.id)
                                         }
                                         action.requiresConfirmation -> {
@@ -234,14 +269,15 @@ fun CommandListScreen(
                                             showConfirmationDialog = true
                                         }
                                         else -> {
-                                            viewModel.triggerQuickCommand(
-                                                command = command,
-                                                showOutputOverride = action.showOutput
-                                            )
                                             if (action.showOutput) {
+                                                // Navigate to execution screen to show output
                                                 onNavigateToCommandExecution(serverId, command.id)
                                             } else {
                                                 // Fire-and-forget from remote panel
+                                                viewModel.triggerQuickCommand(
+                                                    command = command,
+                                                    showOutputOverride = action.showOutput
+                                                )
                                                 feedbackCommandId = command.id
                                             }
                                         }
@@ -269,6 +305,10 @@ fun CommandListScreen(
                                         },
                                         onShowFeedback = {
                                             feedbackCommandId = command.id
+                                        },
+                                        onShowSingleParameter = {
+                                            selectedCommand = command
+                                            showSingleParameterDialog = true
                                         }
                                     )
                                 },
@@ -288,16 +328,17 @@ fun CommandListScreen(
             command = selectedCommand!!,
             onConfirm = {
                 val cmd = selectedCommand!!
-                viewModel.executeCommandWithMode(
-                    commandId = cmd.id,
-                    commandName = cmd.name,
-                    parameters = emptyMap(),
-                    showOutput = cmd.showOutput
-                )
                 if (cmd.showOutput) {
+                    // Navigate to execution screen to show output
                     onNavigateToCommandExecution(serverId, cmd.id)
                 } else {
-                    // Fire-and-forget with confirmation - show visual feedback
+                    // Fire-and-forget with confirmation - execute and show visual feedback
+                    viewModel.executeCommandWithMode(
+                        commandId = cmd.id,
+                        commandName = cmd.name,
+                        parameters = emptyMap(),
+                        showOutput = cmd.showOutput
+                    )
                     feedbackCommandId = cmd.id
                 }
                 showConfirmationDialog = false
@@ -305,6 +346,68 @@ fun CommandListScreen(
             },
             onDismiss = {
                 showConfirmationDialog = false
+                selectedCommand = null
+            }
+        )
+    }
+
+    // Single parameter dialog
+    if (showSingleParameterDialog && selectedCommand != null) {
+        val cmd = selectedCommand!!
+        val parameter = cmd.parameters.first()
+        val isAutoExecuteType = parameter.type == ParameterType.TOGGLE ||
+                                parameter.type == ParameterType.SLIDER
+
+        SingleParameterDialog(
+            command = cmd,
+            initialValue = singleParameterValue,
+            isLoadingDefault = isLoadingSingleParamDefault,
+            onExecute = { paramValue ->
+                if (cmd.showOutput) {
+                    // Execute and navigate to show output
+                    viewModel.executeCommandWithMode(
+                        commandId = cmd.id,
+                        commandName = cmd.name,
+                        parameters = mapOf(parameter.name to paramValue),
+                        showOutput = cmd.showOutput
+                    )
+                    onNavigateToCommandExecution(serverId, cmd.id)
+                    showSingleParameterDialog = false
+                    selectedCommand = null
+                } else {
+                    // Fire-and-forget - execute and show visual feedback
+                    viewModel.executeCommandWithMode(
+                        commandId = cmd.id,
+                        commandName = cmd.name,
+                        parameters = mapOf(parameter.name to paramValue),
+                        showOutput = cmd.showOutput
+                    )
+                    feedbackCommandId = cmd.id
+
+                    // For auto-execute types, keep dialog open; for manual types, close it
+                    if (!isAutoExecuteType) {
+                        showSingleParameterDialog = false
+                        selectedCommand = null
+                    }
+                }
+            },
+            onRefreshDefault = {
+                val parameter = selectedCommand?.parameters?.firstOrNull()
+                if (parameter?.defaultValueCommand != null) {
+                    viewModel.viewModelScope.launch {
+                        isLoadingSingleParamDefault = true
+                        val value = viewModel.fetchDynamicDefault(
+                            command = parameter.defaultValueCommand,
+                            pattern = parameter.defaultValuePattern,
+                            fallback = singleParameterValue
+                        )
+                        singleParameterValue = value
+                        isLoadingSingleParamDefault = false
+                    }
+                }
+            },
+            onDismiss = {
+                showSingleParameterDialog = false
                 selectedCommand = null
             }
         )
@@ -346,6 +449,8 @@ private fun RemoteTabContent(
     state: CommandListUiState.Success,
     isEditing: Boolean,
     layoutDraft: RemoteLayoutSpec,
+    feedbackCommandId: String?,
+    onDismissFeedback: () -> Unit,
     onEditToggle: (Boolean) -> Unit,
     onDraftChanged: (RemoteLayoutSpec) -> Unit,
     onSave: () -> Unit,
@@ -373,6 +478,8 @@ private fun RemoteTabContent(
                 val scrollState = rememberScrollState()
                 RemotePanelScreen(
                     uiModel = state.remotePanel,
+                    feedbackCommandId = feedbackCommandId,
+                    onDismissFeedback = onDismissFeedback,
                     onQuickActionClick = onQuickAction,
                     modifier = Modifier
                         .fillMaxSize()
@@ -473,24 +580,30 @@ private fun handleCommandClick(
     viewModel: CommandListViewModel,
     onNavigateToExecution: () -> Unit,
     onShowConfirmation: () -> Unit,
-    onShowFeedback: () -> Unit = {}
+    onShowFeedback: () -> Unit = {},
+    onShowSingleParameter: () -> Unit = {}
 ) {
     when {
-        // Has parameters - always show parameter screen
-        command.parameters.isNotEmpty() -> {
+        // Single parameter - show inline dialog
+        command.parameters.size == 1 -> {
+            onShowSingleParameter()
+        }
+        // Multiple parameters - show parameter screen
+        command.parameters.size > 1 -> {
             onNavigateToExecution()
         }
         // No parameters but requires confirmation
         command.requiresConfirmation -> {
             onShowConfirmation()
         }
-        // No parameters, no confirmation - immediate execution
+        // No parameters, no confirmation
         else -> {
-            viewModel.triggerQuickCommand(command)
             if (command.showOutput) {
+                // Navigate to execution screen to show output
                 onNavigateToExecution()
             } else {
-                // Fire-and-forget - show visual feedback
+                // Fire-and-forget - execute immediately with visual feedback
+                viewModel.triggerQuickCommand(command)
                 onShowFeedback()
             }
         }
@@ -789,5 +902,18 @@ private fun CommandListContentPreview() {
 private fun EmptyCommandsPreview() {
     HandControlTheme {
         EmptyCommandsView()
+    }
+}
+
+/**
+ * Get default value for a parameter type
+ */
+private fun getDefaultForParameterType(type: ParameterType): String {
+    return when (type) {
+        ParameterType.SLIDER -> "0"
+        ParameterType.TEXT -> ""
+        ParameterType.TOGGLE -> "false"
+        ParameterType.DROPDOWN -> ""
+        ParameterType.UNSPECIFIED -> ""
     }
 }

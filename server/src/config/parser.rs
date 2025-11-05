@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub const DEFAULT_RELAY_SUBPROTOCOL: &str = "handcontrol-relay.v1";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub server: ServerConfig,
@@ -101,7 +103,7 @@ pub struct RelayConfig {
     pub max_relay_tunnels: Option<u32>,
     #[serde(default = "default_true")]
     pub auto_connect: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub include_in_enrollment: bool,
     #[serde(default = "default_relay_reconnect_delay")]
     pub reconnect_delay_seconds: u64,
@@ -116,6 +118,9 @@ pub struct RelayConfig {
     /// Enable debug mode for detailed relay connection logging
     #[serde(default)]
     pub debug_mode: bool,
+    /// WebSocket subprotocol advertised when connecting to the relay
+    #[serde(default = "default_relay_subprotocol")]
+    pub websocket_subprotocol: String,
 }
 
 impl Default for RelayConfig {
@@ -126,12 +131,13 @@ impl Default for RelayConfig {
             relay_auth_secret: None,
             max_relay_tunnels: None,
             auto_connect: true,
-            include_in_enrollment: true,
+            include_in_enrollment: false,
             reconnect_delay_seconds: default_relay_reconnect_delay(),
             relay_token_ttl_hours: default_relay_token_ttl_hours(),
             allow_self_signed_tls: false,
             pinned_cert_sha256: None,
             debug_mode: false,
+            websocket_subprotocol: default_relay_subprotocol(),
         }
     }
 }
@@ -230,6 +236,10 @@ fn default_relay_reconnect_delay() -> u64 {
 
 fn default_relay_token_ttl_hours() -> u64 {
     2160 // 90 days
+}
+
+fn default_relay_subprotocol() -> String {
+    DEFAULT_RELAY_SUBPROTOCOL.to_string()
 }
 
 /// Load configuration from a TOML file

@@ -1,4 +1,4 @@
-use crate::config::parser::RelayConfig;
+use crate::config::parser::{DEFAULT_RELAY_SUBPROTOCOL, RelayConfig};
 use crate::relay::tokens::TokenIssuer;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::stream::SplitSink;
@@ -30,7 +30,6 @@ type LocalReadHalf = Box<dyn AsyncRead + Send + Unpin>;
 type LocalWriteHalf = Box<dyn AsyncWrite + Send + Unpin>;
 
 const CONTROL_PING_INTERVAL_SECS: u64 = 30;
-const RELAY_SUBPROTOCOL: &str = "handcontrol-relay.v1";
 
 #[derive(Debug, Clone, Copy)]
 struct RelayTlsOptions {
@@ -107,6 +106,15 @@ impl RelayClient {
         })
     }
 
+    fn relay_subprotocol(&self) -> &str {
+        let configured = self.config.websocket_subprotocol.trim();
+        if configured.is_empty() {
+            DEFAULT_RELAY_SUBPROTOCOL
+        } else {
+            &self.config.websocket_subprotocol
+        }
+    }
+
     pub async fn get_state(&self) -> RelayClientState {
         self.state.read().await.clone()
     }
@@ -155,10 +163,12 @@ impl RelayClient {
 
         let tls_options = self.tls_options()?;
 
+        let subprotocol = self.relay_subprotocol();
+
         let (ws_stream, _) = if register_url.starts_with("wss://") {
             if let Some(connector) = build_tls_connector(tls_options)? {
                 tokio_tungstenite::connect_async_tls_with_config(
-                    build_relay_request(&register_url)?,
+                    build_relay_request(&register_url, subprotocol)?,
                     None,
                     false,
                     Some(connector),
@@ -166,12 +176,12 @@ impl RelayClient {
                 .await
                 .context("Failed to connect to relay server")?
             } else {
-                connect_async(build_relay_request(&register_url)?)
+                connect_async(build_relay_request(&register_url, subprotocol)?)
                     .await
                     .context("Failed to connect to relay server")?
             }
         } else {
-            connect_async(build_relay_request(&register_url)?)
+            connect_async(build_relay_request(&register_url, subprotocol)?)
                 .await
                 .context("Failed to connect to relay server")?
         };
@@ -340,8 +350,17 @@ impl RelayClient {
         let tunnel_id = tunnel_id.to_string();
         let tls_options = self.tls_options()?;
 
+        let subprotocol = self.relay_subprotocol().to_string();
+
         tokio::spawn(async move {
-            if let Err(e) = handle_tunnel(tunnel_url, tunnel_id, local_endpoint, tls_options).await
+            if let Err(e) = handle_tunnel(
+                tunnel_url,
+                tunnel_id,
+                local_endpoint,
+                tls_options,
+                subprotocol,
+            )
+            .await
             {
                 error!("Tunnel task failed: {:#}", e);
             }
@@ -357,6 +376,7 @@ async fn handle_tunnel(
     tunnel_id: String,
     local_endpoint: SocketAddr,
     tls_options: RelayTlsOptions,
+    subprotocol: String,
 ) -> Result<()> {
     info!(tunnel_id = %tunnel_id, "Opening tunnel to relay");
 
@@ -364,7 +384,7 @@ async fn handle_tunnel(
     let (ws_stream, _) = if tunnel_url.starts_with("wss://") {
         if let Some(connector) = build_tls_connector(tls_options)? {
             tokio_tungstenite::connect_async_tls_with_config(
-                build_relay_request(&tunnel_url)?,
+                build_relay_request(&tunnel_url, &subprotocol)?,
                 None,
                 false,
                 Some(connector),
@@ -372,12 +392,12 @@ async fn handle_tunnel(
             .await
             .context("Failed to connect to tunnel endpoint")?
         } else {
-            connect_async(build_relay_request(&tunnel_url)?)
+            connect_async(build_relay_request(&tunnel_url, &subprotocol)?)
                 .await
                 .context("Failed to connect to tunnel endpoint")?
         }
     } else {
-        connect_async(build_relay_request(&tunnel_url)?)
+        connect_async(build_relay_request(&tunnel_url, &subprotocol)?)
             .await
             .context("Failed to connect to tunnel endpoint")?
     };
@@ -461,14 +481,16 @@ async fn handle_tunnel(
 
 fn build_relay_request(
     url: &str,
+    subprotocol: &str,
 ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
     let mut request = url
         .into_client_request()
         .context("Failed to construct relay WebSocket request")?;
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        HeaderValue::from_static(RELAY_SUBPROTOCOL),
-    );
+    let header = HeaderValue::from_str(subprotocol)
+        .context("relay.websocket_subprotocol must be a valid header value")?;
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", header);
     Ok(request)
 }
 

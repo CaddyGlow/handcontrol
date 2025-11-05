@@ -45,25 +45,26 @@ fn validate_server_config(config: &Config) -> Result<()> {
         }
     }
 
-    if config.relay.enabled {
-        let relay_url = config
-            .relay
-            .relay_server_url
-            .as_ref()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty());
+    let relay_url = config
+        .relay
+        .relay_server_url
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
 
+    let relay_secret_missing = config
+        .relay
+        .relay_auth_secret
+        .as_ref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true);
+
+    if config.relay.enabled {
         if relay_url.is_none() {
             bail!("Relay enabled but relay_server_url is missing");
         }
 
-        if config
-            .relay
-            .relay_auth_secret
-            .as_ref()
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(true)
-        {
+        if relay_secret_missing {
             bail!("Relay enabled but relay_auth_secret is missing");
         }
 
@@ -75,6 +76,26 @@ fn validate_server_config(config: &Config) -> Result<()> {
             if max == 0 {
                 bail!("relay.max_relay_tunnels must be greater than 0 when specified");
             }
+        }
+    }
+
+    if config.relay.include_in_enrollment {
+        if !config.relay.enabled {
+            bail!("relay.include_in_enrollment requires relay.enabled = true");
+        }
+
+        if relay_url.is_none() {
+            bail!("relay.include_in_enrollment requires relay.relay_server_url to be set");
+        }
+
+        if relay_secret_missing {
+            bail!("relay.include_in_enrollment requires relay.relay_auth_secret to be configured");
+        }
+
+        if config.relay.websocket_subprotocol.trim().is_empty() {
+            bail!(
+                "relay.websocket_subprotocol cannot be empty when relay.include_in_enrollment is true"
+            );
         }
     }
 

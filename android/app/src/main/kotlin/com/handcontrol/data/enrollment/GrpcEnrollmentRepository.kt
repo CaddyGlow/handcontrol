@@ -850,8 +850,7 @@ open class GrpcEnrollmentRepository @Inject constructor(
         val sslContext = MtlsSslContextFactory.createSslContext(
             certificateManager = certificateManager,
             expectedFingerprint = expectedFingerprint,
-            onServerCertificate = { cert -> capturedCert = cert },
-            includeClientCertificate = false
+            onServerCertificate = { cert -> capturedCert = cert }
         )
 
         val builder = OkHttpChannelBuilder

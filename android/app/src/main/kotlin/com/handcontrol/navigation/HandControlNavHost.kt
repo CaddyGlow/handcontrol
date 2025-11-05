@@ -21,7 +21,9 @@ import com.handcontrol.feature.welcome.WelcomeViewModel
 fun HandControlNavHost(
     modifier: Modifier = Modifier,
     navController: NavHostController = rememberNavController(),
-    welcomeViewModel: WelcomeViewModel = hiltViewModel()
+    welcomeViewModel: WelcomeViewModel = hiltViewModel(),
+    deepLinkServerId: String? = null,
+    deepLinkCommandId: String? = null
 ) {
     val enrolledServers by welcomeViewModel.enrolledServers
         .collectAsStateWithLifecycle()
@@ -30,6 +32,13 @@ fun HandControlNavHost(
         Route.Welcome
     } else {
         Route.ServerList
+    }
+
+    // Handle deep link navigation
+    LaunchedEffect(deepLinkServerId, deepLinkCommandId) {
+        if (deepLinkServerId != null && deepLinkCommandId != null) {
+            navController.navigate(Route.CommandExecution(deepLinkServerId, deepLinkCommandId))
+        }
     }
 
     NavHost(

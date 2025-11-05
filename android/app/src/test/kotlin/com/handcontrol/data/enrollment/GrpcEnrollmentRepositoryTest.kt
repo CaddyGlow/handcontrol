@@ -5,6 +5,7 @@ package com.handcontrol.data.enrollment
 import android.content.Context
 import com.google.protobuf.ByteString
 import com.handcontrol.core.network.MtlsGrpcChannelFactory
+import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.network.relay.RelayGrpcChannelFactory
 import com.handcontrol.core.security.ClientCertificate
 import com.handcontrol.core.security.ClientCertificateManager
@@ -21,7 +22,6 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
-import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.io.IOException
 import java.security.cert.X509Certificate
@@ -375,5 +375,82 @@ class GrpcEnrollmentRepositoryTest {
         coVerify(exactly = 0) {
             relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
+    }
+
+    @Test
+    fun `relay enrollment surfaces connection failure message`() = runTest {
+        val context = mockk<Context>(relaxed = true)
+        val certificateManager = mockk<ClientCertificateManager>()
+        val mtlsFactory = mockk<MtlsGrpcChannelFactory>(relaxed = true)
+        val relayFactory = mockk<RelayGrpcChannelFactory>()
+        val serverRepo = mockk<EnrolledServerRepository>(relaxed = true)
+
+        coEvery { certificateManager.loadOrCreate() } returns ClientCertificate(byteArrayOf(), "alias")
+        coEvery {
+            relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
+        } throws RelayConnectionException(shortMessage = "relay failure", userMessage = "relay unavailable")
+
+        val repository = object : GrpcEnrollmentRepository(
+            context,
+            certificateManager,
+            mtlsFactory,
+            relayFactory,
+            serverRepo
+        ) {
+            override suspend fun openEnrollmentChannel(
+                host: String,
+                port: Int,
+                expectedFingerprint: String?
+            ): EnrollmentChannel {
+                throw IOException("Direct path blocked for test")
+            }
+        }
+
+        val result = repository.enrollWithToken(
+            hosts = listOf("203.0.113.10"),
+            port = 50051,
+            token = UUID.randomUUID().toString(),
+            deviceName = "Relay Failure Test",
+            expectedCertFingerprint = "SHA256:feedface",
+            expectedServerId = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            validUntil = Instant.now().plusSeconds(300),
+            relayOptions = RelayEnrollmentOptions(
+                relayUrl = "wss://relay.example.com",
+                relayToken = "relay-token",
+                relayRequired = true,
+                allowSelfSignedTls = false,
+                pinnedCertSha256 = null
+            )
+        )
+
+        assertTrue(result is EnrollmentResult.Error)
+        result as EnrollmentResult.Error
+        assertTrue(result.message.contains("Relay connection failed", ignoreCase = true))
+        assertTrue(result.message.contains("relay unavailable", ignoreCase = true))
+    }
+
+    @Test
+    fun `compute default relay authority wraps IPv6 host`() {
+        val context = mockk<Context>(relaxed = true)
+        val certificateManager = mockk<ClientCertificateManager>(relaxed = true)
+        val mtlsFactory = mockk<MtlsGrpcChannelFactory>(relaxed = true)
+        val relayFactory = mockk<RelayGrpcChannelFactory>(relaxed = true)
+        val serverRepo = mockk<EnrolledServerRepository>(relaxed = true)
+
+        val repository = object : GrpcEnrollmentRepository(
+            context,
+            certificateManager,
+            mtlsFactory,
+            relayFactory,
+            serverRepo
+        ) {
+            fun authority(hosts: List<String>, port: Int): String = computeDefaultRelayAuthority(hosts, port)
+        }
+
+        val ipv6Authority = repository.authority(listOf("2001:db8::1"), 50051)
+        assertEquals("[2001:db8::1]:50051", ipv6Authority)
+
+        val hostnameAuthority = repository.authority(listOf("server.local"), 443)
+        assertEquals("server.local:443", hostnameAuthority)
     }
 }

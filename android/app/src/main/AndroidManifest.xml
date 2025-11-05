@@ -34,6 +34,29 @@
                 android:name="android.support.FILE_PROVIDER_PATHS"
                 android:resource="@xml/file_paths" />
         </provider>
+
+        <!-- Widget Configuration Activity -->
+        <activity
+            android:name=".widget.CommandWidgetConfigActivity"
+            android:exported="false"
+            android:theme="@style/Theme.HandControl">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_CONFIGURE" />
+            </intent-filter>
+        </activity>
+
+        <!-- Widget Provider -->
+        <receiver
+            android:name=".widget.CommandWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                <action android:name="com.handcontrol.widget.WIDGET_CLICK" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_command_button_info" />
+        </receiver>
     </application>
 
 </manifest>

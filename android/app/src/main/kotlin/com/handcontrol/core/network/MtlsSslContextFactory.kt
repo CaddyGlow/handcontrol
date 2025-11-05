@@ -19,30 +19,25 @@ object MtlsSslContextFactory {
     suspend fun createSslContext(
         certificateManager: ClientCertificateManager,
         expectedFingerprint: String?,
-        onServerCertificate: ((X509Certificate) -> Unit)? = null,
-        includeClientCertificate: Boolean = true
+        onServerCertificate: ((X509Certificate) -> Unit)? = null
     ): SSLContext {
         val trustManager = buildTrustManager(expectedFingerprint, onServerCertificate)
 
-        val keyManagers: Array<KeyManager>? = if (includeClientCertificate) {
-            val clientCertificate = certificateManager.loadOrCreate()
+        val clientCertificate = certificateManager.loadOrCreate()
 
-            val androidKeyStore = KeyStore.getInstance("AndroidKeyStore").apply {
-                load(null)
-            }
-
-            val keyManagerFactory = KeyManagerFactory.getInstance(
-                KeyManagerFactory.getDefaultAlgorithm()
-            )
-            keyManagerFactory.init(androidKeyStore, null)
-
-            wrapKeyManagers(
-                clientCertificate.privateKeyAlias,
-                keyManagerFactory.keyManagers
-            )
-        } else {
-            null
+        val androidKeyStore = KeyStore.getInstance("AndroidKeyStore").apply {
+            load(null)
         }
+
+        val keyManagerFactory = KeyManagerFactory.getInstance(
+            KeyManagerFactory.getDefaultAlgorithm()
+        )
+        keyManagerFactory.init(androidKeyStore, null)
+
+        val keyManagers = wrapKeyManagers(
+            clientCertificate.privateKeyAlias,
+            keyManagerFactory.keyManagers
+        )
 
         return SSLContext.getInstance("TLS").apply {
             init(keyManagers, arrayOf(trustManager), null)

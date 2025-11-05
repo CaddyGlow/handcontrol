@@ -21,14 +21,27 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Extract deep link parameters from widget
+        val serverId = intent?.getStringExtra("server_id")
+        val commandId = intent?.getStringExtra("command_id")
+
         setContent {
-            HandControlApp(settingsRepository)
+            HandControlApp(
+                settingsRepository = settingsRepository,
+                deepLinkServerId = serverId,
+                deepLinkCommandId = commandId
+            )
         }
     }
 }
 
 @Composable
-fun HandControlApp(settingsRepository: SettingsRepository) {
+fun HandControlApp(
+    settingsRepository: SettingsRepository,
+    deepLinkServerId: String? = null,
+    deepLinkCommandId: String? = null
+) {
     val settings by settingsRepository.settings.collectAsStateWithLifecycle(
         initialValue = com.handcontrol.data.settings.AppSettings()
     )
@@ -40,7 +53,10 @@ fun HandControlApp(settingsRepository: SettingsRepository) {
             Theme.SYSTEM -> isSystemInDarkTheme()
         }
     ) {
-        HandControlNavHost()
+        HandControlNavHost(
+            deepLinkServerId = deepLinkServerId,
+            deepLinkCommandId = deepLinkCommandId
+        )
     }
 }
 

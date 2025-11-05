@@ -136,22 +136,14 @@ pub async fn enroll_via_qr(input: QrEnrollmentInput) -> Result<QrEnrollmentOutco
     let raw: RawQrPayload = serde_json::from_str(&input.payload)
         .context("Failed to parse QR enrollment payload JSON")?;
 
-    let token_expiry = if let Some(valid_until) = raw.valid_until.as_ref() {
-        let expiry = OffsetDateTime::parse(valid_until, &Rfc3339)
-            .context("Invalid valid_until timestamp in QR payload")?;
-        Some(expiry)
-    } else {
-        None
-    };
-
-    if let Some(expiry) = token_expiry {
-        if OffsetDateTime::now_utc() >= expiry {
-            let formatted = expiry
-                .format(&Rfc3339)
-                .unwrap_or_else(|_| expiry.to_string());
-            bail!("Enrollment QR code expired at {}", formatted);
-        }
-    }
+    let token_expiry = raw
+        .valid_until
+        .as_ref()
+        .map(|valid_until| {
+            OffsetDateTime::parse(valid_until, &Rfc3339)
+                .context("Invalid valid_until timestamp in QR payload")
+        })
+        .transpose()?;
 
     let server_id = if let Some(id) = input.override_server_id {
         id

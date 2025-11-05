@@ -124,6 +124,7 @@ QR enrollment currently assumes the enrolling client can reach the server over o
 - **Config UX**: Extend CLI/TUI config commands to toggle `prefer_relay`, `relay_only_mode`, and explain behavior.
 - **Status Surfacing**: CLI `server list` should mark relay-capable servers; TUI should display connection mode indicator (direct vs relay).
 - **Token Refresh**: When CLI/TUI trigger certificate renewal, request new relay token (server returns via response); update registry.
+- **TUI Enrollment UX**: Overlay now supports method selection and surfaces a live QR token expiry countdown while enrollment is in progress.
 
 #### Android
 - **QR Parsing**: Ensure `GrpcEnrollmentRepository` escrow relay info and writes to Room (`relayEnabled`, `relayUrl`, `relayToken`, TLS flags).
@@ -133,6 +134,7 @@ QR enrollment currently assumes the enrolling client can reach the server over o
 - **Error Handling**: Present human-readable errors when relay tunnel fails (expired token, TLS mismatch) and prompt to re-enroll if necessary.
 - **QR Expiry Awareness**: Parse `valid_until`, refuse expired payloads locally, and surface clear guidance to regenerate a fresh QR code.
 - **Testing**: Add instrumentation tests using mock relay + local server; cover direct failover, relay-only scenarios, token expiry.
+- **Relay Fallback**: `GrpcEnrollmentRepository` now retries enrollment via QR-provided relay metadata when all direct hosts fail, preserving TLS hints and connection preferences.
 
 #### Future Clients (Out of Scope)
 - Document expectations so new clients can plug into same enrollment payload without redesign.

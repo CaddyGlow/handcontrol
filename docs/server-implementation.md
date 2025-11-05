@@ -520,13 +520,14 @@ cargo run -- enroll --qr
 - ✅ Automatic cleanup via Drop trait
 
 **Implementation Details:**
-- `src/mdns/service.rs` (232 lines) - MdnsService with start/stop/update methods
+- `src/mdns/service.rs` (489 lines) - MdnsService with start/stop/update methods
 - Main.rs integration: mDNS service starts before gRPC server, stops on shutdown
-- Uses `mdns-sd` crate (pure Rust, no native dependencies)
+- Backend selection: macOS delegates to system Bonjour (`dns-sd`), Linux prefers Avahi when present, other platforms use the embedded `mdns-sd` crate
 - Service type: `_handcontrol._tcp.local.`
 - TXT records: version=1.0, server_id=<uuid>, cert_fingerprint=SHA256:...
 - Instance name: config.server.mdns_instance_name or system hostname
 - Graceful failure: Server continues if mDNS fails (with warning log)
+- Logs include the discovery backend in use (Bonjour, Avahi, or embedded mdns-sd)
 - Drop implementation ensures cleanup even on panic
 
 **Tests:** ✅ 5 PASSING
@@ -540,7 +541,7 @@ cargo run -- enroll --qr
 ```
 INFO Initializing mDNS service...
 INFO handcontrol::mdns::service: Starting mDNS service...
-INFO handcontrol::mdns::service: mDNS service registered: culixa at port 50051 (_handcontrol._tcp.local.)
+INFO handcontrol::mdns::service: mDNS service registered: culixa at port 50051 (_handcontrol._tcp.local.) via embedded-mdns-sd
 INFO mDNS service started: instance_name=culixa
 ```
 

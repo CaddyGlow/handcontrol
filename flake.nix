@@ -24,13 +24,19 @@
           };
         };
         lib = pkgs.lib;
-        androidPackages = pkgs.androidenv.composeAndroidPackages {
-          platformVersions = [ "36" ];
-          buildToolsVersions = [ "36.0.0" ];
-          includeNDK = true;
-          includeEmulator = false;
-          ndkVersions = [ "27.0.12077973" ];
-        };
+        isLinux = pkgs.stdenv.isLinux;
+        isDarwin = pkgs.stdenv.isDarwin;
+        androidPackages =
+          if isLinux then
+            pkgs.androidenv.composeAndroidPackages {
+              platformVersions = [ "36" ];
+              buildToolsVersions = [ "36.0.0" ];
+              includeNDK = true;
+              includeEmulator = false;
+              ndkVersions = [ "27.0.12077973" ];
+            }
+          else
+            null;
         javaToolchain = pkgs.openjdk17;
         cargoToml = lib.importTOML ./Cargo.toml;
         crateName = cargoToml.package.name;
@@ -98,26 +104,60 @@
             };
           };
 
-        androidEmulator = pkgs.androidenv.emulateApp {
-          name = "Pixel 10";
-          platformVersion = "36";
-          systemImageType = "google_apis_playstore";
-          abiVersion = "x86_64";
-          configOptions = {
-            # https://android.googlesource.com/platform/external/qemu/+/refs/heads/master/android/avd/hardware-properties.ini
-            "hw.device.manufacturer" = "Google";
-            "hw.device.name" = "pixel_10";
-            "hw.ramSize" = "8192";
-            "hw.lcd.width" = "1080";
-            "hw.lcd.height" = "2424";
-            "hw.lcd.density" = "460";
-            "hw.keyboard" = "yes";
-          };
-        };
-        nativeBuildInputs = with pkgs; [
-          pkg-config
-          androidEmulator
+        androidEmulator =
+          if isLinux then
+            pkgs.androidenv.emulateApp {
+              name = "Pixel 10";
+              platformVersion = "36";
+              systemImageType = "google_apis_playstore";
+              abiVersion = "x86_64";
+              configOptions = {
+                # https://android.googlesource.com/platform/external/qemu/+/refs/heads/master/android/avd/hardware-properties.ini
+                "hw.device.manufacturer" = "Google";
+                "hw.device.name" = "pixel_10";
+                "hw.ramSize" = "8192";
+                "hw.lcd.width" = "1080";
+                "hw.lcd.height" = "2424";
+                "hw.lcd.density" = "460";
+                "hw.keyboard" = "yes";
+              };
+            }
+          else
+            null;
+        nativeBuildInputs =
+          [ pkgs.pkg-config ]
+          ++ lib.optionals isLinux [ androidEmulator ];
+        commonDevPackages = [
+          pkgs.rustc
+          pkgs.cargo
+          pkgs.clippy
+          pkgs.rustfmt
+          pkgs.rust-analyzer
+          pkgs.cargo-edit
+          pkgs.cargo-deny
+          pkgs.cargo-audit
+          pkgs.cargo-ndk
+          pkgs.rustup
+          pkgs.pkg-config
+          pkgs.protobuf
+          pkgs.openssl
+          javaToolchain
+          pkgs.gradle
         ];
+        linuxDevPackages =
+          if isLinux then
+            [
+              pkgs.cargo-tarpaulin
+              androidPackages.androidsdk
+              pkgs.androidStudioPackages.dev
+            ]
+          else
+            [];
+        darwinDevPackages =
+          if isDarwin then
+            [ pkgs.libiconv ]
+          else
+            [];
 
       in
       {
@@ -148,40 +188,24 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            rustc
-            cargo
-            clippy
-            rustfmt
-            rust-analyzer
-            cargo-edit
-            cargo-deny
-            cargo-audit
-            cargo-tarpaulin
-            cargo-ndk
-            rustup
-            pkg-config
-            protobuf
-            openssl
-            javaToolchain
-            gradle
-            androidPackages.androidsdk
-            androidStudioPackages.dev
-          ];
+          packages = commonDevPackages ++ linuxDevPackages ++ darwinDevPackages;
 
           inherit nativeBuildInputs;
 
-          shellHook = ''
-            export JAVA_HOME=${javaToolchain}
-            export ANDROID_HOME=${androidPackages.androidsdk}
-            export ANDROID_SDK_ROOT=${androidPackages.androidsdk}
-            export QT_QPA_PLATFORM=xcb
-            export NIX_ANDROID_EMULATOR_FLAGS="-no-snapshot -gpu swiftshader_indirect"
-            if [ -d "${androidPackages.androidsdk}/ndk" ]; then
-              export ANDROID_NDK_HOME=$(ls -d ${androidPackages.androidsdk}/ndk/* | head -n1)
-              export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
-            fi
-          '';
+          shellHook =
+            ''
+              export JAVA_HOME=${javaToolchain}
+            ''
+            + lib.optionalString isLinux ''
+              export ANDROID_HOME=${androidPackages.androidsdk}
+              export ANDROID_SDK_ROOT=${androidPackages.androidsdk}
+              export QT_QPA_PLATFORM=xcb
+              export NIX_ANDROID_EMULATOR_FLAGS="-no-snapshot -gpu swiftshader_indirect"
+              if [ -d "${androidPackages.androidsdk}/ndk" ]; then
+                export ANDROID_NDK_HOME=$(ls -d ${androidPackages.androidsdk}/ndk/* | head -n1)
+                export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
+              fi
+            '';
         };
 
         formatter = pkgs.alejandra;

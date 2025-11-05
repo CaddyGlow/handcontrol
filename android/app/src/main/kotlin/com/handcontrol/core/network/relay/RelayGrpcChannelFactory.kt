@@ -27,7 +27,11 @@ import java.net.Socket
 import java.net.SocketAddress
 import java.net.SocketException
 import java.net.URI
+import java.security.cert.X509Certificate
+import java.util.Collections
+import java.util.WeakHashMap
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -42,6 +46,8 @@ class RelayGrpcChannelFactory @Inject constructor(
 ) {
     private val scope = CoroutineScope(Dispatchers.IO)
     private val activeBridges = mutableMapOf<ManagedChannel, BridgeContext>()
+    private val channelCertificates =
+        Collections.synchronizedMap(WeakHashMap<ManagedChannel, AtomicReference<X509Certificate?>>())
 
     /**
      * Creates a gRPC channel that routes through a relay tunnel
@@ -113,25 +119,28 @@ class RelayGrpcChannelFactory @Inject constructor(
     /**
      * Shuts down a relay channel and its associated bridge
      */
-    suspend fun shutdownChannel(channel: ManagedChannel) = withContext(Dispatchers.IO) {
-        Timber.i("Shutting down relay gRPC channel")
+    suspend fun shutdownChannel(channel: ManagedChannel) {
+        withContext(Dispatchers.IO) {
+            Timber.i("Shutting down relay gRPC channel")
 
-        val bridge = activeBridges.remove(channel)
-        if (bridge != null) {
-            bridge.shutdown()
-        }
-
-        channel.shutdown()
-        try {
-            if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
-                Timber.w("Channel did not terminate gracefully, forcing shutdown")
-                channel.shutdownNow()
-                channel.awaitTermination(2, TimeUnit.SECONDS)
+            val bridge = activeBridges.remove(channel)
+            if (bridge != null) {
+                bridge.shutdown()
             }
-        } catch (e: InterruptedException) {
-            Timber.e(e, "Interrupted while shutting down channel")
-            channel.shutdownNow()
-            Thread.currentThread().interrupt()
+
+            channel.shutdown()
+            try {
+                if (!channel.awaitTermination(5, TimeUnit.SECONDS)) {
+                    Timber.w("Channel did not terminate gracefully, forcing shutdown")
+                    channel.shutdownNow()
+                    channel.awaitTermination(2, TimeUnit.SECONDS)
+                }
+            } catch (e: InterruptedException) {
+                Timber.e(e, "Interrupted while shutting down channel")
+                channel.shutdownNow()
+                Thread.currentThread().interrupt()
+            }
+            channelCertificates.remove(channel)
         }
     }
 
@@ -289,9 +298,11 @@ class RelayGrpcChannelFactory @Inject constructor(
         loopbackPort: Int,
         expectedFingerprint: String?
     ): ManagedChannel {
+        val certificateRef = AtomicReference<X509Certificate?>(null)
         val sslContext = MtlsSslContextFactory.createSslContext(
             certificateManager = certificateManager,
-            expectedFingerprint = expectedFingerprint
+            expectedFingerprint = expectedFingerprint,
+            onServerCertificate = { cert -> certificateRef.set(cert) }
         )
 
         val builder = OkHttpChannelBuilder
@@ -303,7 +314,9 @@ class RelayGrpcChannelFactory @Inject constructor(
             .keepAliveTime(30, TimeUnit.SECONDS)
             .keepAliveTimeout(10, TimeUnit.SECONDS)
             .keepAliveWithoutCalls(true)
-        return builder.build()
+        val channel = builder.build()
+        channelCertificates[channel] = certificateRef
+        return channel
     }
 
     suspend fun shutdown() = withContext(Dispatchers.IO) {
@@ -311,6 +324,11 @@ class RelayGrpcChannelFactory @Inject constructor(
         activeBridges.keys.toList().forEach { channel ->
             shutdownChannel(channel)
         }
+        channelCertificates.clear()
+    }
+
+    fun getServerCertificate(channel: ManagedChannel): X509Certificate? {
+        return channelCertificates[channel]?.get()
     }
 }
 

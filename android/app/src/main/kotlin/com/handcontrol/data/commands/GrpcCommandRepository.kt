@@ -1,8 +1,11 @@
 package com.handcontrol.data.commands
 
+import com.handcontrol.core.network.ConnectionResult
 import com.handcontrol.core.network.RelayConnectionException
 import com.handcontrol.core.network.ServerConnectionManager
 import com.handcontrol.data.database.EnrolledServerRepository
+import com.handcontrol.data.database.EnrolledServerEntity
+import com.handcontrol.core.security.VerificationCodeGenerator
 import com.handcontrol.grpc.ExecuteCommandRequest
 import com.handcontrol.grpc.ListCommandsRequest
 import com.handcontrol.grpc.ParameterType as ProtoParameterType
@@ -31,33 +34,42 @@ class GrpcCommandRepository @Inject constructor(
 
             Timber.i("Connecting to server ${server.serverName} for server info")
             val connectionResult = connectionManager.connect(server)
-            val channel = connectionResult.channel
+            val result = try {
+                val channel = connectionResult.channel
 
-            Timber.d("Connected via ${connectionResult.mode} mode")
-            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+                Timber.d("Connected via ${connectionResult.mode} mode")
+                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
-            val request = ServerInfoRequest.newBuilder().build()
-            val response = stub.getServerInfo(request)
+                val request = ServerInfoRequest.newBuilder().build()
+                val response = stub.getServerInfo(request)
 
-            connectionManager.disconnect(connectionResult)
+                verifyServerCertificate(server, connectionResult)
 
-            // Persist successful connection mode
-            enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
+                // Persist successful connection mode
+                enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
 
-            Result.success(
-                ServerInfo(
-                    serverId = response.serverId,
-                    hostname = response.hostname,
-                    version = response.version,
-                    os = response.os
+                Result.success(
+                    ServerInfo(
+                        serverId = response.serverId,
+                        hostname = response.hostname,
+                        version = response.version,
+                        os = response.os
+                    )
                 )
-            )
+            } finally {
+                connectionManager.disconnect(connectionResult)
+            }
+
+            result
         } catch (e: RelayConnectionException) {
             Timber.e(e, "Relay connection failed: ${e.shortMessage}")
             Result.failure(Exception(e.userMessage, e))
         } catch (e: StatusException) {
             Timber.e(e, "Failed to get server info")
             Result.failure(Exception(mapGrpcError(e.status)))
+        } catch (e: SecurityException) {
+            Timber.e(e, "Server certificate verification failed")
+            Result.failure(e)
         } catch (e: Exception) {
             Timber.e(e, "Failed to get server info")
             Result.failure(e)
@@ -71,55 +83,63 @@ class GrpcCommandRepository @Inject constructor(
 
             Timber.i("Connecting to server ${server.serverName} to list commands")
             val connectionResult = connectionManager.connect(server)
-            val channel = connectionResult.channel
+            val result = try {
+                val channel = connectionResult.channel
 
-            Timber.d("Connected via ${connectionResult.mode} mode")
-            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+                Timber.d("Connected via ${connectionResult.mode} mode")
+                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
 
-            val request = ListCommandsRequest.newBuilder().build()
-            val response = stub.listCommands(request)
+                val request = ListCommandsRequest.newBuilder().build()
+                val response = stub.listCommands(request)
 
-            connectionManager.disconnect(connectionResult)
+                verifyServerCertificate(server, connectionResult)
 
-            // Persist successful connection mode
-            enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
+                // Persist successful connection mode
+                enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
 
-            val commands = response.commandsList.map { protoCommand ->
-                Command(
-                    id = protoCommand.id,
-                    name = protoCommand.name,
-                    description = protoCommand.description,
-                    icon = protoCommand.icon,
-                    tags = protoCommand.tagsList,
-                    parameters = protoCommand.parametersList.map { protoParam ->
-                        CommandParameter(
-                            name = protoParam.name,
-                            type = mapParameterType(protoParam.type),
-                            description = protoParam.description,
-                            min = if (protoParam.hasMin()) protoParam.min else null,
-                            max = if (protoParam.hasMax()) protoParam.max else null,
-                            defaultValue = if (protoParam.hasDefaultValue()) protoParam.defaultValue else null,
-                            options = protoParam.optionsList,
-                            validation = if (protoParam.hasValidation()) protoParam.validation else null,
-                            labelOn = if (protoParam.hasLabelOn()) protoParam.labelOn else null,
-                            labelOff = if (protoParam.hasLabelOff()) protoParam.labelOff else null,
-                            defaultValueCommand = if (protoParam.hasDefaultValueCommand()) protoParam.defaultValueCommand else null,
-                            defaultValuePattern = if (protoParam.hasDefaultValuePattern()) protoParam.defaultValuePattern else null
-                        )
-                    },
-                    requiresConfirmation = if (protoCommand.hasRequiresConfirmation()) protoCommand.requiresConfirmation else false,
-                    showOutput = if (protoCommand.hasShowOutput()) protoCommand.showOutput else true
-                )
+                val commands = response.commandsList.map { protoCommand ->
+                    Command(
+                        id = protoCommand.id,
+                        name = protoCommand.name,
+                        description = protoCommand.description,
+                        icon = protoCommand.icon,
+                        tags = protoCommand.tagsList,
+                        parameters = protoCommand.parametersList.map { protoParam ->
+                            CommandParameter(
+                                name = protoParam.name,
+                                type = mapParameterType(protoParam.type),
+                                description = protoParam.description,
+                                min = if (protoParam.hasMin()) protoParam.min else null,
+                                max = if (protoParam.hasMax()) protoParam.max else null,
+                                defaultValue = if (protoParam.hasDefaultValue()) protoParam.defaultValue else null,
+                                options = protoParam.optionsList,
+                                validation = if (protoParam.hasValidation()) protoParam.validation else null,
+                                labelOn = if (protoParam.hasLabelOn()) protoParam.labelOn else null,
+                                labelOff = if (protoParam.hasLabelOff()) protoParam.labelOff else null,
+                                defaultValueCommand = if (protoParam.hasDefaultValueCommand()) protoParam.defaultValueCommand else null,
+                                defaultValuePattern = if (protoParam.hasDefaultValuePattern()) protoParam.defaultValuePattern else null
+                            )
+                        },
+                        requiresConfirmation = if (protoCommand.hasRequiresConfirmation()) protoCommand.requiresConfirmation else false,
+                        showOutput = if (protoCommand.hasShowOutput()) protoCommand.showOutput else true
+                    )
+                }
+                Timber.i("Loaded ${commands.size} commands from server")
+                Result.success(commands)
+            } finally {
+                connectionManager.disconnect(connectionResult)
             }
 
-            Timber.i("Loaded ${commands.size} commands from server")
-            Result.success(commands)
+            result
         } catch (e: RelayConnectionException) {
             Timber.e(e, "Relay connection failed: ${e.shortMessage}")
             Result.failure(Exception(e.userMessage, e))
         } catch (e: StatusException) {
             Timber.e(e, "Failed to list commands")
             Result.failure(Exception(mapGrpcError(e.status)))
+        } catch (e: SecurityException) {
+            Timber.e(e, "Server certificate verification failed")
+            Result.failure(e)
         } catch (e: Exception) {
             Timber.e(e, "Failed to list commands")
             Result.failure(e)
@@ -177,18 +197,28 @@ class GrpcCommandRepository @Inject constructor(
                 Timber.e(e, "Command execution failed")
                 when (e) {
                     is StatusException -> emit(CommandExecutionResult.Error(mapGrpcError(e.status)))
+                    is SecurityException -> emit(CommandExecutionResult.Error(e.message ?: "Security verification failed"))
                     else -> emit(CommandExecutionResult.Error(e.message ?: "Unknown error"))
                 }
             }
             .onCompletion { cause ->
                 // Disconnect channel when flow completes (success or error)
                 Timber.d("Command execution flow completed (cause: $cause)")
-                connectionManager.disconnect(connectionResult)
 
-                // Persist successful connection mode (even if command failed)
-                if (cause == null || cause is StatusException) {
+                var securityFailure: SecurityException? = null
+                try {
+                    verifyServerCertificate(server, connectionResult)
+                } catch (e: SecurityException) {
+                    securityFailure = e
+                } finally {
+                    connectionManager.disconnect(connectionResult)
+                }
+
+                if (securityFailure == null && (cause == null || cause is StatusException)) {
                     enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
                 }
+
+                securityFailure?.let { throw it }
             }
     }
 
@@ -199,6 +229,35 @@ class GrpcCommandRepository @Inject constructor(
             ProtoParameterType.PARAMETER_TYPE_TOGGLE -> ParameterType.TOGGLE
             ProtoParameterType.PARAMETER_TYPE_DROPDOWN -> ParameterType.DROPDOWN
             else -> ParameterType.UNSPECIFIED
+        }
+    }
+
+    private suspend fun verifyServerCertificate(
+        server: EnrolledServerEntity,
+        connectionResult: ConnectionResult
+    ) {
+        val provider = connectionResult.serverCertificateProvider ?: return
+        val certificate = provider.invoke() ?: return
+        val fingerprint = VerificationCodeGenerator.computeFingerprint(certificate.encoded)
+        val normalizedComputed = fingerprint
+            .removePrefix("SHA256:")
+            .replace(":", "")
+            .lowercase()
+        val normalizedStored = server.certFingerprint
+            .removePrefix("SHA256:")
+            .replace(":", "")
+            .lowercase()
+
+        if (server.certFingerprint.isBlank()) {
+            Timber.i("Persisting server fingerprint for ${server.serverName}")
+            enrolledServerRepository.updateServerFingerprint(server.serverId, fingerprint)
+        } else if (normalizedStored != normalizedComputed) {
+            Timber.e(
+                "Server certificate fingerprint mismatch: expected=%s actual=%s",
+                server.certFingerprint,
+                fingerprint
+            )
+            throw SecurityException("Server certificate fingerprint mismatch")
         }
     }
 

@@ -25,6 +25,7 @@ import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import java.io.IOException
+import java.security.cert.X509Certificate
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.coroutines.resume
@@ -37,7 +38,8 @@ data class ConnectionResult(
     val serverId: String,
     val channel: ManagedChannel,
     val mode: ConnectionMode,
-    val connectedAddress: String? = null  // For direct mode, which IP was used
+    val connectedAddress: String? = null,  // For direct mode, which IP was used
+    val serverCertificateProvider: (() -> X509Certificate?)? = null
 )
 
 /**
@@ -191,7 +193,8 @@ class ServerConnectionManager @Inject constructor(
                     serverId = server.serverId,
                     channel = channel,
                     mode = ConnectionMode.DIRECT,
-                    connectedAddress = "$ip:${server.serverPort}"
+                    connectedAddress = "$ip:${server.serverPort}",
+                    serverCertificateProvider = { directChannelFactory.getServerCertificate(channel) }
                 )
             } else {
                 Timber.d("Direct channel to $ip did not become ready within timeout, closing")
@@ -319,7 +322,8 @@ class ServerConnectionManager @Inject constructor(
                 serverId = server.serverId,
                 channel = channel,
                 mode = ConnectionMode.RELAY,
-                connectedAddress = null
+                connectedAddress = null,
+                serverCertificateProvider = { relayChannelFactory.getServerCertificate(channel) }
             )
 
             relayLock.withLock {

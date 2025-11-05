@@ -7,8 +7,10 @@ import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import timber.log.Timber
 import java.math.BigInteger
+import java.security.GeneralSecurityException
 import java.security.KeyPairGenerator
 import java.security.KeyStore
+import java.security.Signature
 import java.security.cert.X509Certificate
 import java.util.Date
 import javax.inject.Inject
@@ -28,11 +30,16 @@ class AndroidKeystoreCertificateManager @Inject constructor(
     override suspend fun loadOrCreate(): ClientCertificate {
         if (keyStore.containsAlias(CLIENT_KEY_ALIAS)) {
             Timber.d("Loading existing client certificate")
-            val certificate = keyStore.getCertificate(CLIENT_KEY_ALIAS) as X509Certificate
-            return ClientCertificate(
-                certificateDer = certificate.encoded,
-                privateKeyAlias = CLIENT_KEY_ALIAS
-            )
+            if (!isKeyUsable(CLIENT_KEY_ALIAS)) {
+                Timber.w("Client key alias %s is not usable, regenerating", CLIENT_KEY_ALIAS)
+                keyStore.deleteEntry(CLIENT_KEY_ALIAS)
+            } else {
+                val certificate = keyStore.getCertificate(CLIENT_KEY_ALIAS) as X509Certificate
+                return ClientCertificate(
+                    certificateDer = certificate.encoded,
+                    privateKeyAlias = CLIENT_KEY_ALIAS
+                )
+            }
         }
 
         Timber.i("Generating new client certificate")
@@ -69,7 +76,12 @@ class AndroidKeystoreCertificateManager @Inject constructor(
             KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY
         )
             .setAlgorithmParameterSpec(java.security.spec.ECGenParameterSpec("secp256r1"))
-            .setDigests(KeyProperties.DIGEST_SHA256)
+            .setDigests(
+                KeyProperties.DIGEST_SHA256,
+                KeyProperties.DIGEST_SHA384,
+                KeyProperties.DIGEST_SHA512,
+                KeyProperties.DIGEST_NONE
+            )
             .setUserAuthenticationRequired(false)
             .setCertificateSubject(X500Principal("CN=HandControl Client"))
             .setCertificateSerialNumber(BigInteger.valueOf(System.currentTimeMillis()))
@@ -86,6 +98,25 @@ class AndroidKeystoreCertificateManager @Inject constructor(
             certificateDer = certificate.encoded,
             privateKeyAlias = CLIENT_KEY_ALIAS
         )
+    }
+
+    private fun isKeyUsable(alias: String): Boolean {
+        return try {
+            val entry = keyStore.getEntry(alias, null) as? KeyStore.PrivateKeyEntry ?: return false
+            val algorithms = listOf("SHA256withECDSA", "NONEwithECDSA")
+
+            for (algorithm in algorithms) {
+                val signature = Signature.getInstance(algorithm)
+                signature.initSign(entry.privateKey)
+                signature.update(byteArrayOf(0x01))
+                signature.sign()
+            }
+
+            true
+        } catch (e: GeneralSecurityException) {
+            Timber.w(e, "Client key alias %s failed usability check", alias)
+            false
+        }
     }
 
     companion object {

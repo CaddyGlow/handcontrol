@@ -37,6 +37,9 @@ interface EnrolledServerDao {
     @Query("UPDATE enrolled_servers SET connectionPreference = :preference WHERE serverId = :serverId")
     suspend fun updateConnectionPreference(serverId: String, preference: ConnectionPreference)
 
+    @Query("UPDATE enrolled_servers SET certFingerprint = :fingerprint WHERE serverId = :serverId")
+    suspend fun updateCertFingerprint(serverId: String, fingerprint: String)
+
     @Delete
     suspend fun deleteServer(server: EnrolledServerEntity)
 

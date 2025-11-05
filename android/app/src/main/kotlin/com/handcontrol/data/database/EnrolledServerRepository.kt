@@ -56,6 +56,10 @@ class EnrolledServerRepository @Inject constructor(
         enrolledServerDao.updateConnectionPreference(serverId, preference)
     }
 
+    suspend fun updateServerFingerprint(serverId: String, fingerprint: String) {
+        enrolledServerDao.updateCertFingerprint(serverId, fingerprint)
+    }
+
     suspend fun removeServer(serverId: String) {
         enrolledServerDao.deleteServerById(serverId)
     }

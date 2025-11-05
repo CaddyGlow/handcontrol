@@ -1,9 +1,12 @@
 use crate::{
-    certificates::CertificatePaths, proto::remote_control_client::RemoteControlClient,
-    storage::ServerRegistryEntry,
+    certificates::CertificatePaths,
+    config,
+    proto::remote_control_client::RemoteControlClient,
+    relay::establish_relay_tunnel,
+    storage::{RegistryRelayInfo, ServerRegistryEntry},
 };
 use anyhow::{anyhow, bail, Context, Result};
-use http::Uri;
+use http::{uri::Authority, Uri};
 use hyper_util::rt::TokioIo;
 use rustls::{
     client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
@@ -17,13 +20,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 use tokio::{
+    io::DuplexStream,
     net::TcpStream,
+    sync::Mutex as AsyncMutex,
     time::{timeout, Duration},
 };
 use tokio_rustls::TlsConnector;
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tower::service_fn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 const DEFAULT_CONNECT_TIMEOUT_SECONDS: u64 = 5;
@@ -149,6 +155,57 @@ async fn connect_channel(
     })
 }
 
+async fn connect_channel_with_stream(
+    stream_holder: Arc<AsyncMutex<Option<DuplexStream>>>,
+    endpoint_uri: String,
+    server_name: ServerName<'static>,
+    expected_fingerprint: Option<&str>,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<ConnectResult> {
+    let (tls_config, recorder) = build_tls_config(expected_fingerprint, client_auth)?;
+
+    let endpoint = Endpoint::from_shared(endpoint_uri.clone())
+        .with_context(|| format!("Invalid endpoint URI: {endpoint_uri}"))?
+        .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS));
+
+    let tls_connector = TlsConnector::from(tls_config);
+    let connector = service_fn(move |_: Uri| {
+        let tls_connector = tls_connector.clone();
+        let server_name = server_name.clone();
+        let stream_holder = stream_holder.clone();
+        async move {
+            let mut guard = stream_holder.lock().await;
+            let stream = guard
+                .take()
+                .ok_or_else(|| anyhow!("Relay stream already consumed"))?;
+            drop(guard);
+
+            let tls_stream = timeout(
+                Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS),
+                tls_connector.connect(server_name.clone(), stream),
+            )
+            .await
+            .map_err(|_| anyhow!("TLS handshake timed out"))??;
+
+            Ok::<_, anyhow::Error>(TokioIo::new(tls_stream))
+        }
+    });
+
+    let channel = endpoint
+        .connect_with_connector(connector)
+        .await
+        .context("Failed to establish gRPC channel")?;
+
+    let fingerprint = recorder
+        .fingerprint()
+        .ok_or_else(|| anyhow!("Server fingerprint not captured during handshake"))?;
+
+    Ok(ConnectResult {
+        channel,
+        fingerprint,
+    })
+}
+
 fn build_endpoints(address: &str, port: u16) -> Result<(String, SocketAddr, ServerName<'static>)> {
     let domain = normalize_domain(address);
     let uri = if domain.contains(':') {
@@ -173,6 +230,23 @@ fn build_endpoints(address: &str, port: u16) -> Result<(String, SocketAddr, Serv
     };
 
     Ok((uri, socket_addr, server_name))
+}
+
+fn build_uri_and_server_name(host: &str, port: u16) -> Result<(String, ServerName<'static>)> {
+    let domain = normalize_domain(host);
+    let uri = if domain.contains(':') {
+        format!("http://[{domain}]:{port}")
+    } else {
+        format!("http://{domain}:{port}")
+    };
+
+    let server_name = if let Ok(ip) = domain.parse::<IpAddr>() {
+        ServerName::IpAddress(ip.into())
+    } else {
+        ServerName::try_from(domain.as_str())?.to_owned()
+    };
+
+    Ok((uri, server_name))
 }
 
 fn build_tls_config(
@@ -404,17 +478,245 @@ pub async fn connect_registered(
     entry: &ServerRegistryEntry,
     cert_paths: &CertificatePaths,
 ) -> Result<HandControlClient> {
-    let address = entry
-        .ip
-        .as_ref()
-        .or_else(|| entry.hostname.as_ref())
-        .ok_or_else(|| anyhow!("Registry entry missing address"))?;
-    let port = entry.port.unwrap_or(50051);
+    let (cert_pem, key_pem) = cert_paths
+        .load_client_credentials()
+        .context("Failed to load stored client credentials")?;
+    let cert_chain = load_certs(&cert_pem)?;
 
     let fingerprint =
         load_pinned_fingerprint(cert_paths).context("Failed to load pinned server fingerprint")?;
 
-    HandControlClient::connect(address, port, cert_paths, &fingerprint).await
+    let cfg = config::load().unwrap_or_else(|err| {
+        warn!("Failed to load client config: {err:#}; using defaults");
+        config::ClientConfig::default()
+    });
+
+    let mut direct_addresses = collect_direct_addresses(entry);
+    let relay_info = entry.relay.clone();
+    let has_relay = relay_info.is_some();
+    let relay_required = relay_info
+        .as_ref()
+        .map(|info| info.relay_required)
+        .unwrap_or(false);
+    let relay_prefs = cfg.network.relay;
+    let relay_only_mode = relay_required || relay_prefs.relay_only_mode;
+
+    enum Attempt {
+        Direct(String),
+        Relay,
+    }
+
+    let port = entry.port.unwrap_or(50051);
+
+    let mut attempts: Vec<Attempt> = Vec::new();
+
+    if relay_only_mode {
+        if has_relay {
+            attempts.push(Attempt::Relay);
+        } else {
+            bail!(
+                "Relay connection required for server {} but no relay credentials stored",
+                entry.id
+            );
+        }
+    } else {
+        if relay_prefs.prefer_relay && has_relay {
+            attempts.push(Attempt::Relay);
+        }
+
+        if !direct_addresses.is_empty() {
+            let max_direct = relay_prefs.max_direct_attempts;
+            let limit = if max_direct == 0 {
+                direct_addresses.len()
+            } else {
+                (max_direct as usize).min(direct_addresses.len())
+            };
+            direct_addresses.truncate(limit);
+            for address in &direct_addresses {
+                attempts.push(Attempt::Direct(address.clone()));
+            }
+        }
+
+        if !relay_prefs.prefer_relay && has_relay {
+            attempts.push(Attempt::Relay);
+        }
+    }
+
+    if attempts.is_empty() {
+        bail!(
+            "No connection targets available for server {}. Add addresses or relay credentials",
+            entry.id
+        );
+    }
+
+    let mut errors: Vec<String> = Vec::new();
+
+    for attempt in attempts {
+        match attempt {
+            Attempt::Direct(address) => {
+                debug!("Attempting direct connection to {}:{}", address, port);
+                match connect_via_direct(&address, port, &fingerprint, &cert_chain, &key_pem).await
+                {
+                    Ok(client) => return Ok(client),
+                    Err(err) => {
+                        debug!("Direct connection to {} failed: {:#}", address, err);
+                        errors.push(format!("direct {address}: {err:#}"));
+                    }
+                }
+            }
+            Attempt::Relay => {
+                let relay_info = match &relay_info {
+                    Some(info) => info,
+                    None => {
+                        errors.push("relay: credentials unavailable".to_string());
+                        continue;
+                    }
+                };
+
+                let client_id = match entry.client_id {
+                    Some(id) => id,
+                    None => {
+                        errors.push("relay: client_id missing from enrollment".to_string());
+                        continue;
+                    }
+                };
+
+                debug!("Attempting relay connection via {}", relay_info.relay_url);
+                match connect_via_relay(
+                    entry,
+                    relay_info,
+                    client_id,
+                    port,
+                    &fingerprint,
+                    &cert_chain,
+                    &key_pem,
+                )
+                .await
+                {
+                    Ok(client) => return Ok(client),
+                    Err(err) => {
+                        debug!("Relay connection failed: {:#}", err);
+                        errors.push(format!("relay: {err:#}"));
+                    }
+                }
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        bail!("All connection attempts failed for server {}", entry.id);
+    }
+
+    bail!(
+        "All connection attempts failed for server {}:\n{}",
+        entry.id,
+        errors.join("\n")
+    );
+}
+
+fn collect_direct_addresses(entry: &ServerRegistryEntry) -> Vec<String> {
+    fn push_unique(target: &mut Vec<String>, candidate: &str) {
+        if candidate.trim().is_empty() {
+            return;
+        }
+        if !target
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(candidate))
+        {
+            target.push(candidate.to_string());
+        }
+    }
+
+    let mut addresses = Vec::new();
+    for addr in &entry.addresses {
+        push_unique(&mut addresses, addr);
+    }
+    if let Some(ip) = &entry.ip {
+        push_unique(&mut addresses, ip);
+    }
+    if let Some(host) = &entry.hostname {
+        push_unique(&mut addresses, host);
+    }
+    addresses
+}
+
+async fn connect_via_direct(
+    address: &str,
+    port: u16,
+    fingerprint: &str,
+    cert_chain: &[CertificateDer<'static>],
+    key_pem: &[u8],
+) -> Result<HandControlClient> {
+    let client_key = load_private_key(key_pem)?;
+    let result = connect_channel(
+        address,
+        port,
+        Some(fingerprint),
+        Some((cert_chain.to_vec(), client_key)),
+    )
+    .await?;
+
+    Ok(HandControlClient {
+        inner: RemoteControlClient::new(result.channel),
+    })
+}
+
+async fn connect_via_relay(
+    entry: &ServerRegistryEntry,
+    relay_info: &RegistryRelayInfo,
+    client_id: Uuid,
+    default_port: u16,
+    fingerprint: &str,
+    cert_chain: &[CertificateDer<'static>],
+    key_pem: &[u8],
+) -> Result<HandControlClient> {
+    let tunnel = establish_relay_tunnel(relay_info, entry.id, &client_id)
+        .await
+        .context("Failed to establish relay tunnel")?;
+
+    let (authority_host, override_port) =
+        derive_relay_authority(entry, tunnel.server_authority.as_deref());
+    let port = override_port.unwrap_or(default_port);
+    let (endpoint_uri, server_name) =
+        build_uri_and_server_name(&authority_host, port).context("Invalid relay authority")?;
+
+    let stream_holder = Arc::new(AsyncMutex::new(Some(tunnel.stream)));
+    let client_key = load_private_key(key_pem)?;
+    let result = connect_channel_with_stream(
+        stream_holder,
+        endpoint_uri,
+        server_name,
+        Some(fingerprint),
+        Some((cert_chain.to_vec(), client_key)),
+    )
+    .await?;
+
+    Ok(HandControlClient {
+        inner: RemoteControlClient::new(result.channel),
+    })
+}
+
+fn derive_relay_authority(
+    entry: &ServerRegistryEntry,
+    tunnel_authority: Option<&str>,
+) -> (String, Option<u16>) {
+    if let Some(authority) = tunnel_authority {
+        if let Ok(parsed) = authority.parse::<Authority>() {
+            return (parsed.host().to_string(), parsed.port_u16());
+        }
+    }
+
+    if let Some(host) = &entry.hostname {
+        return (host.clone(), None);
+    }
+    if let Some(addr) = entry.addresses.first() {
+        return (addr.clone(), None);
+    }
+    if let Some(ip) = &entry.ip {
+        return (ip.clone(), None);
+    }
+
+    (entry.id.to_string(), None)
 }
 
 fn normalize_domain(address: &str) -> String {

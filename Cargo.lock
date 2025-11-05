@@ -1240,6 +1240,7 @@ dependencies = [
  "anyhow",
  "base64",
  "directories",
+ "futures-util",
  "hex",
  "hostname",
  "http",
@@ -1256,12 +1257,14 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-tungstenite 0.25.0",
  "toml",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
  "tower",
  "tracing",
+ "url",
  "uuid",
 ]
 

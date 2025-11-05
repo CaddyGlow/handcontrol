@@ -4,6 +4,7 @@ pub mod config;
 pub mod discovery;
 pub mod enrollment;
 pub mod grpc_client;
+mod relay;
 pub mod storage;
 
 pub mod proto {
@@ -16,7 +17,8 @@ pub use commands::{
     CommandParameterType, CommandStreamEvent, CommandSummary,
 };
 pub use config::{
-    CliConfig, ClientConfig, ConnectionConfig, DeviceConfig, DiscoveryConfig, TuiConfig,
+    CliConfig, ClientConfig, ConnectionConfig, DeviceConfig, DiscoveryConfig, NetworkConfig,
+    RelayBehaviorConfig, TuiConfig,
 };
 pub use discovery::{discover_servers, DiscoveredServer};
 pub use enrollment::{

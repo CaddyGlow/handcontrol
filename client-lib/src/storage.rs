@@ -31,19 +31,37 @@ impl ServerRegistry {
         let file: ServerRegistryFile = toml::from_str(&contents)
             .with_context(|| format!("Failed to parse {}", path.display()))?;
 
-        Ok(Self {
-            entries: file.server.unwrap_or_default(),
-        })
+        let mut entries = file.server.unwrap_or_default();
+        for entry in &mut entries {
+            if entry.addresses.is_empty() {
+                if let Some(ip) = entry.ip.clone() {
+                    entry.addresses.push(ip);
+                }
+            }
+
+            if entry.ip.is_none() {
+                entry.ip = entry.addresses.first().cloned();
+            }
+        }
+
+        Ok(Self { entries })
     }
 
     /// Persist the registry to disk.
     pub fn save(&self) -> Result<()> {
         let path = registry_path()?;
+        let mut entries = self.entries.clone();
+        for entry in &mut entries {
+            if entry.ip.is_none() {
+                entry.ip = entry.addresses.first().cloned();
+            }
+        }
+
         let file = ServerRegistryFile {
-            server: if self.entries.is_empty() {
+            server: if entries.is_empty() {
                 None
             } else {
-                Some(self.entries.clone())
+                Some(entries)
             },
         };
 
@@ -84,6 +102,18 @@ impl ServerRegistry {
 }
 
 /// Individual server entry stored in `servers.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RegistryRelayInfo {
+    pub relay_url: String,
+    pub relay_token: String,
+    #[serde(default)]
+    pub relay_required: bool,
+    #[serde(default)]
+    pub allow_self_signed_tls: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_cert_sha256: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerRegistryEntry {
     pub id: Uuid,
@@ -103,6 +133,10 @@ pub struct ServerRegistryEntry {
     pub cert_fingerprint: Option<String>,
     #[serde(default)]
     pub cert_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub addresses: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<RegistryRelayInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

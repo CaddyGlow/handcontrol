@@ -18,6 +18,9 @@ pub struct ClientConfig {
     pub connection: ConnectionConfig,
 
     #[serde(default)]
+    pub network: NetworkConfig,
+
+    #[serde(default)]
     pub tui: TuiConfig,
 
     #[serde(default)]
@@ -32,9 +35,44 @@ impl Default for ClientConfig {
         Self {
             discovery: DiscoveryConfig::default(),
             connection: ConnectionConfig::default(),
+            network: NetworkConfig::default(),
             tui: TuiConfig::default(),
             cli: CliConfig::default(),
             device: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    #[serde(default)]
+    pub relay: RelayBehaviorConfig,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            relay: RelayBehaviorConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayBehaviorConfig {
+    #[serde(default)]
+    pub prefer_relay: bool,
+    #[serde(default)]
+    pub relay_only_mode: bool,
+    #[serde(default = "default_max_direct_attempts")]
+    pub max_direct_attempts: u32,
+}
+
+impl Default for RelayBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            prefer_relay: false,
+            relay_only_mode: false,
+            max_direct_attempts: default_max_direct_attempts(),
         }
     }
 }
@@ -196,6 +234,10 @@ fn default_timeout_seconds() -> u64 {
 
 fn default_command_timeout() -> u64 {
     300
+}
+
+fn default_max_direct_attempts() -> u32 {
+    3
 }
 
 fn default_retry_attempts() -> u32 {

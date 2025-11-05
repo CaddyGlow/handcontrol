@@ -555,7 +555,28 @@ async fn run_enroll_qr(args: QrEnrollCommand) -> Result<()> {
     if let Some(client_id) = outcome.client_id {
         println!("Client ID: {client_id}");
     }
-    println!("Server address: {}", outcome.address);
+    if !outcome.addresses.is_empty() {
+        if outcome.addresses.len() == 1 {
+            println!("Direct address: {}:{}", outcome.addresses[0], outcome.port);
+        } else {
+            println!("Direct addresses (port {}):", outcome.port);
+            for addr in &outcome.addresses {
+                println!("  - {}:{}", addr, outcome.port);
+            }
+        }
+    } else {
+        println!("No direct addresses recorded.");
+    }
+    if let Some(relay) = &outcome.relay {
+        println!(
+            "Relay URL: {} (required: {})",
+            relay.relay_url,
+            if relay.relay_required { "yes" } else { "no" }
+        );
+        if relay.allow_self_signed_tls {
+            println!("Relay TLS: allowing self-signed certificates");
+        }
+    }
     println!("Credentials stored in {}", outcome.cert_directory.display());
 
     Ok(())
@@ -600,6 +621,28 @@ async fn run_enroll_approve(args: ApproveEnrollCommand) -> Result<()> {
     println!("Enrollment approved for server {}", outcome.server_id);
     if let Some(client_id) = outcome.client_id {
         println!("Client ID: {client_id}");
+    }
+    if !outcome.addresses.is_empty() {
+        if outcome.addresses.len() == 1 {
+            println!("Direct address: {}:{}", outcome.addresses[0], outcome.port);
+        } else {
+            println!("Direct addresses (port {}):", outcome.port);
+            for addr in &outcome.addresses {
+                println!("  - {}:{}", addr, outcome.port);
+            }
+        }
+    } else {
+        println!("No direct addresses recorded.");
+    }
+    if let Some(relay) = &outcome.relay {
+        println!(
+            "Relay URL: {} (required: {})",
+            relay.relay_url,
+            if relay.relay_required { "yes" } else { "no" }
+        );
+        if relay.allow_self_signed_tls {
+            println!("Relay TLS: allowing self-signed certificates");
+        }
     }
     println!("Credentials stored in {}", outcome.cert_directory.display());
     if let Some(code) = last_code {
@@ -878,6 +921,10 @@ fn find_enrolled_server<'a>(
                 .as_ref()
                 .map(|ip| ip.eq_ignore_ascii_case(identifier))
                 .unwrap_or(false)
+            || entry
+                .addresses
+                .iter()
+                .any(|addr| addr.eq_ignore_ascii_case(identifier))
         {
             return Ok(entry);
         }
@@ -915,6 +962,15 @@ fn set_config_value(cfg: &mut ClientConfig, key: &str, value: &str) -> Result<()
         }
         ["connection", "retry_delay_ms"] => {
             cfg.connection.retry_delay_ms = parse_u64_arg(key, value)?;
+        }
+        ["network", "relay", "prefer_relay"] => {
+            cfg.network.relay.prefer_relay = parse_bool_arg(value)?;
+        }
+        ["network", "relay", "relay_only_mode"] => {
+            cfg.network.relay.relay_only_mode = parse_bool_arg(value)?;
+        }
+        ["network", "relay", "max_direct_attempts"] => {
+            cfg.network.relay.max_direct_attempts = parse_u32_arg(key, value)?;
         }
         ["tui", "show_timestamps"] => {
             cfg.tui.show_timestamps = parse_bool_arg(value)?;
@@ -980,7 +1036,7 @@ fn parse_u32_arg(key: &str, value: &str) -> Result<u32> {
     value
         .trim()
         .parse::<u32>()
-        .with_context(|| format!("{} must be a positive integer", key))
+        .with_context(|| format!("{} must be a non-negative integer", key))
 }
 
 fn set_device_string(cfg: &mut ClientConfig, is_name: bool, value: &str) {
@@ -1091,16 +1147,21 @@ fn output_tsv_registry(rows: &[RegistryRow], cfg: &ClientConfig) -> Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
 
     if cfg.cli.show_headers {
-        writeln!(stdout, "SERVER_ID\tHOSTNAME\tIP\tLAST_SEEN")?;
+        writeln!(stdout, "SERVER_ID\tHOSTNAME\tADDRESSES\tRELAY\tLAST_SEEN")?;
     }
 
     for row in rows {
         writeln!(
             stdout,
-            "{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}",
             row.server_id,
             row.hostname.as_deref().unwrap_or("-"),
-            row.ip.as_deref().unwrap_or("-"),
+            if row.addresses.is_empty() {
+                "-".to_string()
+            } else {
+                row.addresses.join(", ")
+            },
+            if row.relay { "yes" } else { "no" },
             row.last_seen.as_deref().unwrap_or("-")
         )?;
     }
@@ -1132,7 +1193,8 @@ struct DiscoverRow {
 struct RegistryRow {
     server_id: String,
     hostname: Option<String>,
-    ip: Option<String>,
+    addresses: Vec<String>,
+    relay: bool,
     last_seen: Option<String>,
 }
 
@@ -1141,8 +1203,35 @@ impl From<&ServerRegistryEntry> for RegistryRow {
         Self {
             server_id: entry.id.to_string(),
             hostname: entry.hostname.clone(),
-            ip: entry.ip.clone(),
+            addresses: collect_display_addresses(entry),
+            relay: entry.relay.is_some(),
             last_seen: entry.last_seen.clone(),
         }
     }
+}
+
+fn collect_display_addresses(entry: &ServerRegistryEntry) -> Vec<String> {
+    fn push_unique(target: &mut Vec<String>, candidate: &str) {
+        if candidate.trim().is_empty() {
+            return;
+        }
+        if !target
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(candidate))
+        {
+            target.push(candidate.to_string());
+        }
+    }
+
+    let mut addresses = Vec::new();
+    for addr in &entry.addresses {
+        push_unique(&mut addresses, addr);
+    }
+    if let Some(ip) = &entry.ip {
+        push_unique(&mut addresses, ip);
+    }
+    if let Some(host) = &entry.hostname {
+        push_unique(&mut addresses, host);
+    }
+    addresses
 }

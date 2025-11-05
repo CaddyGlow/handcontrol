@@ -36,7 +36,8 @@ sealed interface CommandListUiState {
         val commands: List<Command>,
         val filteredCommands: List<Command>,
         val searchQuery: String = "",
-        val remotePanel: RemotePanelUiModel = RemotePanelUiModel.empty()
+        val remotePanel: RemotePanelUiModel = RemotePanelUiModel.empty(),
+        val remoteLayoutSpec: RemoteLayoutSpec? = null
     ) : CommandListUiState
     data class Error(val message: String) : CommandListUiState
 }
@@ -117,7 +118,8 @@ class CommandListViewModel @Inject constructor(
                     serverInfo = serverInfo,
                     commands = commands,
                     filteredCommands = commands,
-                    remotePanel = buildRemotePanelModel(commands, layoutSpec)
+                    remotePanel = buildRemotePanelModel(commands, layoutSpec),
+                    remoteLayoutSpec = layoutSpec
                 )
 
                 // Note: Connection mode is already updated by repository
@@ -352,6 +354,40 @@ class CommandListViewModel @Inject constructor(
         } catch (e: Exception) {
             Timber.w(e, "Failed to fetch dynamic default")
             fallback
+        }
+    }
+
+    fun saveRemoteLayoutSpec(spec: RemoteLayoutSpec) {
+        val serverId = currentServerId ?: return
+
+        viewModelScope.launch {
+            enrolledServerRepository.saveRemoteLayoutSpec(serverId, spec)
+
+            val currentState = _uiState.value
+            if (currentState is CommandListUiState.Success) {
+                val updatedPanel = buildRemotePanelModel(currentState.commands, spec)
+                _uiState.value = currentState.copy(
+                    remotePanel = updatedPanel,
+                    remoteLayoutSpec = spec
+                )
+            }
+        }
+    }
+
+    fun clearRemoteLayoutSpec() {
+        val serverId = currentServerId ?: return
+
+        viewModelScope.launch {
+            enrolledServerRepository.saveRemoteLayoutSpec(serverId, null)
+
+            val currentState = _uiState.value
+            if (currentState is CommandListUiState.Success) {
+                val fallbackPanel = buildRemotePanelModel(currentState.commands, null)
+                _uiState.value = currentState.copy(
+                    remotePanel = fallbackPanel,
+                    remoteLayoutSpec = null
+                )
+            }
         }
     }
 

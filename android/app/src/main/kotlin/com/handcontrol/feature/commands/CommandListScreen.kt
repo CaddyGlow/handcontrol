@@ -1,7 +1,9 @@
 package com.handcontrol.feature.commands
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -20,26 +22,31 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -47,6 +54,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -60,6 +68,8 @@ import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.ui.components.CommandConfirmationDialog
 import com.handcontrol.ui.theme.HandControlTheme
 import kotlinx.coroutines.flow.collectLatest
+import com.handcontrol.feature.commands.remote.RemoteLayoutBuilderScreen
+import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import com.handcontrol.feature.commands.remote.RemotePanelScreen
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -78,6 +88,8 @@ fun CommandListScreen(
     var showConfirmationDialog by remember { mutableStateOf(false) }
     var selectedCommand by remember { mutableStateOf<Command?>(null) }
     var selectedTab by remember { mutableStateOf(CommandListTab.List) }
+    var isEditingRemote by rememberSaveable { mutableStateOf(false) }
+    var layoutDraft by remember(serverId) { mutableStateOf(RemoteLayoutSpec.withDefaultSections()) }
 
     LaunchedEffect(Unit) {
         viewModel.loadCommands(serverId)
@@ -92,10 +104,15 @@ fun CommandListScreen(
 
     LaunchedEffect(uiState) {
         val successState = uiState as? CommandListUiState.Success
-        if (successState != null &&
-            !successState.remotePanel.hasContent &&
-            selectedTab == CommandListTab.Remote
-        ) {
+        if (successState != null) {
+            val remoteEnabled = successState.commands.isNotEmpty()
+            if (!remoteEnabled && selectedTab == CommandListTab.Remote) {
+                selectedTab = CommandListTab.List
+            }
+            if (!remoteEnabled && isEditingRemote) {
+                isEditingRemote = false
+            }
+        } else if (selectedTab == CommandListTab.Remote) {
             selectedTab = CommandListTab.List
         }
     }
@@ -169,28 +186,41 @@ fun CommandListScreen(
                     if (state.commands.isEmpty()) {
                         EmptyCommandsView()
                     } else {
-                        val availableTabs = if (state.remotePanel.hasContent) {
-                            listOf(CommandListTab.List, CommandListTab.Remote)
-                        } else {
-                            listOf(CommandListTab.List)
+                        val availableTabs = listOf(CommandListTab.List, CommandListTab.Remote)
+
+                        LaunchedEffect(state.remoteLayoutSpec, isEditingRemote) {
+                            if (!isEditingRemote) {
+                                layoutDraft = (state.remoteLayoutSpec ?: RemoteLayoutSpec.withDefaultSections())
+                            }
                         }
 
-                        if (availableTabs.size > 1) {
-                            CommandListTabRow(
-                                tabs = availableTabs,
-                                selectedTab = selectedTab,
-                                onTabSelected = { selectedTab = it }
-                            )
-                            Spacer(modifier = Modifier.height(12.dp))
-                        }
+                        CommandListTabRow(
+                            tabs = availableTabs,
+                            selectedTab = selectedTab,
+                            onTabSelected = { selectedTab = it }
+                        )
+                        Spacer(modifier = Modifier.height(12.dp))
 
-                        if (selectedTab == CommandListTab.Remote && state.remotePanel.hasContent) {
-                            val scrollState = rememberScrollState()
-                            RemotePanelScreen(
-                                uiModel = state.remotePanel,
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .verticalScroll(scrollState)
+                        if (selectedTab == CommandListTab.Remote) {
+                            RemoteTabContent(
+                                state = state,
+                                isEditing = isEditingRemote,
+                                layoutDraft = layoutDraft,
+                                onEditToggle = { editing ->
+                                    if (editing) {
+                                        layoutDraft = state.remoteLayoutSpec ?: RemoteLayoutSpec.withDefaultSections()
+                                    }
+                                    isEditingRemote = editing
+                                },
+                                onDraftChanged = { layoutDraft = it },
+                                onSave = {
+                                    viewModel.saveRemoteLayoutSpec(layoutDraft)
+                                    isEditingRemote = false
+                                },
+                                onReset = {
+                                    layoutDraft = RemoteLayoutSpec.withDefaultSections()
+                                },
+                                modifier = Modifier.fillMaxSize()
                             )
                         } else {
                             CommandListContent(
@@ -272,6 +302,128 @@ private fun CommandListTabRow(
                 onClick = { onTabSelected(tab) },
                 text = { Text(label) }
             )
+        }
+    }
+}
+
+@Composable
+private fun RemoteTabContent(
+    state: CommandListUiState.Success,
+    isEditing: Boolean,
+    layoutDraft: RemoteLayoutSpec,
+    onEditToggle: (Boolean) -> Unit,
+    onDraftChanged: (RemoteLayoutSpec) -> Unit,
+    onSave: () -> Unit,
+    onReset: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier = modifier) {
+        if (isEditing) {
+            RemoteLayoutBuilderScreen(
+                commands = state.commands,
+                initialSpec = layoutDraft,
+                onSpecChanged = onDraftChanged,
+                modifier = Modifier.fillMaxSize()
+            )
+
+            BuilderActionBar(
+                onCancel = { onEditToggle(false) },
+                onReset = onReset,
+                onSave = onSave,
+                modifier = Modifier.align(Alignment.BottomCenter)
+            )
+        } else {
+            if (state.remotePanel.hasContent) {
+                val scrollState = rememberScrollState()
+                RemotePanelScreen(
+                    uiModel = state.remotePanel,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .verticalScroll(scrollState)
+                )
+            } else {
+                RemotePanelPlaceholder(
+                    modifier = Modifier.align(Alignment.Center),
+                    onStartEdit = { onEditToggle(true) }
+                )
+            }
+
+            FloatingActionButton(
+                onClick = { onEditToggle(true) },
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(16.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Edit,
+                    contentDescription = "Customize Remote"
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun BuilderActionBar(
+    onCancel: () -> Unit,
+    onReset: () -> Unit,
+    onSave: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.95f))
+            .padding(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        TextButton(onClick = onCancel) {
+            Text("Cancel")
+        }
+        OutlinedButton(onClick = onReset) {
+            Text("Reset")
+        }
+        Spacer(modifier = Modifier.weight(1f))
+        Button(onClick = onSave) {
+            Icon(imageVector = Icons.Default.Save, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Save")
+        }
+    }
+}
+
+@Composable
+private fun RemotePanelPlaceholder(
+    modifier: Modifier = Modifier,
+    onStartEdit: () -> Unit
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            imageVector = Icons.Default.Edit,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(48.dp)
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Text(
+            text = "No remote layout yet",
+            style = MaterialTheme.typography.titleMedium
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Drag commands from the library to craft your control panel.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Button(onClick = onStartEdit) {
+            Text("Start Customizing")
         }
     }
 }

@@ -31,6 +31,37 @@ data class RemoteLayoutSpec(
         @SerialName("telemetry")
         TELEMETRY
     }
+
+    companion object {
+        const val QUICK_ACTIONS_SECTION_ID = "quick_actions"
+        const val ADJUSTMENTS_SECTION_ID = "adjustments"
+        const val TELEMETRY_SECTION_ID = "telemetry"
+
+        fun withDefaultSections(): RemoteLayoutSpec {
+            return RemoteLayoutSpec(
+                sections = listOf(
+                    SectionSpec(
+                        id = QUICK_ACTIONS_SECTION_ID,
+                        type = SectionType.QUICK_ACTIONS,
+                        title = "Quick Actions",
+                        entries = emptyList()
+                    ),
+                    SectionSpec(
+                        id = ADJUSTMENTS_SECTION_ID,
+                        type = SectionType.ADJUSTMENTS,
+                        title = "Adjustments",
+                        entries = emptyList()
+                    ),
+                    SectionSpec(
+                        id = TELEMETRY_SECTION_ID,
+                        type = SectionType.TELEMETRY,
+                        title = "Telemetry",
+                        entries = emptyList()
+                    )
+                )
+            )
+        }
+    }
 }
 
 @Serializable

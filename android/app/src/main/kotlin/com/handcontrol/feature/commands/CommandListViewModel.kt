@@ -405,12 +405,9 @@ class CommandListViewModel @Inject constructor(
         showOutputOverride: Boolean? = null
     ) {
         val showOutput = showOutputOverride ?: command.showOutput
-        if (!showOutput) {
-            viewModelScope.launch {
-                _toastMessage.emit("${command.name} sent")
-            }
-        }
 
+        // Visual feedback is handled by UI component
+        // Toast notification is shown on completion in executeCommandWithMode
         executeCommandWithMode(
             commandId = command.id,
             commandName = command.name,

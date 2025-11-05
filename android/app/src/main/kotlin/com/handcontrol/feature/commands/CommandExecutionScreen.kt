@@ -203,6 +203,10 @@ fun CommandExecutionScreen(
                                 onExecute = {
                                     val params = parameterStates.mapValues { it.value.currentValue }
                                     viewModel.triggerQuickCommand(cmd, params)
+                                    // Navigate back immediately if command doesn't show output
+                                    if (!cmd.showOutput) {
+                                        onNavigateBack()
+                                    }
                                 },
                                 canExecute = isFormValid
                             )

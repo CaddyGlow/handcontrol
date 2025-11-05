@@ -121,7 +121,7 @@ class GrpcCommandRepository @Inject constructor(
                             )
                         },
                         requiresConfirmation = if (protoCommand.hasRequiresConfirmation()) protoCommand.requiresConfirmation else false,
-                        showOutput = if (protoCommand.hasShowOutput()) protoCommand.showOutput else true
+                        showOutput = if (protoCommand.hasShowOutput()) protoCommand.showOutput else false
                     )
                 }
                 Timber.i("Loaded ${commands.size} commands from server")

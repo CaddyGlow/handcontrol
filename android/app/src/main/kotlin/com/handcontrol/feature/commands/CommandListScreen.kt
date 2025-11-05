@@ -66,6 +66,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.ui.components.CommandConfirmationDialog
+import com.handcontrol.ui.components.CommandExecutionFeedback
 import com.handcontrol.ui.theme.HandControlTheme
 import kotlinx.coroutines.flow.collectLatest
 import com.handcontrol.feature.commands.remote.RemoteLayoutBuilderScreen
@@ -91,6 +92,7 @@ fun CommandListScreen(
     var selectedTab by remember { mutableStateOf(CommandListTab.List) }
     var isEditingRemote by rememberSaveable { mutableStateOf(false) }
     var layoutDraft by remember(serverId) { mutableStateOf(RemoteLayoutSpec.withDefaultSections()) }
+    var feedbackCommandId by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(Unit) {
         viewModel.loadCommands(serverId)
@@ -238,6 +240,9 @@ fun CommandListScreen(
                                             )
                                             if (action.showOutput) {
                                                 onNavigateToCommandExecution(serverId, command.id)
+                                            } else {
+                                                // Fire-and-forget from remote panel
+                                                feedbackCommandId = command.id
                                             }
                                         }
                                     }
@@ -261,9 +266,14 @@ fun CommandListScreen(
                                         onShowConfirmation = {
                                             selectedCommand = command
                                             showConfirmationDialog = true
+                                        },
+                                        onShowFeedback = {
+                                            feedbackCommandId = command.id
                                         }
                                     )
-                                }
+                                },
+                                feedbackCommandId = feedbackCommandId,
+                                onDismissFeedback = { feedbackCommandId = null }
                             )
                         }
                     }
@@ -286,6 +296,9 @@ fun CommandListScreen(
                 )
                 if (cmd.showOutput) {
                     onNavigateToCommandExecution(serverId, cmd.id)
+                } else {
+                    // Fire-and-forget with confirmation - show visual feedback
+                    feedbackCommandId = cmd.id
                 }
                 showConfirmationDialog = false
                 selectedCommand = null
@@ -459,7 +472,8 @@ private fun handleCommandClick(
     command: Command,
     viewModel: CommandListViewModel,
     onNavigateToExecution: () -> Unit,
-    onShowConfirmation: () -> Unit
+    onShowConfirmation: () -> Unit,
+    onShowFeedback: () -> Unit = {}
 ) {
     when {
         // Has parameters - always show parameter screen
@@ -475,6 +489,9 @@ private fun handleCommandClick(
             viewModel.triggerQuickCommand(command)
             if (command.showOutput) {
                 onNavigateToExecution()
+            } else {
+                // Fire-and-forget - show visual feedback
+                onShowFeedback()
             }
         }
     }
@@ -585,6 +602,8 @@ private fun CommandListContent(
     searchQuery: String,
     onSearchQueryChange: (String) -> Unit,
     onCommandClick: (Command) -> Unit,
+    feedbackCommandId: String?,
+    onDismissFeedback: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(modifier = modifier.fillMaxSize()) {
@@ -634,7 +653,9 @@ private fun CommandListContent(
                 items(commands, key = { it.id }) { command ->
                     CommandCard(
                         command = command,
-                        onClick = { onCommandClick(command) }
+                        onClick = { onCommandClick(command) },
+                        showFeedback = feedbackCommandId == command.id,
+                        onDismissFeedback = onDismissFeedback
                     )
                 }
             }
@@ -646,59 +667,72 @@ private fun CommandListContent(
 private fun CommandCard(
     command: Command,
     onClick: () -> Unit,
+    showFeedback: Boolean = false,
+    onDismissFeedback: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    Card(
-        modifier = modifier
-            .fillMaxWidth()
-            .clickable(onClick = onClick),
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant
-        )
-    ) {
-        Row(
+    Box(modifier = modifier) {
+        Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Default.PlayArrow,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.primary,
-                modifier = Modifier.size(32.dp)
+                .clickable(onClick = onClick),
+            colors = CardDefaults.cardColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant
             )
-
-            Spacer(modifier = Modifier.width(16.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = command.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.PlayArrow,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(32.dp)
                 )
 
-                Spacer(modifier = Modifier.height(4.dp))
+                Spacer(modifier = Modifier.width(16.dp))
 
-                Text(
-                    text = command.description,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-
-                if (command.parameters.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "${command.parameters.size} parameter${if (command.parameters.size != 1) "s" else ""}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.secondary
+                        text = command.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Text(
+                        text = command.description,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+
+                    if (command.parameters.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text(
+                            text = "${command.parameters.size} parameter${if (command.parameters.size != 1) "s" else ""}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
                 }
             }
+        }
+
+        // Visual feedback overlay
+        if (showFeedback) {
+            CommandExecutionFeedback(
+                visible = true,
+                onDismiss = onDismissFeedback,
+                modifier = Modifier.matchParentSize()
+            )
         }
     }
 }
@@ -743,7 +777,9 @@ private fun CommandListContentPreview() {
             ),
             searchQuery = "",
             onSearchQueryChange = {},
-            onCommandClick = {}
+            onCommandClick = {},
+            feedbackCommandId = null,
+            onDismissFeedback = {}
         )
     }
 }

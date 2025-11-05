@@ -11,7 +11,7 @@ data class Command(
     val tags: List<String>,
     val parameters: List<CommandParameter>,
     val requiresConfirmation: Boolean = false,
-    val showOutput: Boolean = true
+    val showOutput: Boolean = false
 )
 
 /**

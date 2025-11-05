@@ -21,6 +21,7 @@ import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import org.junit.Test
 import java.io.IOException
 import java.security.cert.X509Certificate
@@ -160,6 +161,165 @@ class GrpcEnrollmentRepositoryTest {
                 allowSelfSignedTls = false,
                 pinnedCertSha256 = null
             )
+        }
+    }
+
+    @Test
+    fun `direct enrollment succeeds without invoking relay`() = runTest {
+        val context = mockk<Context>(relaxed = true)
+        val certificateManager = mockk<ClientCertificateManager>()
+        val mtlsFactory = mockk<MtlsGrpcChannelFactory>(relaxed = true)
+        val relayFactory = mockk<RelayGrpcChannelFactory>(relaxed = true)
+        val serverRepo = mockk<EnrolledServerRepository>(relaxed = true)
+
+        val clientCertificate = ClientCertificate(
+            certificateDer = byteArrayOf(4, 5, 6, 7),
+            privateKeyAlias = "alias"
+        )
+        coEvery { certificateManager.loadOrCreate() } returns clientCertificate
+        coEvery { certificateManager.pinServerFingerprint(any()) } returns Unit
+
+        val expectedServerId = "5b7b1f6e-7a97-4bb6-9f3d-4f0dcd2e4d55"
+        val handshakeCert = mockk<X509Certificate>()
+        val handshakeDer = byteArrayOf(8, 8, 8, 8)
+        every { handshakeCert.encoded } returns handshakeDer
+        val fingerprint = VerificationCodeGenerator.computeFingerprint(handshakeDer)
+
+        val directChannel = mockk<ManagedChannel>(relaxed = true)
+        val response = EnrollResponse.newBuilder()
+            .setSuccess(true)
+            .setClientId("client-999")
+            .build()
+
+        val repository = object : GrpcEnrollmentRepository(
+            context,
+            certificateManager,
+            mtlsFactory,
+            relayFactory,
+            serverRepo
+        ) {
+            var handled = false
+
+            override suspend fun openEnrollmentChannel(
+                host: String,
+                port: Int,
+                expectedFingerprint: String?
+            ): EnrollmentChannel {
+                return EnrollmentChannel(directChannel) { handshakeCert }
+            }
+
+            override suspend fun sendEnrollmentRequest(
+                channel: ManagedChannel,
+                request: com.handcontrol.grpc.EnrollRequest
+            ): EnrollResponse {
+                return response
+            }
+
+            override suspend fun handleSuccessfulEnrollment(
+                channel: ManagedChannel,
+                response: EnrollResponse,
+                fingerprint: String,
+                expectedServerId: String,
+                allHosts: List<String>,
+                port: Int,
+                relayOptions: RelayEnrollmentOptions?
+            ): EnrollmentResult {
+                handled = true
+                return EnrollmentResult.Success(response.clientId, expectedServerId)
+            }
+
+            override suspend fun shutdownEnrollmentChannel(channel: ManagedChannel) {
+                // no-op for test
+            }
+        }
+
+        val result = repository.enrollWithToken(
+            hosts = listOf("192.168.1.50"),
+            port = 50051,
+            token = UUID.randomUUID().toString(),
+            deviceName = "Unit Test",
+            expectedCertFingerprint = fingerprint,
+            expectedServerId = expectedServerId,
+            validUntil = Instant.now().plusSeconds(120),
+            relayOptions = null
+        )
+
+        assertTrue(result is EnrollmentResult.Success)
+        assertTrue(repository.handled)
+        coVerify(exactly = 0) {
+            relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
+        }
+    }
+
+    @Test
+    fun `direct enrollment propagates server error message`() = runTest {
+        val context = mockk<Context>(relaxed = true)
+        val certificateManager = mockk<ClientCertificateManager>()
+        val mtlsFactory = mockk<MtlsGrpcChannelFactory>(relaxed = true)
+        val relayFactory = mockk<RelayGrpcChannelFactory>(relaxed = true)
+        val serverRepo = mockk<EnrolledServerRepository>(relaxed = true)
+
+        val clientCertificate = ClientCertificate(
+            certificateDer = byteArrayOf(10, 11, 12),
+            privateKeyAlias = "alias"
+        )
+        coEvery { certificateManager.loadOrCreate() } returns clientCertificate
+        coEvery { certificateManager.pinServerFingerprint(any()) } returns Unit
+
+        val handshakeCert = mockk<X509Certificate>()
+        val handshakeDer = byteArrayOf(13, 13, 13)
+        every { handshakeCert.encoded } returns handshakeDer
+        val fingerprint = VerificationCodeGenerator.computeFingerprint(handshakeDer)
+
+        val directChannel = mockk<ManagedChannel>(relaxed = true)
+        val errorResponse = EnrollResponse.newBuilder()
+            .setSuccess(false)
+            .setErrorMessage("server denied enrollment")
+            .build()
+
+        val repository = object : GrpcEnrollmentRepository(
+            context,
+            certificateManager,
+            mtlsFactory,
+            relayFactory,
+            serverRepo
+        ) {
+            override suspend fun openEnrollmentChannel(
+                host: String,
+                port: Int,
+                expectedFingerprint: String?
+            ): EnrollmentChannel {
+                return EnrollmentChannel(directChannel) { handshakeCert }
+            }
+
+            override suspend fun sendEnrollmentRequest(
+                channel: ManagedChannel,
+                request: com.handcontrol.grpc.EnrollRequest
+            ): EnrollResponse {
+                return errorResponse
+            }
+
+            override suspend fun shutdownEnrollmentChannel(channel: ManagedChannel) {
+                // ignore
+            }
+        }
+
+        val result = repository.enrollWithToken(
+            hosts = listOf("192.168.1.60"),
+            port = 50051,
+            token = UUID.randomUUID().toString(),
+            deviceName = "Unit Test",
+            expectedCertFingerprint = fingerprint,
+            expectedServerId = "d87d1ce3-7f6d-4480-a966-efa7440db28f",
+            validUntil = Instant.now().plusSeconds(120),
+            relayOptions = null
+        )
+
+        assertTrue(result is EnrollmentResult.Error)
+        result as EnrollmentResult.Error
+        assertEquals("server denied enrollment", result.message)
+        coVerify(exactly = 0) {
+            relayFactory.createChannelViaRelay(any(), any(), any(), any(), any(), any(), any(), any())
         }
     }
 }

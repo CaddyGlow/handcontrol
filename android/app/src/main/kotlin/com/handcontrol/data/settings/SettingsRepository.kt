@@ -1,5 +1,6 @@
 package com.handcontrol.data.settings
 
+import com.handcontrol.data.database.ConnectionPreference
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -67,6 +68,14 @@ class SettingsRepository @Inject constructor(
     suspend fun updateNetworkDiagnostics(enabled: Boolean): Result<Unit> {
         return dataStore.updateNetworkDiagnostics(enabled).onFailure {
             _settingsError.value = "Failed to save network diagnostics setting"
+        }
+    }
+
+    suspend fun updateDefaultConnectionPreference(
+        preference: ConnectionPreference
+    ): Result<Unit> {
+        return dataStore.updateDefaultConnectionPreference(preference).onFailure {
+            _settingsError.value = "Failed to save default connection preference"
         }
     }
 

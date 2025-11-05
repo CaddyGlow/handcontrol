@@ -15,6 +15,7 @@ import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.BuildConfig
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.settings.*
 import com.handcontrol.feature.settings.components.*
 
@@ -73,6 +74,14 @@ fun SettingsScreen(
                         selectedOption = settings.ipv6Preference,
                         options = IpPreference.entries.toList(),
                         onOptionSelected = viewModel::updateIpv6Preference,
+                        optionLabel = { it.toDisplayString() }
+                    )
+                    DropdownPreference(
+                        title = "Default Connection Mode",
+                        description = "Applies when a server is set to Auto",
+                        selectedOption = settings.defaultConnectionPreference,
+                        options = ConnectionPreference.entries.toList(),
+                        onOptionSelected = viewModel::updateDefaultConnectionPreference,
                         optionLabel = { it.toDisplayString() }
                     )
                     SliderPreference(

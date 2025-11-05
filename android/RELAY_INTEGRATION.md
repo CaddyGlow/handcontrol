@@ -169,8 +169,7 @@ Test end-to-end flow:
 
 1. **No Token Refresh**: Clients must re-enroll when relay tokens expire (currently 24 hours)
 2. **No Relay Certificate Validation**: Relay server certificate is accepted without validation
-3. **Connection Mode Not Persisted**: `lastConnectionMode` field exists but not yet updated after connections
-4. **No User Preferences**: Cannot force relay or disable relay (always tries direct first)
+3. **No User Preferences**: Cannot force relay or disable relay (always tries direct first)
 
 ## Future Work
 
@@ -179,10 +178,8 @@ Test end-to-end flow:
 1. **Integration**:
    - Update `GrpcCommandRepository` to use `ServerConnectionManager`
    - Update `ServerHealthCheckerImpl` to use `ServerConnectionManager`
-   - Persist connection mode after successful connection
 
 2. **User Settings**:
-   - Add relay preference: Auto (default), Force Relay, Disable Relay
    - Show connection statistics (direct vs relay usage)
 
 3. **Testing**:

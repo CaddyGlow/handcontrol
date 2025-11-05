@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.handcontrol.core.logging.LogCollectorTree
+import com.handcontrol.data.database.ConnectionPreference
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.data.settings.*
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -82,6 +83,12 @@ class SettingsViewModel @Inject constructor(
     fun updateNetworkDiagnostics(enabled: Boolean) {
         viewModelScope.launch {
             settingsRepository.updateNetworkDiagnostics(enabled)
+        }
+    }
+
+    fun updateDefaultConnectionPreference(preference: ConnectionPreference) {
+        viewModelScope.launch {
+            settingsRepository.updateDefaultConnectionPreference(preference)
         }
     }
 

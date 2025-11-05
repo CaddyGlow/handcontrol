@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
+import com.handcontrol.data.database.ConnectionPreference
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
@@ -28,6 +29,8 @@ class SettingsDataStore @Inject constructor(
         val LOG_LEVEL = stringPreferencesKey("log_level")
         val ENABLE_NETWORK_LOGGING = booleanPreferencesKey("enable_network_logging")
         val ENABLE_NETWORK_DIAGNOSTICS = booleanPreferencesKey("enable_network_diagnostics")
+        val DEFAULT_CONNECTION_PREFERENCE =
+            stringPreferencesKey("default_connection_preference")
     }
 
     val settings: Flow<AppSettings> = context.dataStore.data
@@ -49,8 +52,11 @@ class SettingsDataStore @Inject constructor(
                 discoveryTimeoutSeconds = prefs[Keys.DISCOVERY_TIMEOUT] ?: 5,
                 logLevel = LogLevel.valueOf(prefs[Keys.LOG_LEVEL] ?: LogLevel.INFO.name),
                 enableNetworkLogging = prefs[Keys.ENABLE_NETWORK_LOGGING] ?: false,
-                enableNetworkDiagnostics = prefs[Keys.ENABLE_NETWORK_DIAGNOSTICS] ?: false
-            )
+                enableNetworkDiagnostics = prefs[Keys.ENABLE_NETWORK_DIAGNOSTICS] ?: false,
+                defaultConnectionPreference = ConnectionPreference.valueOf(
+                    prefs[Keys.DEFAULT_CONNECTION_PREFERENCE] ?: ConnectionPreference.AUTO.name
+                )
+        )
         }
 
     suspend fun updateTheme(theme: Theme): Result<Unit> = runCatching {
@@ -132,6 +138,17 @@ class SettingsDataStore @Inject constructor(
         Unit
     }.onFailure { e ->
         Timber.e(e, "Failed to update network diagnostics setting")
+    }
+
+    suspend fun updateDefaultConnectionPreference(
+        preference: ConnectionPreference
+    ): Result<Unit> = runCatching {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.DEFAULT_CONNECTION_PREFERENCE] = preference.name
+        }
+        Unit
+    }.onFailure { e ->
+        Timber.e(e, "Failed to update default connection preference")
     }
 
     suspend fun resetToDefaults(): Result<Unit> = runCatching {

@@ -1,5 +1,7 @@
 package com.handcontrol.data.settings
 
+import com.handcontrol.data.database.ConnectionPreference
+
 data class AppSettings(
     val theme: Theme = Theme.SYSTEM,
     val enableRelayFallback: Boolean = true,
@@ -9,7 +11,8 @@ data class AppSettings(
     val discoveryTimeoutSeconds: Int = 5,
     val logLevel: LogLevel = LogLevel.INFO,
     val enableNetworkLogging: Boolean = false,
-    val enableNetworkDiagnostics: Boolean = false
+    val enableNetworkDiagnostics: Boolean = false,
+    val defaultConnectionPreference: ConnectionPreference = ConnectionPreference.AUTO
 )
 
 enum class Theme {
@@ -45,4 +48,10 @@ fun IpPreference.toDisplayString(): String = when (this) {
     IpPreference.IPV4_PREFERRED -> "IPv4 Preferred"
     IpPreference.IPV6_ONLY -> "IPv6 Only"
     IpPreference.IPV4_ONLY -> "IPv4 Only"
+}
+
+fun ConnectionPreference.toDisplayString(): String = when (this) {
+    ConnectionPreference.AUTO -> "Auto (direct then relay)"
+    ConnectionPreference.DIRECT_ONLY -> "Direct only"
+    ConnectionPreference.RELAY_ONLY -> "Relay only"
 }

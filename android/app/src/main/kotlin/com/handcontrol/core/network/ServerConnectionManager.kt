@@ -81,7 +81,10 @@ class ServerConnectionManager @Inject constructor(
         Timber.i("Connecting to server ${server.serverName} (${server.serverId})")
 
         val settings = settingsRepository.settings.first()
-        val preference = preferenceOverride ?: server.connectionPreference
+        val preference = preferenceOverride ?: when (server.connectionPreference) {
+            ConnectionPreference.AUTO -> settings.defaultConnectionPreference
+            else -> server.connectionPreference
+        }
         val preferRelay = preference == ConnectionPreference.RELAY_ONLY
         val allowRelayFallback = preference != ConnectionPreference.DIRECT_ONLY
         val directTimeoutMs = TimeUnit.SECONDS.toMillis(

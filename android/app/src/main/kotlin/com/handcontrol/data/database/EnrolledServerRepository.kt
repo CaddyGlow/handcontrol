@@ -23,7 +23,8 @@ class EnrolledServerRepository @Inject constructor(
         certFingerprint: String,
         relayEnabled: Boolean = false,
         relayUrl: String? = null,
-        relayToken: String? = null
+        relayToken: String? = null,
+        initialConnectionMode: ConnectionMode = ConnectionMode.UNKNOWN
     ) {
         // Convert single host to list for backward compatibility
         val server = EnrolledServerEntity(
@@ -39,7 +40,8 @@ class EnrolledServerRepository @Inject constructor(
             relayEnabled = relayEnabled,
             relayUrl = relayUrl,
             relayToken = relayToken,
-            connectionPreference = ConnectionPreference.AUTO
+            connectionPreference = ConnectionPreference.AUTO,
+            lastConnectionMode = initialConnectionMode
         )
         enrolledServerDao.insertServer(server)
     }

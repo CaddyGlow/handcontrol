@@ -11,6 +11,7 @@ import com.handcontrol.core.network.MtlsSslContextFactory
 import com.handcontrol.core.security.ClientCertificate
 import com.handcontrol.core.security.ClientCertificateManager
 import com.handcontrol.core.security.VerificationCodeGenerator
+import com.handcontrol.data.database.ConnectionMode
 import com.handcontrol.data.database.EnrolledServerRepository
 import com.handcontrol.grpc.CheckPairingStatusRequest
 import com.handcontrol.grpc.EnrollRequest
@@ -264,7 +265,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                         certFingerprint = fingerprint,
                         relayEnabled = relayEnabled,
                         relayUrl = relayUrl,
-                        relayToken = relayToken
+                        relayToken = relayToken,
+                        initialConnectionMode = ConnectionMode.DIRECT
                     )
                     Timber.i(
                         "Server info saved: serverId=%s, hostname=%s, relay=%s",
@@ -494,7 +496,8 @@ class GrpcEnrollmentRepository @Inject constructor(
                             certFingerprint = fingerprint,
                             relayEnabled = relayEnabled,
                             relayUrl = relayUrl,
-                            relayToken = relayToken
+                            relayToken = relayToken,
+                            initialConnectionMode = ConnectionMode.DIRECT
                         )
                         Timber.i("Server info saved: serverId=$serverId, hostname=${serverInfo.hostname}, relay=${relayEnabled}")
                     } catch (e: Exception) {

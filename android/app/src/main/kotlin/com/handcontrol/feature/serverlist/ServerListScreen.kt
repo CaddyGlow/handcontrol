@@ -49,6 +49,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.handcontrol.data.database.ConnectionMode
 import com.handcontrol.data.database.EnrolledServerEntity
 import com.handcontrol.ui.theme.HandControlTheme
 import java.text.SimpleDateFormat
@@ -242,6 +243,43 @@ private fun ServerCard(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
+                val (modeIcon, modeLabel, modeTint) = when (server.lastConnectionMode) {
+                    ConnectionMode.DIRECT -> Triple(
+                        Icons.Filled.Wifi,
+                        "Last connection: Direct",
+                        MaterialTheme.colorScheme.primary
+                    )
+                    ConnectionMode.RELAY -> Triple(
+                        Icons.Filled.Cloud,
+                        "Last connection: Relay",
+                        MaterialTheme.colorScheme.primary
+                    )
+                    ConnectionMode.UNKNOWN -> Triple(
+                        Icons.Filled.Computer,
+                        "Last connection: Pending",
+                        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+                    )
+                }
+
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Icon(
+                        imageVector = modeIcon,
+                        contentDescription = modeLabel,
+                        tint = modeTint,
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Text(
+                        text = modeLabel,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = modeTint
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(4.dp))
+
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -265,7 +303,7 @@ private fun ServerCard(
                                 modifier = Modifier.size(14.dp)
                             )
                             Text(
-                                text = "Relay",
+                                text = "Relay ready",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.secondary
                             )
@@ -276,6 +314,11 @@ private fun ServerCard(
                             contentDescription = "Direct connection only",
                             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
                             modifier = Modifier.size(14.dp)
+                        )
+                        Text(
+                            text = "Direct only",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
                         )
                     }
                 }

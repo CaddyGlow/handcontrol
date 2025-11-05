@@ -2527,6 +2527,53 @@ fn move_selection_down(app: &mut App) {
     );
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_token_expiry_returns_none_when_missing() {
+        let payload = r#"{"server_id":"abc"}"#;
+        let expiry = extract_token_expiry(payload).unwrap();
+        assert!(expiry.is_none());
+    }
+
+    #[test]
+    fn extract_token_expiry_parses_rfc3339_timestamp() {
+        let future = OffsetDateTime::now_utc() + TimeDuration::seconds(90);
+        let formatted = future.format(&Rfc3339).unwrap();
+        let payload = format!(r#"{{"valid_until":"{}"}}"#, formatted);
+        let parsed = extract_token_expiry(&payload)
+            .unwrap()
+            .expect("expected expiry");
+        assert_eq!(parsed, future);
+    }
+
+    #[test]
+    fn extract_token_expiry_errors_on_non_string() {
+        let payload = r#"{"valid_until":123}"#;
+        let err = extract_token_expiry(payload).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("valid_until must be a string"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn format_remaining_formats_minutes_and_seconds() {
+        let display = format_remaining(TimeDuration::seconds(125));
+        assert_eq!(display, "2m 05s");
+    }
+
+    #[test]
+    fn format_remaining_handles_sub_minute() {
+        assert_eq!(format_remaining(TimeDuration::seconds(12)), "12s");
+        assert_eq!(format_remaining(TimeDuration::seconds(0)), "0s");
+        assert_eq!(format_remaining(TimeDuration::seconds(-5)), "0s");
+    }
+}
+
 fn insert_char_at(target: &mut String, index: usize, ch: char) {
     let len = target.chars().count();
     if index >= len {

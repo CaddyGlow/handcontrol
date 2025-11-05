@@ -6,6 +6,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import androidx.annotation.VisibleForTesting
 import com.google.protobuf.ByteString
 import com.handcontrol.core.network.MtlsSslContextFactory
 import com.handcontrol.core.network.RelayConnectionException
@@ -50,7 +51,7 @@ private val Context.enrollmentDataStore: DataStore<Preferences> by preferencesDa
 )
 
 @Singleton
-class GrpcEnrollmentRepository @Inject constructor(
+open class GrpcEnrollmentRepository @Inject constructor(
     @ApplicationContext private val context: Context,
     private val certificateManager: ClientCertificateManager,
     private val channelFactory: com.handcontrol.core.network.MtlsGrpcChannelFactory,
@@ -60,7 +61,7 @@ class GrpcEnrollmentRepository @Inject constructor(
 
     private val CLIENT_ID_KEY = stringPreferencesKey("client_id")
 
-    private data class EnrollmentChannel(
+    protected data class EnrollmentChannel(
         val channel: ManagedChannel,
         val serverCertificateProvider: () -> X509Certificate?
     )
@@ -255,16 +256,14 @@ class GrpcEnrollmentRepository @Inject constructor(
                 val channel = enrollmentChannel.channel
                 Timber.d("tryEnrollWithHost: Unauthenticated gRPC channel created")
 
-                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
                 Timber.d("tryEnrollWithHost: Sending enrollment request")
-
                 val request = EnrollRequest.newBuilder()
                     .setEnrollmentToken(token)
                     .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
                     .setDeviceName(deviceName)
                     .build()
 
-                val response = stub.enroll(request)
+                val response = sendEnrollmentRequest(channel, request)
                 Timber.d("tryEnrollWithHost: Enrollment RPC completed, success=%s", response.success)
 
                 val serverCert = enrollmentChannel.serverCertificateProvider()
@@ -381,14 +380,13 @@ class GrpcEnrollmentRepository @Inject constructor(
                 pinnedCertSha256 = options.pinnedCertSha256
             )
 
-            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
             val request = EnrollRequest.newBuilder()
                 .setEnrollmentToken(token)
                 .setClientCertificate(ByteString.copyFrom(certificate.certificateDer))
                 .setDeviceName(deviceName)
                 .build()
 
-            val response = stub.enroll(request)
+            val response = sendEnrollmentRequest(channel, request)
             Timber.d("Relay enrollment RPC completed, success=%s", response.success)
 
             val serverCert = relayChannelFactory.getServerCertificate(channel)
@@ -452,7 +450,17 @@ class GrpcEnrollmentRepository @Inject constructor(
         }
     }
 
-    private suspend fun handleSuccessfulEnrollment(
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    protected open suspend fun sendEnrollmentRequest(
+        channel: ManagedChannel,
+        request: EnrollRequest
+    ): com.handcontrol.grpc.EnrollResponse {
+        val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
+        return stub.enroll(request)
+    }
+
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    protected open suspend fun handleSuccessfulEnrollment(
         channel: ManagedChannel,
         response: com.handcontrol.grpc.EnrollResponse,
         fingerprint: String,
@@ -547,7 +555,8 @@ class GrpcEnrollmentRepository @Inject constructor(
         return EnrollmentResult.Success(response.clientId, serverId)
     }
 
-    private fun computeDefaultRelayAuthority(hosts: List<String>, port: Int): String {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    protected fun computeDefaultRelayAuthority(hosts: List<String>, port: Int): String {
         val host = hosts.firstOrNull()?.trim()?.takeIf { it.isNotEmpty() } ?: "handcontrol.local"
         val authority = if (host.contains(":") && !host.startsWith("[")) {
             "[$host]"
@@ -827,7 +836,8 @@ class GrpcEnrollmentRepository @Inject constructor(
         return stub.getServerInfo(ServerInfoRequest.getDefaultInstance())
     }
 
-    private suspend fun openEnrollmentChannel(
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    protected open suspend fun openEnrollmentChannel(
         host: String,
         port: Int,
         expectedFingerprint: String?
@@ -861,7 +871,8 @@ class GrpcEnrollmentRepository @Inject constructor(
         return EnrollmentChannel(channel) { capturedCert }
     }
 
-    private suspend fun shutdownEnrollmentChannel(channel: ManagedChannel) {
+    @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+    protected open suspend fun shutdownEnrollmentChannel(channel: ManagedChannel) {
         withContext(Dispatchers.IO) {
             try {
                 channel.shutdown()

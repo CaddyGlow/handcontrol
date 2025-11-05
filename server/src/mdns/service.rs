@@ -1,20 +1,23 @@
 use anyhow::{Context, Result};
-use mdns_sd::{ServiceDaemon, ServiceInfo};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 const SERVICE_TYPE: &str = "_handcontrol._tcp.local.";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const SERVICE_TYPE_NO_DOMAIN: &str = "_handcontrol._tcp";
 const TXT_RECORD_VERSION: &str = "1.0";
 const DEFAULT_HOST_LABEL: &str = "handcontrol";
 
 /// mDNS service manager for HandControl server
 ///
 /// Advertises the HandControl server on the local network using mDNS/DNS-SD.
-/// Clients can discover the server using the _handcontrol._tcp.local. service type.
+/// The concrete backend is chosen at runtime:
+///   * macOS -> delegates to the system Bonjour daemon via `dns-sd`
+///   * Linux -> prefers Avahi (`avahi-publish-service`) when available
+///   * all other platforms -> embedded `mdns-sd` crate
 pub struct MdnsService {
-    daemon: Arc<Mutex<Option<ServiceDaemon>>>,
+    handle: Arc<Mutex<Option<platform::Handle>>>,
     instance_name: String,
     port: u16,
     server_id: Uuid,
@@ -23,12 +26,6 @@ pub struct MdnsService {
 
 impl MdnsService {
     /// Create a new mDNS service manager
-    ///
-    /// # Arguments
-    /// * `instance_name` - Human-readable instance name (e.g., hostname or user-configured name)
-    /// * `port` - TCP port the gRPC server is listening on
-    /// * `server_id` - UUID identifying this server instance
-    /// * `cert_fingerprint` - SHA256 fingerprint of the server certificate (format: "SHA256:hex")
     pub fn new(
         instance_name: String,
         port: u16,
@@ -36,7 +33,7 @@ impl MdnsService {
         cert_fingerprint: String,
     ) -> Self {
         Self {
-            daemon: Arc::new(Mutex::new(None)),
+            handle: Arc::new(Mutex::new(None)),
             instance_name,
             port,
             server_id,
@@ -45,59 +42,26 @@ impl MdnsService {
     }
 
     /// Start the mDNS service and register the HandControl service
-    ///
-    /// This will advertise the server on all network interfaces.
-    /// TXT records include:
-    /// - version: Protocol version (1.0)
-    /// - server_id: UUID of this server
-    /// - cert_fingerprint: SHA256 fingerprint of server certificate
     pub fn start(&self) -> Result<()> {
         info!("Starting mDNS service...");
 
-        // Create the mDNS daemon
-        let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
+        if self.is_running() {
+            warn!("mDNS service already running, restarting with updated configuration");
+            self.stop()
+                .context("Failed to stop existing mDNS service before restart")?;
+        }
 
-        // Prepare TXT records
-        let mut properties = HashMap::new();
-        properties.insert("version".to_string(), TXT_RECORD_VERSION.to_string());
-        properties.insert("server_id".to_string(), self.server_id.to_string());
-        properties.insert(
-            "cert_fingerprint".to_string(),
-            self.cert_fingerprint.clone(),
-        );
+        let txt_records = self.build_txt_records();
+        let (handle, backend_name) = platform::start(&self.instance_name, self.port, &txt_records)
+            .context("Failed to activate mDNS backend")?;
 
-        debug!(
-            "mDNS TXT records: version={}, server_id={}, cert_fingerprint={}",
-            TXT_RECORD_VERSION, self.server_id, self.cert_fingerprint
-        );
-
-        let host_name = derive_host_name();
-
-        // Create service info
-        // Note: mdns-sd will automatically determine the host's IP addresses
-        let service_info = ServiceInfo::new(
-            SERVICE_TYPE,
-            &self.instance_name,
-            &host_name,
-            (), // Use default IP (all interfaces)
-            self.port,
-            Some(properties),
-        )
-        .context("Failed to create mDNS service info")?;
-        let service_info = service_info.enable_addr_auto();
-
-        // Register the service
-        daemon
-            .register(service_info)
-            .context("Failed to register mDNS service")?;
-
+        debug!("mDNS TXT records: {:?}", txt_records);
         info!(
-            "mDNS service registered: {} at port {} ({})",
-            self.instance_name, self.port, SERVICE_TYPE
+            "mDNS service registered: {} at port {} ({}) via {}",
+            self.instance_name, self.port, SERVICE_TYPE, backend_name
         );
 
-        // Store daemon
-        *self.daemon.lock().unwrap() = Some(daemon);
+        *self.handle.lock().unwrap() = Some(handle);
 
         Ok(())
     }
@@ -106,14 +70,10 @@ impl MdnsService {
     pub fn stop(&self) -> Result<()> {
         info!("Stopping mDNS service...");
 
-        let mut daemon_guard = self.daemon.lock().unwrap();
+        let mut guard = self.handle.lock().unwrap();
 
-        if let Some(daemon) = daemon_guard.take() {
-            // Shutdown the daemon (this automatically unregisters all services)
-            daemon
-                .shutdown()
-                .context("Failed to shutdown mDNS daemon")?;
-
+        if let Some(handle) = guard.take() {
+            handle.stop()?;
             info!("mDNS service stopped");
         } else {
             warn!("mDNS service was not running");
@@ -124,12 +84,10 @@ impl MdnsService {
 
     /// Check if the mDNS service is currently running
     pub fn is_running(&self) -> bool {
-        self.daemon.lock().unwrap().is_some()
+        self.handle.lock().unwrap().is_some()
     }
 
     /// Update the service registration (for config reload)
-    ///
-    /// This stops the current service and starts a new one with updated parameters.
     pub fn update(
         &mut self,
         instance_name: String,
@@ -139,23 +97,29 @@ impl MdnsService {
     ) -> Result<()> {
         info!("Updating mDNS service registration...");
 
-        // Stop existing service
-        if self.is_running() {
-            self.stop()
-                .context("Failed to stop existing mDNS service")?;
-        }
+        self.stop()
+            .context("Failed to stop existing mDNS service")?;
 
-        // Update parameters
         self.instance_name = instance_name;
         self.port = port;
         self.server_id = server_id;
         self.cert_fingerprint = cert_fingerprint;
 
-        // Restart with new parameters
         self.start()
             .context("Failed to restart mDNS service with new parameters")?;
 
         Ok(())
+    }
+
+    fn build_txt_records(&self) -> Vec<(String, String)> {
+        vec![
+            ("version".to_string(), TXT_RECORD_VERSION.to_string()),
+            ("server_id".to_string(), self.server_id.to_string()),
+            (
+                "cert_fingerprint".to_string(),
+                self.cert_fingerprint.clone(),
+            ),
+        ]
     }
 }
 
@@ -208,6 +172,250 @@ fn sanitize_host_label(input: &str) -> String {
     label
 }
 
+mod platform {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::SERVICE_TYPE_NO_DOMAIN;
+    use super::{Result, SERVICE_TYPE, derive_host_name};
+    use anyhow::Context;
+    use mdns_sd::{ServiceDaemon, ServiceInfo};
+    use std::collections::HashMap;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::io::{self, Read};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::process::{Child, Command, Stdio};
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::thread;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use std::time::Duration;
+    use tracing::{info, warn};
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use anyhow::bail;
+
+    pub enum Handle {
+        Internal(ServiceDaemon),
+        #[cfg(target_os = "macos")]
+        Bonjour {
+            child: Child,
+        },
+        #[cfg(target_os = "linux")]
+        Avahi {
+            child: Child,
+        },
+    }
+
+    impl Handle {
+        pub fn backend_name(&self) -> &'static str {
+            match self {
+                Handle::Internal(..) => "embedded-mdns-sd",
+                #[cfg(target_os = "macos")]
+                Handle::Bonjour { .. } => "dns-sd",
+                #[cfg(target_os = "linux")]
+                Handle::Avahi { .. } => "avahi",
+            }
+        }
+
+        pub fn stop(self) -> Result<()> {
+            match self {
+                Handle::Internal(daemon) => {
+                    let receiver = daemon
+                        .shutdown()
+                        .context("Failed to shutdown mDNS daemon")?;
+                    drop(receiver);
+                    Ok(())
+                }
+                #[cfg(target_os = "macos")]
+                Handle::Bonjour { mut child } => stop_child(&mut child, "dns-sd"),
+                #[cfg(target_os = "linux")]
+                Handle::Avahi { mut child } => stop_child(&mut child, "avahi-publish-service"),
+            }
+        }
+    }
+
+    pub fn start(
+        instance_name: &str,
+        port: u16,
+        txt_records: &[(String, String)],
+    ) -> Result<(Handle, &'static str)> {
+        #[cfg(target_os = "macos")]
+        {
+            let handle = start_macos(instance_name, port, txt_records)?;
+            let backend_name = handle.backend_name();
+            return Ok((handle, backend_name));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            match start_avahi(instance_name, port, txt_records) {
+                Ok(handle) => {
+                    let backend_name = handle.backend_name();
+                    return Ok((handle, backend_name));
+                }
+                Err(err) => {
+                    warn!(
+                        "Failed to publish mDNS via Avahi (falling back to embedded mdns-sd): {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        let handle = start_internal(instance_name, port, txt_records)?;
+        let backend_name = handle.backend_name();
+        Ok((handle, backend_name))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn start_macos(
+        instance_name: &str,
+        port: u16,
+        txt_records: &[(String, String)],
+    ) -> Result<Handle> {
+        let mut args = vec![
+            "-R".to_string(),
+            instance_name.to_string(),
+            SERVICE_TYPE_NO_DOMAIN.to_string(),
+            "local".to_string(),
+            port.to_string(),
+        ];
+
+        for (key, value) in txt_records {
+            args.push(format!("{}={}", key, value));
+        }
+
+        info!(
+            "Registering mDNS via system dns-sd: instance={} port={} txt={:?}",
+            instance_name, port, txt_records
+        );
+
+        let mut child = Command::new("dns-sd")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn dns-sd registration command")?;
+
+        wait_for_child_ready(&mut child, "dns-sd")?;
+
+        Ok(Handle::Bonjour { child })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn start_avahi(
+        instance_name: &str,
+        port: u16,
+        txt_records: &[(String, String)],
+    ) -> Result<Handle> {
+        let mut args = vec![
+            instance_name.to_string(),
+            SERVICE_TYPE_NO_DOMAIN.to_string(),
+            port.to_string(),
+        ];
+
+        for (key, value) in txt_records {
+            args.push(format!("{}={}", key, value));
+        }
+
+        info!(
+            "Attempting Avahi registration: instance={} port={} txt={:?}",
+            instance_name, port, txt_records
+        );
+
+        let mut child = Command::new("avahi-publish-service")
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("Failed to spawn avahi-publish-service command")?;
+
+        match wait_for_child_ready(&mut child, "avahi-publish-service") {
+            Ok(()) => Ok(Handle::Avahi { child }),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn start_internal(
+        instance_name: &str,
+        port: u16,
+        txt_records: &[(String, String)],
+    ) -> Result<Handle> {
+        info!(
+            "Registering mDNS via embedded mdns-sd daemon: instance={} port={} txt={:?}",
+            instance_name, port, txt_records
+        );
+
+        let daemon = ServiceDaemon::new().context("Failed to create mDNS service daemon")?;
+
+        let mut properties = HashMap::new();
+        for (key, value) in txt_records {
+            properties.insert(key.clone(), value.clone());
+        }
+
+        let host_name = derive_host_name();
+
+        let service_info = ServiceInfo::new(
+            SERVICE_TYPE,
+            instance_name,
+            &host_name,
+            (),
+            port,
+            Some(properties),
+        )
+        .context("Failed to create mDNS service info")?
+        .enable_addr_auto();
+
+        daemon
+            .register(service_info)
+            .context("Failed to register mDNS service")?;
+
+        Ok(Handle::Internal(daemon))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn wait_for_child_ready(child: &mut Child, name: &str) -> Result<()> {
+        thread::sleep(Duration::from_millis(200));
+
+        if let Some(status) = child
+            .try_wait()
+            .context(format!("Failed to check {} process status", name))?
+        {
+            let mut stderr_output = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                let _ = stderr.read_to_string(&mut stderr_output);
+            }
+            bail!(
+                "{} exited early with status {}{}",
+                name,
+                status,
+                if stderr_output.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", stderr_output.trim())
+                }
+            );
+        }
+
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn stop_child(child: &mut Child, name: &str) -> Result<()> {
+        if let Err(error) = child.kill() {
+            if error.kind() != io::ErrorKind::InvalidInput {
+                return Err(error).context(format!("Failed to terminate {} process", name));
+            }
+        }
+
+        child
+            .wait()
+            .context(format!("Failed to wait for {} process shutdown", name))?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -235,14 +443,10 @@ mod tests {
             "SHA256:test".to_string(),
         );
 
-        // Start service
         let result = service.start();
-        // Note: This might fail in CI environments without proper mDNS support
-        // So we just verify it doesn't panic
         if result.is_ok() {
             assert!(service.is_running());
 
-            // Stop service
             assert!(service.stop().is_ok());
             assert!(!service.is_running());
         }
@@ -257,20 +461,17 @@ mod tests {
             "SHA256:test".to_string(),
         );
 
-        // Should not error when stopping a non-running service
         assert!(service.stop().is_ok());
     }
 
     #[test]
     fn test_txt_record_format() {
-        // Verify TXT record constants are correct
         assert_eq!(SERVICE_TYPE, "_handcontrol._tcp.local.");
         assert_eq!(TXT_RECORD_VERSION, "1.0");
     }
 
     #[test]
     fn test_service_type_constant() {
-        // Service type must match PRD specification
         assert_eq!(SERVICE_TYPE, "_handcontrol._tcp.local.");
     }
 

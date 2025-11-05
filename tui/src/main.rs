@@ -1,8 +1,8 @@
 mod app {
     use handcontrol_client_lib::{
+        CommandList, CommandParameter, CommandParameterType, CommandSummary, DiscoveredServer,
         config::ClientConfig,
         storage::{ServerRegistry, ServerRegistryEntry},
-        CommandList, CommandParameter, CommandParameterType, CommandSummary, DiscoveredServer,
     };
     use std::collections::{BTreeSet, HashMap};
     use uuid::Uuid;
@@ -684,7 +684,7 @@ mod app {
     }
 }
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use app::{App, FocusPane, OutputChannel, ParameterValue, ServerStatus};
 use crossterm::{
     cursor::{Hide, Show},
@@ -695,20 +695,20 @@ use crossterm::{
         PushKeyboardEnhancementFlags,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use handcontrol_client_lib::{
-    config, config::DiscoveryConfig, discover_servers, enroll_via_approval, execute_command,
-    list_commands, validate_parameters, ApprovalEnrollmentInput, CommandList, CommandParameterType,
-    CommandStreamEvent, CommandSummary, DiscoveredServer, ServerRegistry, ServerRegistryEntry,
+    ApprovalEnrollmentInput, CommandList, CommandParameterType, CommandStreamEvent, CommandSummary,
+    DiscoveredServer, ServerRegistry, ServerRegistryEntry, config, config::DiscoveryConfig,
+    discover_servers, enroll_via_approval, execute_command, list_commands, validate_parameters,
 };
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
-    Frame, Terminal,
 };
 use std::{collections::HashMap, fs, io, time::Duration};
 use tokio::sync::mpsc;
@@ -2441,6 +2441,22 @@ fn render_servers(frame: &mut Frame<'_>, area: Rect, app: &App) {
                         subtitle.clone(),
                         Style::default().fg(Color::Gray),
                     )));
+                }
+                if let Some(entry) = server.registry_entry.as_ref() {
+                    if let Some(relay) = &entry.relay {
+                        let mut relay_text = if relay.relay_required {
+                            "Relay required".to_string()
+                        } else {
+                            "Relay available".to_string()
+                        };
+                        if !relay.relay_url.trim().is_empty() {
+                            relay_text.push_str(&format!(" · {}", relay.relay_url.trim()));
+                        }
+                        lines.push(Line::from(Span::styled(
+                            relay_text,
+                            Style::default().fg(Color::Cyan),
+                        )));
+                    }
                 }
                 let status_text = match server.status {
                     ServerStatus::Enrolled => "Enrolled",

@@ -6,6 +6,7 @@ import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.CommandExecutionResult
 import com.handcontrol.data.commands.CommandRepository
 import com.handcontrol.data.commands.ServerInfo
+import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -18,6 +19,11 @@ import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
+import com.handcontrol.feature.commands.remote.RemotePanelUiModel
+import com.handcontrol.feature.commands.remote.RemoteQuickAction
+import com.handcontrol.feature.commands.remote.RemoteAdjustmentGroup
+import com.handcontrol.feature.commands.remote.RemoteAdjustment
+import com.handcontrol.feature.commands.remote.RemoteTelemetryCard
 
 sealed interface CommandListUiState {
     data object Loading : CommandListUiState
@@ -25,7 +31,8 @@ sealed interface CommandListUiState {
         val serverInfo: ServerInfo,
         val commands: List<Command>,
         val filteredCommands: List<Command>,
-        val searchQuery: String = ""
+        val searchQuery: String = "",
+        val remotePanel: RemotePanelUiModel = RemotePanelUiModel.empty()
     ) : CommandListUiState
     data class Error(val message: String) : CommandListUiState
 }
@@ -103,7 +110,8 @@ class CommandListViewModel @Inject constructor(
                 _uiState.value = CommandListUiState.Success(
                     serverInfo = serverInfo,
                     commands = commands,
-                    filteredCommands = commands
+                    filteredCommands = commands,
+                    remotePanel = buildRemotePanelModel(commands)
                 )
 
                 // Note: Connection mode is already updated by repository
@@ -339,5 +347,89 @@ class CommandListViewModel @Inject constructor(
             Timber.w(e, "Failed to fetch dynamic default")
             fallback
         }
+    }
+
+    private fun buildRemotePanelModel(commands: List<Command>): RemotePanelUiModel {
+        val quickActions = commands
+            .filter { it.parameters.isEmpty() }
+            .take(6)
+            .map { command ->
+                RemoteQuickAction(
+                    id = command.id,
+                    title = command.name,
+                    subtitle = command.description.takeIf { it.isNotBlank() },
+                    iconKey = command.icon.takeIf { it.isNotBlank() },
+                    isEnabled = true,
+                    isBusy = false,
+                    requiresConfirmation = command.requiresConfirmation,
+                    showOutput = command.showOutput
+                )
+            }
+
+        val adjustmentGroups = commands
+            .filter { it.parameters.isNotEmpty() }
+            .take(3)
+            .mapNotNull { command ->
+                val controls = command.parameters.mapNotNull { parameter ->
+                    when (parameter.type) {
+                        ParameterType.SLIDER -> {
+                            val min = parameter.min?.toFloat() ?: 0f
+                            val max = parameter.max?.toFloat() ?: 100f
+                            val safeRange = if (min < max) min..max else 0f..100f
+                            RemoteAdjustment.Slider(
+                                id = "${command.id}:${parameter.name}",
+                                label = parameter.name,
+                                isEnabled = true,
+                                value = parameter.defaultValue?.toFloatOrNull()
+                                    ?.coerceIn(safeRange.start, safeRange.endInclusive)
+                                    ?: safeRange.start,
+                                range = safeRange,
+                                step = null,
+                                helperText = parameter.description.takeIf { it.isNotBlank() }
+                            )
+                        }
+
+                        ParameterType.TOGGLE -> RemoteAdjustment.Toggle(
+                            id = "${command.id}:${parameter.name}",
+                            label = parameter.name,
+                            isEnabled = true,
+                            isChecked = parameter.defaultValue?.toBooleanStrictOrNull() ?: false,
+                            helperText = parameter.description.takeIf { it.isNotBlank() }
+                        )
+
+                        ParameterType.TEXT -> null
+                        ParameterType.DROPDOWN -> null
+                        ParameterType.UNSPECIFIED -> null
+                    }
+                }
+
+                if (controls.isEmpty()) {
+                    null
+                } else {
+                    RemoteAdjustmentGroup(
+                        id = command.id,
+                        title = command.name.takeIf { it.isNotBlank() },
+                        controls = controls
+                    )
+                }
+            }
+
+        val telemetry = quickActions.take(3).map { action ->
+            RemoteTelemetryCard.Counter(
+                id = "telemetry_${action.id}",
+                title = action.title,
+                isLoading = false,
+                lastUpdatedTimestamp = null,
+                value = 0,
+                unit = null,
+                delta = null
+            )
+        }
+
+        return RemotePanelUiModel(
+            quickActions = quickActions,
+            adjustments = adjustmentGroups,
+            telemetry = telemetry
+        )
     }
 }

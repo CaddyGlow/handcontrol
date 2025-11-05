@@ -1147,13 +1147,16 @@ fn output_tsv_registry(rows: &[RegistryRow], cfg: &ClientConfig) -> Result<()> {
     let mut stdout = io::BufWriter::new(io::stdout().lock());
 
     if cfg.cli.show_headers {
-        writeln!(stdout, "SERVER_ID\tHOSTNAME\tADDRESSES\tRELAY\tLAST_SEEN")?;
+        writeln!(
+            stdout,
+            "SERVER_ID\tHOSTNAME\tADDRESSES\tMODE\tRELAY_URL\tLAST_SEEN"
+        )?;
     }
 
     for row in rows {
         writeln!(
             stdout,
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}",
             row.server_id,
             row.hostname.as_deref().unwrap_or("-"),
             if row.addresses.is_empty() {
@@ -1161,7 +1164,11 @@ fn output_tsv_registry(rows: &[RegistryRow], cfg: &ClientConfig) -> Result<()> {
             } else {
                 row.addresses.join(", ")
             },
-            if row.relay { "yes" } else { "no" },
+            row.relay_mode.as_deref().unwrap_or("direct-only"),
+            row.relay_url
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("-"),
             row.last_seen.as_deref().unwrap_or("-")
         )?;
     }
@@ -1194,17 +1201,35 @@ struct RegistryRow {
     server_id: String,
     hostname: Option<String>,
     addresses: Vec<String>,
-    relay: bool,
+    relay_mode: Option<String>,
+    relay_url: Option<String>,
     last_seen: Option<String>,
 }
 
 impl From<&ServerRegistryEntry> for RegistryRow {
     fn from(entry: &ServerRegistryEntry) -> Self {
+        let (relay_mode, relay_url) = entry.relay.as_ref().map_or((None, None), |relay| {
+            let mode = if relay.relay_required {
+                "relay-only"
+            } else {
+                "direct+relay"
+            };
+
+            let url = if relay.relay_url.trim().is_empty() {
+                None
+            } else {
+                Some(relay.relay_url.clone())
+            };
+
+            (Some(mode.to_string()), url)
+        });
+
         Self {
             server_id: entry.id.to_string(),
             hostname: entry.hostname.clone(),
             addresses: collect_display_addresses(entry),
-            relay: entry.relay.is_some(),
+            relay_mode,
+            relay_url,
             last_seen: entry.last_seen.clone(),
         }
     }

@@ -6,15 +6,15 @@ use crate::{
     },
     storage::{RegistryRelayInfo, ServerRegistry, ServerRegistryEntry},
 };
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 use std::time::Duration;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::time::{Instant, sleep};
-use tonic::{Request, transport::Channel};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use tokio::time::{sleep, Instant};
+use tonic::{transport::Channel, Request};
 use uuid::Uuid;
 
 #[derive(Debug)]

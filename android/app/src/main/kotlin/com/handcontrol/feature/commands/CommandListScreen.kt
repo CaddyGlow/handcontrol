@@ -14,6 +14,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
@@ -35,6 +37,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Tab
+import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -56,6 +60,7 @@ import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.ui.components.CommandConfirmationDialog
 import com.handcontrol.ui.theme.HandControlTheme
 import kotlinx.coroutines.flow.collectLatest
+import com.handcontrol.feature.commands.remote.RemotePanelScreen
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -72,6 +77,7 @@ fun CommandListScreen(
 
     var showConfirmationDialog by remember { mutableStateOf(false) }
     var selectedCommand by remember { mutableStateOf<Command?>(null) }
+    var selectedTab by remember { mutableStateOf(CommandListTab.List) }
 
     LaunchedEffect(Unit) {
         viewModel.loadCommands(serverId)
@@ -81,6 +87,16 @@ fun CommandListScreen(
     LaunchedEffect(Unit) {
         viewModel.toastMessage.collectLatest { message ->
             snackbarHostState.showSnackbar(message)
+        }
+    }
+
+    LaunchedEffect(uiState) {
+        val successState = uiState as? CommandListUiState.Success
+        if (successState != null &&
+            !successState.remotePanel.hasContent &&
+            selectedTab == CommandListTab.Remote
+        ) {
+            selectedTab = CommandListTab.List
         }
     }
 
@@ -153,26 +169,51 @@ fun CommandListScreen(
                     if (state.commands.isEmpty()) {
                         EmptyCommandsView()
                     } else {
-                        CommandListContent(
-                            commands = state.filteredCommands,
-                            searchQuery = state.searchQuery,
-                            onSearchQueryChange = { query ->
-                                viewModel.searchCommands(query)
-                            },
-                            onCommandClick = { command ->
-                                handleCommandClick(
-                                    command = command,
-                                    viewModel = viewModel,
-                                    onNavigateToExecution = {
-                                        onNavigateToCommandExecution(serverId, command.id)
-                                    },
-                                    onShowConfirmation = {
-                                        selectedCommand = command
-                                        showConfirmationDialog = true
-                                    }
-                                )
-                            }
-                        )
+                        val availableTabs = if (state.remotePanel.hasContent) {
+                            listOf(CommandListTab.List, CommandListTab.Remote)
+                        } else {
+                            listOf(CommandListTab.List)
+                        }
+
+                        if (availableTabs.size > 1) {
+                            CommandListTabRow(
+                                tabs = availableTabs,
+                                selectedTab = selectedTab,
+                                onTabSelected = { selectedTab = it }
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+                        }
+
+                        if (selectedTab == CommandListTab.Remote && state.remotePanel.hasContent) {
+                            val scrollState = rememberScrollState()
+                            RemotePanelScreen(
+                                uiModel = state.remotePanel,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .verticalScroll(scrollState)
+                            )
+                        } else {
+                            CommandListContent(
+                                commands = state.filteredCommands,
+                                searchQuery = state.searchQuery,
+                                onSearchQueryChange = { query ->
+                                    viewModel.searchCommands(query)
+                                },
+                                onCommandClick = { command ->
+                                    handleCommandClick(
+                                        command = command,
+                                        viewModel = viewModel,
+                                        onNavigateToExecution = {
+                                            onNavigateToCommandExecution(serverId, command.id)
+                                        },
+                                        onShowConfirmation = {
+                                            selectedCommand = command
+                                            showConfirmationDialog = true
+                                        }
+                                    )
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -202,6 +243,36 @@ fun CommandListScreen(
                 selectedCommand = null
             }
         )
+    }
+}
+
+private enum class CommandListTab { List, Remote }
+
+@Composable
+private fun CommandListTabRow(
+    tabs: List<CommandListTab>,
+    selectedTab: CommandListTab,
+    onTabSelected: (CommandListTab) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val safeIndex = tabs.indexOf(selectedTab).takeIf { it >= 0 } ?: 0
+
+    TabRow(
+        selectedTabIndex = safeIndex,
+        modifier = modifier
+    ) {
+        tabs.forEachIndexed { index, tab ->
+            val label = when (tab) {
+                CommandListTab.List -> "List"
+                CommandListTab.Remote -> "Remote"
+            }
+
+            Tab(
+                selected = index == safeIndex,
+                onClick = { onTabSelected(tab) },
+                text = { Text(label) }
+            )
+        }
     }
 }
 

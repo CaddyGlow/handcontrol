@@ -22,12 +22,12 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Computer
 import androidx.compose.material.icons.filled.Error
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -71,6 +71,7 @@ import kotlinx.coroutines.flow.collectLatest
 import com.handcontrol.feature.commands.remote.RemoteLayoutBuilderScreen
 import com.handcontrol.feature.commands.remote.RemoteLayoutSpec
 import com.handcontrol.feature.commands.remote.RemotePanelScreen
+import com.handcontrol.feature.commands.remote.RemoteQuickAction
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -220,6 +221,29 @@ fun CommandListScreen(
                                 onReset = {
                                     layoutDraft = RemoteLayoutSpec.withDefaultSections()
                                 },
+                                onQuickAction = { action ->
+                                    val command = state.commands.find { it.id == action.id } ?: return@RemoteTabContent
+                                    when {
+                                        command.parameters.isNotEmpty() -> {
+                                            onNavigateToCommandExecution(serverId, command.id)
+                                        }
+                                        action.requiresConfirmation -> {
+                                            selectedCommand = command
+                                            showConfirmationDialog = true
+                                        }
+                                        else -> {
+                                            viewModel.executeCommandWithMode(
+                                                commandId = command.id,
+                                                commandName = command.name,
+                                                parameters = emptyMap(),
+                                                showOutput = action.showOutput
+                                            )
+                                            if (action.showOutput) {
+                                                onNavigateToCommandExecution(serverId, command.id)
+                                            }
+                                        }
+                                    }
+                                },
                                 modifier = Modifier.fillMaxSize()
                             )
                         } else {
@@ -315,6 +339,7 @@ private fun RemoteTabContent(
     onDraftChanged: (RemoteLayoutSpec) -> Unit,
     onSave: () -> Unit,
     onReset: () -> Unit,
+    onQuickAction: (RemoteQuickAction) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Box(modifier = modifier) {
@@ -337,6 +362,7 @@ private fun RemoteTabContent(
                 val scrollState = rememberScrollState()
                 RemotePanelScreen(
                     uiModel = state.remotePanel,
+                    onQuickActionClick = onQuickAction,
                     modifier = Modifier
                         .fillMaxSize()
                         .verticalScroll(scrollState)

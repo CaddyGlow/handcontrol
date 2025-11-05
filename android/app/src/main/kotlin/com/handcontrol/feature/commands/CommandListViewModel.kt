@@ -9,6 +9,9 @@ import com.handcontrol.data.commands.ServerInfo
 import com.handcontrol.data.commands.ParameterType
 import com.handcontrol.data.database.EnrolledServerRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -16,6 +19,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
@@ -28,6 +32,7 @@ import com.handcontrol.feature.commands.remote.RemoteQuickAction
 import com.handcontrol.feature.commands.remote.RemoteAdjustmentGroup
 import com.handcontrol.feature.commands.remote.RemoteAdjustment
 import com.handcontrol.feature.commands.remote.RemoteTelemetryCard
+import kotlin.math.abs
 
 sealed interface CommandListUiState {
     data object Loading : CommandListUiState
@@ -80,6 +85,9 @@ class CommandListViewModel @Inject constructor(
     val toastMessage: SharedFlow<String> = _toastMessage.asSharedFlow()
 
     private var currentServerId: String? = null
+    private var telemetrySources: Map<String, TelemetrySource> = emptyMap()
+    private val telemetryJobs = mutableMapOf<String, Job>()
+    private val telemetryLatestCards = mutableMapOf<String, RemoteTelemetryCard>()
 
     fun loadCommands(serverId: String) {
         currentServerId = serverId
@@ -391,6 +399,12 @@ class CommandListViewModel @Inject constructor(
         }
     }
 
+    override fun onCleared() {
+        super.onCleared()
+        telemetryJobs.values.forEach { it.cancel() }
+        telemetryJobs.clear()
+    }
+
     private fun buildRemotePanelModel(
         commands: List<Command>,
         layoutSpec: RemoteLayoutSpec?
@@ -403,6 +417,7 @@ class CommandListViewModel @Inject constructor(
         val quickActions = mutableListOf<RemoteQuickAction>()
         val adjustmentGroups = mutableListOf<RemoteAdjustmentGroup>()
         val telemetryCards = mutableListOf<RemoteTelemetryCard>()
+        val newTelemetrySources = mutableMapOf<String, TelemetrySource>()
 
         layoutSpec.sections.forEach { section ->
             when (section.type) {
@@ -449,14 +464,18 @@ class CommandListViewModel @Inject constructor(
                 RemoteLayoutSpec.SectionType.TELEMETRY -> {
                     section.entries
                         .filterIsInstance<RemoteLayoutEntry.TelemetryEntry>()
-                        .mapNotNull { entry ->
-                            val command = commandMap[entry.sourceCommandId] ?: return@mapNotNull null
-                            mapTelemetryEntry(entry, command)
+                        .forEach { entry ->
+                            val command = commandMap[entry.sourceCommandId] ?: return@forEach
+                            val baseCard = mapTelemetryEntry(entry, command)
+                            val previous = telemetryLatestCards[baseCard.id]
+                            telemetryCards += previous ?: baseCard
+                            newTelemetrySources[baseCard.id] = TelemetrySource(command, entry)
                         }
-                        .also { telemetryCards.addAll(it) }
                 }
             }
         }
+
+        refreshTelemetrySources(newTelemetrySources)
 
         if (quickActions.isEmpty() && adjustmentGroups.isEmpty() && telemetryCards.isEmpty()) {
             return buildDefaultRemotePanel(commands)
@@ -470,6 +489,8 @@ class CommandListViewModel @Inject constructor(
     }
 
     private fun buildDefaultRemotePanel(commands: List<Command>): RemotePanelUiModel {
+        refreshTelemetrySources(emptyMap())
+
         val quickActions = commands
             .filter { it.parameters.isEmpty() }
             .take(6)
@@ -534,23 +555,36 @@ class CommandListViewModel @Inject constructor(
                 }
             }
 
-        val telemetry = quickActions.take(3).map { action ->
-            RemoteTelemetryCard.Counter(
-                id = "telemetry_${action.id}",
-                title = action.title,
-                isLoading = false,
-                lastUpdatedTimestamp = null,
-                value = 0,
-                unit = null,
-                delta = null
-            )
-        }
-
         return RemotePanelUiModel(
             quickActions = quickActions,
             adjustments = adjustmentGroups,
-            telemetry = telemetry
+            telemetry = emptyList()
         )
+    }
+
+    private fun refreshTelemetrySources(newSources: Map<String, TelemetrySource>) {
+        val removedIds = telemetrySources.keys - newSources.keys
+        removedIds.forEach { id ->
+            telemetryJobs.remove(id)?.cancel()
+            telemetryLatestCards.remove(id)
+        }
+
+        val serverId = currentServerId
+
+        newSources.forEach { (id, source) ->
+            val existing = telemetrySources[id]
+            if (existing != source) {
+                telemetryJobs.remove(id)?.cancel()
+                telemetryLatestCards.remove(id)
+                if (serverId != null) {
+                    telemetryJobs[id] = viewModelScope.launch {
+                        collectTelemetry(serverId, id, source)
+                    }
+                }
+            }
+        }
+
+        telemetrySources = newSources
     }
 
     private fun mapAdjustmentEntry(
@@ -686,5 +720,165 @@ class CommandListViewModel @Inject constructor(
             value == "0" -> false
             else -> null
         }
+    }
+
+    private suspend fun collectTelemetry(serverId: String, id: String, source: TelemetrySource) {
+        while (currentCoroutineContext().isActive) {
+            try {
+                val card = fetchTelemetryCard(serverId, id, source)
+                if (card != null) {
+                    updateTelemetryCard(id, card)
+                }
+            } catch (e: Exception) {
+                Timber.w(e, "Telemetry collection failed for ${source.command.id}")
+            }
+            delay(TELEMETRY_POLL_INTERVAL_MS)
+        }
+    }
+
+    private suspend fun fetchTelemetryCard(
+        serverId: String,
+        id: String,
+        source: TelemetrySource
+    ): RemoteTelemetryCard? {
+        val outputBuilder = StringBuilder()
+        var exitCode = 0
+
+        try {
+            commandRepository.executeCommand(serverId, source.command.id, emptyMap())
+                .collect { result ->
+                    when (result) {
+                        is CommandExecutionResult.Output -> if (!result.isError) {
+                            outputBuilder.appendLine(result.text)
+                        }
+
+                        is CommandExecutionResult.ExitCode -> exitCode = result.code
+                        is CommandExecutionResult.Error -> throw IllegalStateException(result.message)
+                    }
+                }
+        } catch (e: Exception) {
+            Timber.w(e, "Telemetry command execution failed: ${source.command.id}")
+            return null
+        }
+
+        if (exitCode != 0) {
+            Timber.w("Telemetry command ${source.command.id} exited with $exitCode")
+        }
+
+        val output = outputBuilder.toString().trim()
+        if (output.isEmpty() && source.entry.display != TelemetryDisplay.TEXT) {
+            Timber.d("Telemetry command ${source.command.id} returned empty output")
+        }
+
+        return buildTelemetryCardFromOutput(id, source, output)
+    }
+
+    private fun buildTelemetryCardFromOutput(
+        id: String,
+        source: TelemetrySource,
+        output: String
+    ): RemoteTelemetryCard? {
+        val timestamp = System.currentTimeMillis()
+        val previous = telemetryLatestCards[id]
+
+        return when (source.entry.display) {
+            TelemetryDisplay.COUNTER -> {
+                val numeric = extractNumber(output)?.toLongOrNull() ?: return null
+                val delta = (previous as? RemoteTelemetryCard.Counter)?.let { numeric - it.value }
+                RemoteTelemetryCard.Counter(
+                    id = id,
+                    title = source.entry.titleOverride ?: source.command.name,
+                    isLoading = false,
+                    lastUpdatedTimestamp = timestamp,
+                    value = numeric,
+                    unit = source.entry.unit,
+                    delta = delta
+                )
+            }
+
+            TelemetryDisplay.GAUGE -> {
+                val numeric = extractNumber(output)?.toFloatOrNull() ?: return null
+                val min = source.entry.min ?: 0f
+                val max = source.entry.max?.takeIf { it > min } ?: 100f
+                val clamped = numeric.coerceIn(min, max)
+                val previousGauge = previous as? RemoteTelemetryCard.Gauge
+                val diff = previousGauge?.let { clamped - it.value } ?: 0f
+                val trend = previousGauge?.let {
+                    when {
+                        diff > 0.5f -> RemoteTelemetryCard.Trend(
+                            direction = RemoteTelemetryCard.Trend.Direction.UP,
+                            magnitude = abs(diff)
+                        )
+
+                        diff < -0.5f -> RemoteTelemetryCard.Trend(
+                            direction = RemoteTelemetryCard.Trend.Direction.DOWN,
+                            magnitude = abs(diff)
+                        )
+
+                        else -> RemoteTelemetryCard.Trend(
+                            direction = RemoteTelemetryCard.Trend.Direction.STEADY,
+                            magnitude = abs(diff)
+                        )
+                    }
+                }
+
+                RemoteTelemetryCard.Gauge(
+                    id = id,
+                    title = source.entry.titleOverride ?: source.command.name,
+                    isLoading = false,
+                    lastUpdatedTimestamp = timestamp,
+                    value = clamped,
+                    min = min,
+                    max = max,
+                    unit = source.entry.unit,
+                    trend = trend
+                )
+            }
+
+            TelemetryDisplay.TEXT -> {
+                val body = when {
+                    source.entry.textTemplate != null ->
+                        source.entry.textTemplate.replace("{value}", output.ifEmpty { "—" })
+
+                    output.isNotEmpty() -> output
+                    else -> source.command.description
+                }.ifEmpty { "—" }
+
+                RemoteTelemetryCard.Text(
+                    id = id,
+                    title = source.entry.titleOverride ?: source.command.name,
+                    isLoading = false,
+                    lastUpdatedTimestamp = timestamp,
+                    body = body
+                )
+            }
+        }
+    }
+
+    private fun extractNumber(output: String): String? {
+        return numberRegex.find(output)?.value
+    }
+
+    private fun updateTelemetryCard(id: String, card: RemoteTelemetryCard) {
+        telemetryLatestCards[id] = card
+        val currentState = _uiState.value
+        if (currentState is CommandListUiState.Success) {
+            val updatedPanel = currentState.remotePanel.copy(
+                telemetry = currentState.remotePanel.telemetry.map { existing ->
+                    if (existing.id == id) card else existing
+                }
+            )
+            _uiState.value = currentState.copy(remotePanel = updatedPanel)
+        }
+    }
+
+    private data class TelemetrySource(
+        val command: Command,
+        val entry: RemoteLayoutEntry.TelemetryEntry
+    )
+
+    companion object {
+        private const val TELEMETRY_POLL_INTERVAL_MS = 5_000L
+        private val numberRegex = Regex("[-+]?[0-9]*\\.?[0-9]+")
     }
 }

@@ -167,6 +167,9 @@ async fn run_interactive_shell(
     let master = Arc::new(master_fd);
     let outbound = endpoints.outbound.clone();
 
+    let mut idle_timeout_secs = idle_timeout;
+    let mut max_duration_secs = max_duration;
+
     outbound
         .send(SessionServerEvent::Ready {
             message: Some(format!("Shell started: {}", shell_path)),
@@ -229,9 +232,9 @@ async fn run_interactive_shell(
 
     loop {
         let idle_deadline =
-            idle_timeout.map(|secs| last_activity + tokio::time::Duration::from_secs(secs));
+            idle_timeout_secs.map(|secs| last_activity + tokio::time::Duration::from_secs(secs));
         let max_deadline =
-            max_duration.map(|secs| start_time + tokio::time::Duration::from_secs(secs));
+            max_duration_secs.map(|secs| start_time + tokio::time::Duration::from_secs(secs));
 
         tokio::select! {
             exit = &mut exit_rx => {
@@ -325,6 +328,7 @@ async fn run_interactive_shell(
                         capability_id = %capability_id,
                         "Interactive shell idle timeout reached"
                     );
+                    idle_timeout_secs = None;
                     exit_metadata = Some(ExitMetadata {
                         timed_out: true,
                         message: Some("Idle timeout reached".to_string()),
@@ -344,6 +348,7 @@ async fn run_interactive_shell(
                         capability_id = %capability_id,
                         "Interactive shell maximum duration reached"
                     );
+                    max_duration_secs = None;
                     exit_metadata = Some(ExitMetadata {
                         timed_out: true,
                         message: Some("Session duration limit exceeded".to_string()),
@@ -650,12 +655,14 @@ async fn run_interactive_shell(
     let mut last_activity = start_time;
     let mut exit_tick = tokio::time::interval(tokio::time::Duration::from_millis(100));
     exit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut idle_timeout_secs = idle_timeout;
+    let mut max_duration_secs = max_duration;
 
     loop {
         let idle_deadline =
-            idle_timeout.map(|secs| last_activity + tokio::time::Duration::from_secs(secs));
+            idle_timeout_secs.map(|secs| last_activity + tokio::time::Duration::from_secs(secs));
         let max_deadline =
-            max_duration.map(|secs| start_time + tokio::time::Duration::from_secs(secs));
+            max_duration_secs.map(|secs| start_time + tokio::time::Duration::from_secs(secs));
         let mut session_finished = false;
 
         tokio::select! {
@@ -746,6 +753,7 @@ async fn run_interactive_shell(
                         capability_id = %capability_id,
                         "Interactive shell idle timeout reached"
                     );
+                    idle_timeout_secs = None;
                     let _ = child.kill().await;
                     let _ = outbound
                         .send(SessionServerEvent::Exit {
@@ -769,6 +777,7 @@ async fn run_interactive_shell(
                         capability_id = %capability_id,
                         "Interactive shell maximum duration reached"
                     );
+                    max_duration_secs = None;
                     let _ = child.kill().await;
                     let _ = outbound
                         .send(SessionServerEvent::Exit {

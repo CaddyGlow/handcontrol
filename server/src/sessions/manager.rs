@@ -39,6 +39,7 @@ struct SessionEntry {
     _capability: Arc<dyn Capability>,
     state: Mutex<SessionState>,
     event_tx: broadcast::Sender<SessionBroadcastEvent>,
+    owner_fingerprint: Option<String>,
 }
 
 #[derive(Debug)]
@@ -91,6 +92,7 @@ pub struct SessionSnapshot {
     pub metadata: CapabilityMetadata,
     pub session_mode: SessionMode,
     pub state: SessionStateSnapshot,
+    pub owner_fingerprint: Option<String>,
 }
 
 pub struct SessionHandle {
@@ -132,6 +134,8 @@ impl SessionManager {
             outbound: server_sender.clone(),
         };
 
+        let owner_fingerprint = client_fingerprint.clone();
+
         let ctx = CapabilityOpenContext {
             metadata: metadata.clone(),
             parameters,
@@ -152,6 +156,7 @@ impl SessionManager {
             _capability: Arc::clone(&capability),
             state: Mutex::new(state),
             event_tx: event_tx.clone(),
+            owner_fingerprint,
         });
 
         {
@@ -297,7 +302,26 @@ impl SessionManager {
             metadata: entry.metadata.clone(),
             session_mode: entry.session_mode,
             state: state.snapshot(),
+            owner_fingerprint: entry.owner_fingerprint.clone(),
         })
+    }
+
+    pub fn list_sessions(&self) -> Vec<SessionSnapshot> {
+        let guard = self.inner.sessions.read().unwrap();
+        guard
+            .iter()
+            .filter_map(|(id, entry)| {
+                let state = entry.state.lock().ok()?;
+                Some(SessionSnapshot {
+                    id: SessionId::from_uuid(*id),
+                    capability_id: entry.capability_id.clone(),
+                    metadata: entry.metadata.clone(),
+                    session_mode: entry.session_mode,
+                    state: state.snapshot(),
+                    owner_fingerprint: entry.owner_fingerprint.clone(),
+                })
+            })
+            .collect()
     }
 
     fn get_entry(&self, session_id: &SessionId) -> Result<Arc<SessionEntry>, SessionManagerError> {

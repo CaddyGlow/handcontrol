@@ -8,10 +8,12 @@ import com.handcontrol.data.commands.CommandKind
 import com.handcontrol.data.commands.CommandRepository
 import com.handcontrol.data.commands.CommandSessionMode
 import com.handcontrol.data.commands.ParameterInputState
+import com.handcontrol.data.commands.ActiveCommandSession
 import com.handcontrol.data.commands.ShellSession
 import com.handcontrol.data.commands.ShellSessionEvent
 import com.handcontrol.data.commands.TerminalSize
 import com.handcontrol.data.commands.ValidationResult
+import com.handcontrol.data.commands.ResumeSessionSpec
 import com.handcontrol.data.commands.defaultValueFor
 import com.handcontrol.data.commands.toProtoParameter
 import com.handcontrol.data.commands.validateParameterValue
@@ -99,6 +101,8 @@ class ShellSessionViewModel @Inject constructor(
                     statusMessage = null
                 )
 
+                refreshResumeCandidates()
+
                 // Kick off dynamic default fetches (non-blocking)
                 command.parameters.forEach { param ->
                     if (param.defaultValueCommand != null) {
@@ -167,6 +171,14 @@ class ShellSessionViewModel @Inject constructor(
     }
 
     fun startSession() {
+        launchSession(resumeCandidate = null)
+    }
+
+    fun resumeSession(candidate: ResumeCandidate) {
+        launchSession(resumeCandidate = candidate)
+    }
+
+    private fun launchSession(resumeCandidate: ResumeCandidate?) {
         val serverId = currentServerId
         val command = currentCommand
 
@@ -180,23 +192,40 @@ class ShellSessionViewModel @Inject constructor(
             return
         }
 
-        val invalidParam = parameterStates.entries.firstOrNull {
-            it.value.validationResult is ValidationResult.Invalid
-        }
-        if (invalidParam != null) {
-            emitToast("Fix parameter '${invalidParam.key}' before starting the session")
-            return
+        if (resumeCandidate == null) {
+            val invalidParam = parameterStates.entries.firstOrNull {
+                it.value.validationResult is ValidationResult.Invalid
+            }
+            if (invalidParam != null) {
+                emitToast("Fix parameter '${invalidParam.key}' before starting the session")
+                return
+            }
         }
 
-        val parameters = parameterStates.mapValues { it.value.currentValue }
+        val parameters = if (resumeCandidate == null) {
+            parameterStates.mapValues { it.value.currentValue }
+        } else {
+            emptyMap()
+        }
+        val connectingMessage = if (resumeCandidate != null) {
+            "Resuming previous session..."
+        } else {
+            null
+        }
 
         viewModelScope.launch {
-            // Reset output and mark as connecting
             _uiState.update {
                 it.copy(
                     connectionState = ShellConnectionState.Connecting,
                     terminalSession = null,
-                    statusMessage = null
+                    statusMessage = connectingMessage,
+                    resumeCandidates = if (resumeCandidate != null) {
+                        it.resumeCandidates.filterNot { option ->
+                            option.sessionId == resumeCandidate.sessionId
+                        }
+                    } else {
+                        it.resumeCandidates
+                    }
                 )
             }
 
@@ -204,7 +233,8 @@ class ShellSessionViewModel @Inject constructor(
                 serverId = serverId,
                 commandId = command.id,
                 parameters = parameters,
-                terminalSize = TerminalSize(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS)
+                terminalSize = TerminalSize(DEFAULT_TERMINAL_COLS, DEFAULT_TERMINAL_ROWS),
+                resumeSpec = resumeCandidate?.resumeSpec
             )
 
             if (result.isFailure) {
@@ -212,6 +242,9 @@ class ShellSessionViewModel @Inject constructor(
                 Timber.e(result.exceptionOrNull(), "Shell session failed to start")
                 _uiState.update {
                     it.copy(connectionState = ShellConnectionState.Failed(message))
+                }
+                if (resumeCandidate != null) {
+                    refreshResumeCandidates()
                 }
                 emitToast(message)
                 return@launch
@@ -235,7 +268,7 @@ class ShellSessionViewModel @Inject constructor(
                 it.copy(
                     connectionState = ShellConnectionState.Connecting,
                     terminalSession = terminalSession,
-                    statusMessage = null
+                    statusMessage = connectingMessage
                 )
             }
         }
@@ -298,8 +331,14 @@ class ShellSessionViewModel @Inject constructor(
                         statusMessage = reason
                     )
                 }
+                refreshResumeCandidates()
             }
         }
+    }
+
+    fun detachSession() {
+        if (remoteTerminalSession == null) return
+        closeSession("Client detached")
     }
 
     fun registerTerminalBridge(handle: ComposeTerminalBridgeHandle) {
@@ -327,6 +366,34 @@ class ShellSessionViewModel @Inject constructor(
                     state.validationResult is ValidationResult.Valid
                 }
             )
+        }
+    }
+
+    private fun refreshResumeCandidates() {
+        val serverId = currentServerId ?: return
+        val command = currentCommand ?: return
+
+        viewModelScope.launch {
+            val result = commandRepository.listSessions(serverId)
+            if (result.isFailure) {
+                Timber.w(result.exceptionOrNull(), "Failed to load resumable sessions")
+                _uiState.update { it.copy(resumeCandidates = emptyList()) }
+                return@launch
+            }
+
+            val sessions = result.getOrThrow()
+            val candidates = sessions
+                .asSequence()
+                .filter { it.capabilityId == command.id }
+                .filter { it.sessionMode == CommandSessionMode.REALTIME }
+                .filter { !it.attached }
+                .mapNotNull { it.toResumeCandidate() }
+                .sortedByDescending { it.lastActivityMs }
+                .toList()
+
+            _uiState.update {
+                it.copy(resumeCandidates = candidates)
+            }
         }
     }
 
@@ -408,6 +475,25 @@ class ShellSessionViewModel @Inject constructor(
                     )
                 }
             }
+            is ShellSessionEvent.Resuming -> {
+                val message = "Connection lost. Attempting to resume (attempt ${event.attempt})..."
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Connecting,
+                        statusMessage = message
+                    )
+                }
+                emitToast(message)
+            }
+            is ShellSessionEvent.ResumeAcknowledged -> {
+                val message = event.message ?: "Session resumed."
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Active(message),
+                        statusMessage = message
+                    )
+                }
+            }
             is ShellSessionEvent.Output -> {
                 // Text rendering is handled by the terminal view directly.
             }
@@ -422,6 +508,7 @@ class ShellSessionViewModel @Inject constructor(
                         statusMessage = event.message
                     )
                 }
+                refreshResumeCandidates()
             }
             is ShellSessionEvent.Error -> {
                 activeSession = null
@@ -432,6 +519,7 @@ class ShellSessionViewModel @Inject constructor(
                     )
                 }
                 emitToast(event.message)
+                refreshResumeCandidates()
             }
             is ShellSessionEvent.Heartbeat -> {
                 // No-op; we may surface latency information later.
@@ -445,6 +533,7 @@ class ShellSessionViewModel @Inject constructor(
                         statusMessage = message
                     )
                 }
+                refreshResumeCandidates()
             }
         }
     }
@@ -465,6 +554,7 @@ data class ShellSessionUiState(
     val parameterStates: Map<String, ParameterInputState> = emptyMap(),
     val dynamicLoading: Map<String, Boolean> = emptyMap(),
     val isFormValid: Boolean = false,
+    val resumeCandidates: List<ResumeCandidate> = emptyList(),
     val connectionState: ShellConnectionState = ShellConnectionState.NotStarted,
     val errorMessage: String? = null,
     val terminalSession: TerminalSession? = null,
@@ -495,3 +585,36 @@ interface ComposeTerminalBridgeHandle {
     fun toggleKeyboard()
     fun hideKeyboard()
 }
+
+data class ResumeCandidate(
+    val sessionId: String,
+    val capabilityId: String,
+    val capabilityName: String,
+    val ownerFingerprint: String?,
+    val createdAtMs: Long,
+    val lastActivityMs: Long,
+    val bufferLength: Int,
+    val resumeSpec: ResumeSessionSpec
+)
+
+private fun ActiveCommandSession.toResumeCandidate(): ResumeCandidate? {
+    if (resumeToken.isBlank()) return null
+    val displayName = capabilityName.ifBlank { capabilityId }
+    return ResumeCandidate(
+        sessionId = sessionId,
+        capabilityId = capabilityId,
+        capabilityName = displayName,
+        ownerFingerprint = ownerFingerprint,
+        createdAtMs = createdAtMs,
+        lastActivityMs = lastActivityMs,
+        bufferLength = bufferLength,
+        resumeSpec = ResumeSessionSpec(
+            sessionId = sessionId,
+            resumeToken = resumeToken,
+            lastStdoutSequence = stdoutNextSequence.toLastSequence(),
+            lastStderrSequence = stderrNextSequence.toLastSequence()
+        )
+    )
+}
+
+private fun Long.toLastSequence(): Long = if (this <= 0L) 0L else this - 1L

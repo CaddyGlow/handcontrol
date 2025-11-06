@@ -41,6 +41,9 @@ This document explains how the resumable session flow works in HandControl, what
 ### CLI
 
 - The CLI automatically retries a dropped realtime session using the saved resume state. Users will see a brief status message indicating that the session is being resumed.
+- Press `Ctrl+]` in an interactive session to detach without terminating the remote shell; the CLI prints reattachment instructions before exiting.
+- `handcontrol-cli sessions <server>` lists active sessions, showing capability details, attachment status, age, and owner fingerprint without exposing control.
+- `handcontrol-cli resume <server> <session-id>` reconnects to an existing realtime session using the server-provided resume token and cursor metadata.
 - Resume attempts preserve terminal size (the CLI replays a resize event when reconnecting) and continue streaming output seamlessly after buffered replay completes.
 - Explicit exits (`Ctrl+C` followed by prompt confirmation, or `exit` inside the shell) still close the session permanently.
 

@@ -3,15 +3,17 @@ use clap::{Parser, Subcommand, ValueEnum};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig, TransportPreference, TRANSPORT_OVERRIDE_ENV},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
-    list_commands as fetch_command_list, open_capability_session, resume_capability_session,
+    list_commands as fetch_command_list, list_sessions as fetch_sessions, open_capability_session,
+    resume_capability_session,
     storage::{ServerRegistry, ServerRegistryEntry},
-    validate_parameters, ApprovalEnrollmentInput, CapabilitySessionEvent, CapabilitySessionSender,
-    CommandKind, CommandList, CommandSessionMode, CommandStreamEvent, CommandSummary,
-    DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CapabilitySession, CapabilitySessionEvent,
+    CapabilitySessionResumeState, CapabilitySessionSender, CommandKind, CommandList,
+    CommandSessionMode, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
+    ServerSessionInfo,
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::io::{self, Read, Write};
@@ -20,6 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -83,6 +86,12 @@ enum Command {
     List(ListCommand),
     /// Execute a command on an enrolled server
     Exec(ExecCommand),
+    /// Inspect active sessions on an enrolled server
+    Sessions(SessionsCommand),
+    /// Resume an existing interactive session
+    Resume(ResumeCommand),
+    /// Generate shell completion scripts
+    Completions(CompletionCommand),
     /// Remove stored enrollment for a server
     Remove(RemoveCommand),
     /// Manage client configuration
@@ -165,6 +174,72 @@ struct RemoveCommand {
     /// Skip confirmation prompt
     #[arg(long, alias = "yes")]
     confirm: bool,
+}
+
+#[derive(Parser)]
+struct SessionsCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Output JSON instead of a table
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct ResumeCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Session identifier (UUID)
+    session_id: String,
+}
+
+#[derive(Parser)]
+struct CompletionCommand {
+    #[command(subcommand)]
+    command: CompletionSubcommand,
+}
+
+#[derive(Subcommand)]
+enum CompletionSubcommand {
+    /// Generate shell completion scripts
+    Generate(GenerateCompletionCommand),
+    /// Internal helpers for dynamic shell completions
+    #[command(hide = true)]
+    Dynamic(DynamicCompletionCommand),
+}
+
+#[derive(Parser)]
+struct GenerateCompletionCommand {
+    /// Target shell to generate completions for
+    #[arg(value_enum)]
+    shell: Shell,
+    /// Write the generated script to a file instead of stdout
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct DynamicCompletionCommand {
+    #[command(subcommand)]
+    target: DynamicCompletionTarget,
+}
+
+#[derive(Subcommand)]
+enum DynamicCompletionTarget {
+    /// Suggest enrolled server identifiers
+    Servers {
+        /// Optional prefix to filter results
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Suggest resumable session identifiers for a server
+    Sessions {
+        /// Server identifier (UUID, hostname, or alias)
+        server: String,
+        /// Optional prefix to filter results
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -257,6 +332,9 @@ async fn main() -> Result<()> {
         Command::Info(cmd) => run_info(cmd).await,
         Command::List(cmd) => run_list_commands(cmd).await,
         Command::Exec(cmd) => run_exec_command(cmd).await,
+        Command::Sessions(cmd) => run_sessions(cmd).await,
+        Command::Resume(cmd) => run_resume(cmd).await,
+        Command::Completions(cmd) => run_completions(cmd).await,
         Command::Remove(cmd) => run_remove(cmd),
         Command::Config { command } => run_config(command),
         Command::Enroll { command } => run_enroll(command).await,
@@ -514,7 +592,20 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
                     command.name
                 );
             }
-            run_interactive_shell(entry, command, sanitized).await
+            let session = open_capability_session(entry, &command.id, sanitized).await?;
+            if session.session_mode() != CommandSessionMode::Realtime {
+                bail!(
+                    "Capability '{}' reported unsupported session mode {:?}",
+                    command.name,
+                    session.session_mode()
+                );
+            }
+            let session_label = if command.name.is_empty() {
+                command.id.clone()
+            } else {
+                command.name.clone()
+            };
+            run_interactive_shell(entry, &server, &session_label, session, false).await
         }
         _ => bail!(
             "Capability '{}' requires {:?} sessions which are not supported by this CLI",
@@ -526,200 +617,113 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
 
 async fn run_interactive_shell(
     entry: &ServerRegistryEntry,
-    command: &CommandSummary,
-    parameters: HashMap<String, String>,
+    server_label: &str,
+    session_name: &str,
+    mut session: CapabilitySession,
+    resumed: bool,
 ) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("Realtime capabilities require an interactive TTY");
     }
 
-    let mut session = open_capability_session(entry, &command.id, parameters).await?;
-    if session.session_mode() != CommandSessionMode::Realtime {
-        bail!(
-            "Capability '{}' reported unsupported session mode {:?}",
-            command.name,
-            session.session_mode()
-        );
-    }
+    let config = config::load()?;
+    let jiggle_resize = config.cli.jiggle_resize_on_resume;
 
-    if let Some(message) = session.ready_message() {
+    if resumed {
+        println!("Resumed interactive session '{session_name}'.");
+    } else if let Some(message) = session.ready_message() {
         if !message.is_empty() {
             println!("{message}");
         }
     } else {
-        println!(
-            "Interactive session '{}' ready. Press Ctrl+C to terminate.",
-            command.name
-        );
+        println!("Interactive session '{session_name}' ready.");
     }
+    println!("Press Ctrl+] to detach.");
 
     let raw_guard = RawModeGuard::new()?;
 
     let mut sender = session.sender();
     send_initial_resize(&sender).await;
 
-    let mut input_handle = spawn_input_task(sender.clone());
-    let mut resize_handle = spawn_resize_task(sender.clone());
+    let (mut input_handle, mut resize_handle, mut detach_rx) = setup_io_tasks(sender.clone());
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut resume_attempts: usize = 0;
+    maybe_jiggle(jiggle_resize, &mut sender).await?;
+    let mut outcome = drive_session(
+        &mut session,
+        &mut stdout,
+        &mut stderr,
+        &mut detach_rx,
+        &mut exit_code,
+        &mut timed_out,
+    )
+    .await?;
 
-    while let Some(event) = session.recv().await? {
-        match event {
-            CapabilitySessionEvent::Output {
-                data,
-                stderr: is_stderr,
-                ..
-            } => {
-                if is_stderr {
-                    if stderr.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    let _ = stderr.flush().await;
-                } else {
-                    if stdout.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    let _ = stdout.flush().await;
-                }
-                resume_attempts = 0;
-            }
-            CapabilitySessionEvent::Exit {
-                exit_code: code,
-                timed_out: was_timeout,
-                message,
-            } => {
-                exit_code = Some(code);
-                timed_out = was_timeout;
-                if let Some(message) = message {
-                    let mut bytes = message.into_bytes();
-                    if !bytes.ends_with(&[b'\n']) {
-                        bytes.push(b'\n');
-                    }
-                    let _ = stderr.write_all(&bytes).await;
-                    let _ = stderr.flush().await;
-                }
-            }
-            CapabilitySessionEvent::Error { message, .. } => {
-                return Err(anyhow!("Server reported capability error: {}", message));
-            }
-            CapabilitySessionEvent::HeartbeatAck { .. } => {
-                // Ignore keep-alives.
-            }
-            CapabilitySessionEvent::Closed { reason } => {
-                if exit_code.is_none() {
-                    if let Some(reason) = reason {
-                        return Err(anyhow!("Capability session closed: {}", reason));
-                    } else {
-                        return Err(anyhow!("Capability session closed unexpectedly"));
-                    }
-                }
-                break;
-            }
-        }
-
-        continue;
-    }
-
-    while exit_code.is_none() {
-        // Stream ended without an exit event; attempt to resume if possible.
+    while matches!(outcome, SessionOutcome::StreamClosed) && exit_code.is_none() {
         let resume_state = session.resume_state();
 
         println!("\nConnection interrupted. Attempting to resume...");
 
-        input_handle.abort();
-        let _ = input_handle.await;
-        if let Some(handle) = &mut resize_handle {
-            handle.abort();
-            let _ = handle.await;
-        }
+        cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
 
         match resume_capability_session(entry, resume_state).await {
             Ok(new_session) => {
                 session = new_session;
                 sender = session.sender();
                 send_initial_resize(&sender).await;
-                input_handle = spawn_input_task(sender.clone());
-                resize_handle = spawn_resize_task(sender.clone());
+                maybe_jiggle(jiggle_resize, &mut sender).await?;
+
+                let handles = setup_io_tasks(sender.clone());
+                input_handle = handles.0;
+                resize_handle = handles.1;
+                detach_rx = handles.2;
+
                 resume_attempts += 1;
                 println!("Session resumed (attempt #{resume_attempts}).");
+
+                outcome = drive_session(
+                    &mut session,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut detach_rx,
+                    &mut exit_code,
+                    &mut timed_out,
+                )
+                .await?;
             }
             Err(err) => {
+                cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
+                drop(raw_guard);
                 return Err(anyhow!("Failed to resume session: {}", err));
             }
         }
-
-        while let Some(event) = session.recv().await? {
-            match event {
-                CapabilitySessionEvent::Output {
-                    data,
-                    stderr: is_stderr,
-                    ..
-                } => {
-                    if is_stderr {
-                        if stderr.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = stderr.flush().await;
-                    } else {
-                        if stdout.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = stdout.flush().await;
-                    }
-                }
-                CapabilitySessionEvent::Exit {
-                    exit_code: code,
-                    timed_out: was_timeout,
-                    message,
-                } => {
-                    exit_code = Some(code);
-                    timed_out = was_timeout;
-                    if let Some(message) = message {
-                        let mut bytes = message.into_bytes();
-                        if !bytes.ends_with(&[b'\n']) {
-                            bytes.push(b'\n');
-                        }
-                        let _ = stderr.write_all(&bytes).await;
-                        let _ = stderr.flush().await;
-                    }
-                    break;
-                }
-                CapabilitySessionEvent::Error { message, .. } => {
-                    return Err(anyhow!("Server reported capability error: {}", message));
-                }
-                CapabilitySessionEvent::HeartbeatAck { .. } => {}
-                CapabilitySessionEvent::Closed { reason } => {
-                    if exit_code.is_none() {
-                        if let Some(reason) = reason {
-                            return Err(anyhow!("Capability session closed: {}", reason));
-                        } else {
-                            return Err(anyhow!("Capability session closed unexpectedly"));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if exit_code.is_some() {
-            break;
-        }
     }
 
+    let detached = matches!(outcome, SessionOutcome::Detached);
+
+    cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
     drop(raw_guard);
 
-    let _ = sender.close(None).await;
-    input_handle.abort();
-    let _ = input_handle.await;
-
-    if let Some(handle) = &mut resize_handle {
-        handle.abort();
-        let _ = handle.await;
+    if detached {
+        let _ = sender.close(Some("Client detached".to_string())).await;
+        println!("\nDetached from session {}.", session.session_id());
+        println!(
+            "Resume later with: handcontrol-cli resume {} {}",
+            server_label,
+            session.session_id()
+        );
+        println!(
+            "You can view active sessions with: handcontrol-cli sessions {}",
+            server_label
+        );
+        return Ok(());
     }
+
+    let _ = sender.close(None).await;
 
     if timed_out {
         bail!("Realtime capability timed out");
@@ -741,7 +745,10 @@ async fn send_initial_resize(sender: &CapabilitySessionSender) {
     }
 }
 
-fn spawn_input_task(sender: CapabilitySessionSender) -> tokio::task::JoinHandle<()> {
+fn spawn_input_task(
+    sender: CapabilitySessionSender,
+    detach_tx: mpsc::UnboundedSender<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
@@ -752,8 +759,38 @@ fn spawn_input_task(sender: CapabilitySessionSender) -> tokio::task::JoinHandle<
                     break;
                 }
                 Ok(n) => {
-                    if sender.send_input(buf[..n].to_vec(), false).await.is_err() {
-                        break;
+                    let start = 0;
+                    let mut detach_triggered = false;
+
+                    for (idx, byte) in buf[..n].iter().enumerate() {
+                        if *byte == 0x1d {
+                            if idx > start {
+                                if sender
+                                    .send_input(buf[start..idx].to_vec(), false)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let _ = detach_tx.send(());
+                            detach_triggered = true;
+                            break;
+                        }
+                    }
+
+                    if detach_triggered {
+                        return;
+                    }
+
+                    if start < n {
+                        if sender
+                            .send_input(buf[start..n].to_vec(), false)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
                 Err(_) => {
@@ -788,6 +825,412 @@ fn spawn_resize_task(sender: CapabilitySessionSender) -> Option<tokio::task::Joi
     {
         let _ = sender;
         None
+    }
+}
+
+fn setup_io_tasks(
+    sender: CapabilitySessionSender,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Option<tokio::task::JoinHandle<()>>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (detach_tx, detach_rx) = mpsc::unbounded_channel();
+    let input_handle = spawn_input_task(sender.clone(), detach_tx);
+    let resize_handle = spawn_resize_task(sender);
+    (input_handle, resize_handle, detach_rx)
+}
+
+enum SessionOutcome {
+    Exit,
+    StreamClosed,
+    Detached,
+}
+
+async fn drive_session(
+    session: &mut CapabilitySession,
+    stdout: &mut tokio::io::Stdout,
+    stderr: &mut tokio::io::Stderr,
+    detach_rx: &mut mpsc::UnboundedReceiver<()>,
+    exit_code: &mut Option<i32>,
+    timed_out: &mut bool,
+) -> Result<SessionOutcome> {
+    loop {
+        tokio::select! {
+            Some(_) = detach_rx.recv() => return Ok(SessionOutcome::Detached),
+            event = session.recv() => match event {
+                Ok(Some(CapabilitySessionEvent::Output { data, stderr: is_stderr, .. })) => {
+                    let write_result = if is_stderr {
+                        stderr.write_all(&data).await
+                    } else {
+                        stdout.write_all(&data).await
+                    };
+
+                    if write_result.is_err() {
+                        return Ok(SessionOutcome::StreamClosed);
+                    }
+
+                    let _ = if is_stderr {
+                        stderr.flush().await
+                    } else {
+                        stdout.flush().await
+                    };
+                }
+                Ok(Some(CapabilitySessionEvent::Exit { exit_code: code, timed_out: was_timeout, message })) => {
+                    *exit_code = Some(code);
+                    *timed_out = was_timeout;
+                    if let Some(message) = message {
+                        let mut bytes = message.into_bytes();
+                        if !bytes.ends_with(&[b'\n']) {
+                            bytes.push(b'\n');
+                        }
+                        let _ = stderr.write_all(&bytes).await;
+                        let _ = stderr.flush().await;
+                    }
+                    return Ok(SessionOutcome::Exit);
+                }
+                Ok(Some(CapabilitySessionEvent::Error { message, .. })) => {
+                    return Err(anyhow!("Server reported capability error: {}", message));
+                }
+                Ok(Some(CapabilitySessionEvent::HeartbeatAck { .. })) => {
+                    // keep alive
+                }
+                Ok(Some(CapabilitySessionEvent::Closed { reason })) => {
+                    if exit_code.is_none() {
+                        if let Some(reason) = reason {
+                            return Err(anyhow!("Capability session closed: {}", reason));
+                        } else {
+                            return Err(anyhow!("Capability session closed unexpectedly"));
+                        }
+                    }
+                    return Ok(SessionOutcome::StreamClosed);
+                }
+                Ok(None) => return Ok(SessionOutcome::StreamClosed),
+                Err(err) => return Err(err),
+            },
+        }
+    }
+}
+
+async fn cleanup_io_tasks(
+    input_handle: &mut tokio::task::JoinHandle<()>,
+    resize_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    input_handle.abort();
+    let _ = input_handle.await;
+
+    if let Some(handle) = resize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+async fn maybe_jiggle(enabled: bool, sender: &mut CapabilitySessionSender) -> Result<()> {
+    if enabled {
+        jiggle_terminal(sender).await?;
+    }
+    Ok(())
+}
+
+async fn jiggle_terminal(sender: &mut CapabilitySessionSender) -> Result<()> {
+    if let Ok((cols, rows)) = terminal_size() {
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
+
+        sender
+            .send_resize(u32::from(cols.saturating_add(1)), u32::from(rows))
+            .await
+            .ok();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sender
+            .send_resize(u32::from(cols), u32::from(rows))
+            .await
+            .ok();
+    }
+
+    Ok(())
+}
+
+async fn run_sessions(cmd: SessionsCommand) -> Result<()> {
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&cmd.server, &registry)?.clone();
+
+    let mut sessions = fetch_sessions(&entry).await?;
+    sessions.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+
+    if cmd.json {
+        output_json(&sessions)?;
+        return Ok(());
+    }
+
+    print_sessions_table(&sessions);
+    Ok(())
+}
+
+async fn run_resume(cmd: ResumeCommand) -> Result<()> {
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&cmd.server, &registry)?.clone();
+
+    let sessions = fetch_sessions(&entry).await?;
+    let mut info_matches: Vec<ServerSessionInfo> = Vec::new();
+    let normalized = cmd.session_id.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+
+    for session in sessions {
+        if session.session_id.eq_ignore_ascii_case(&cmd.session_id) {
+            info_matches.clear();
+            info_matches.push(session);
+            break;
+        }
+
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let canonical = session.session_id.to_ascii_lowercase();
+        let simple: String = canonical.chars().filter(|c| *c != '-').collect();
+        if canonical.starts_with(&normalized)
+            || (!compact.is_empty() && simple.starts_with(&compact))
+        {
+            info_matches.push(session);
+        }
+    }
+
+    let info = match info_matches.len() {
+        0 => {
+            bail!(
+                "Session '{}' not found on server {}",
+                cmd.session_id,
+                entry.id
+            )
+        }
+        1 => info_matches.pop().unwrap(),
+        _ => {
+            let candidates = info_matches
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Session identifier '{}' is ambiguous on server {}; matches: {}",
+                cmd.session_id,
+                entry.id,
+                candidates
+            );
+        }
+    };
+
+    if info.session_mode != CommandSessionMode::Realtime {
+        bail!(
+            "Session '{}' uses '{:?}' mode which cannot be resumed interactively",
+            info.session_id,
+            info.session_mode
+        );
+    }
+
+    let state = CapabilitySessionResumeState {
+        session_id: info.session_id.clone(),
+        capability_id: info.capability_id.clone(),
+        resume_token: info.resume_token.clone(),
+        last_stdout_sequence: info.stdout_next_sequence.saturating_sub(1),
+        last_stderr_sequence: info.stderr_next_sequence.saturating_sub(1),
+        session_mode: info.session_mode,
+    };
+
+    let session = resume_capability_session(&entry, state).await?;
+    let session_label = if info.capability_name.is_empty() {
+        info.capability_id
+    } else {
+        info.capability_name
+    };
+
+    run_interactive_shell(&entry, &cmd.server, &session_label, session, true).await
+}
+
+async fn run_completions(cmd: CompletionCommand) -> Result<()> {
+    match cmd.command {
+        CompletionSubcommand::Generate(args) => generate_completion_script(args),
+        CompletionSubcommand::Dynamic(cmd) => run_dynamic_completion(cmd).await,
+    }
+}
+
+fn generate_completion_script(args: GenerateCompletionCommand) -> Result<()> {
+    let GenerateCompletionCommand { shell, output } = args;
+    let mut command = Cli::command();
+    let bin_name = command.get_name().to_string();
+
+    let mut buffer: Vec<u8> = Vec::new();
+    generate(shell, &mut command, bin_name.as_str(), &mut buffer);
+    let mut script =
+        String::from_utf8(buffer).context("Generated completion script was not UTF-8")?;
+
+    match shell {
+        Shell::Bash => enhance_bash_completion(&mut script),
+        Shell::Zsh => enhance_zsh_completion(&mut script),
+        Shell::Fish => enhance_fish_completion(&mut script),
+        _ => {}
+    }
+
+    if let Some(path) = output {
+        let mut file = fs::File::create(&path)
+            .with_context(|| format!("Failed to create completion file {}", path.display()))?;
+        file.write_all(script.as_bytes())
+            .with_context(|| format!("Failed to write completion file {}", path.display()))?;
+    } else {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(script.as_bytes())?;
+        handle.flush()?;
+    }
+
+    Ok(())
+}
+
+async fn run_dynamic_completion(cmd: DynamicCompletionCommand) -> Result<()> {
+    match cmd.target {
+        DynamicCompletionTarget::Servers { prefix } => {
+            let registry = ServerRegistry::load()?;
+            let prefix = prefix.unwrap_or_default();
+            for candidate in collect_server_candidates(&prefix, &registry) {
+                println!("{candidate}");
+            }
+            Ok(())
+        }
+        DynamicCompletionTarget::Sessions { server, prefix } => {
+            let registry = ServerRegistry::load()?;
+            let entry = find_enrolled_server(&server, &registry)?.clone();
+            let sessions = fetch_sessions(&entry).await?;
+            let prefix = prefix.unwrap_or_default();
+            for candidate in collect_session_candidates(&sessions, &prefix) {
+                println!("{candidate}");
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_sessions_table(sessions: &[ServerSessionInfo]) {
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return;
+    }
+
+    println!(
+        "{:<36}  {:<24}  {:<8}  {:<7}  {:<10}  {:<12}  {}",
+        "Session ID", "Capability", "Mode", "Attached", "Owner", "Age", "Last Activity"
+    );
+
+    for info in sessions {
+        let capability_display = if info.capability_name.is_empty() {
+            info.capability_id.clone()
+        } else {
+            info.capability_name.clone()
+        };
+
+        println!(
+            "{:<36}  {:<24}  {:<8}  {:<7}  {:<10}  {:<12}  {}",
+            info.session_id,
+            truncate(&capability_display, 24),
+            format!("{:?}", info.session_mode),
+            if info.attached { "yes" } else { "no" },
+            short_fingerprint(&info.owner_fingerprint),
+            format_age(info.created_at_ms),
+            format_since(info.last_activity_ms),
+        );
+    }
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        value.to_string()
+    } else if width == 0 {
+        String::new()
+    } else if width == 1 {
+        "…".to_string()
+    } else {
+        format!("{}…", &value[..width - 1])
+    }
+}
+
+fn short_fingerprint(fingerprint: &Option<String>) -> String {
+    match fingerprint {
+        Some(fp) if !fp.is_empty() => {
+            if fp.len() <= 8 {
+                fp.clone()
+            } else {
+                format!("{}…", &fp[..8])
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn timestamp_to_datetime(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000).ok()
+}
+
+fn format_age(ms: i64) -> String {
+    match timestamp_to_datetime(ms) {
+        Some(created) => {
+            let now = OffsetDateTime::now_utc();
+            if now >= created {
+                duration_to_brief(now - created)
+            } else {
+                "0s".to_string()
+            }
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn format_since(ms: i64) -> String {
+    match timestamp_to_datetime(ms) {
+        Some(timestamp) => {
+            let now = OffsetDateTime::now_utc();
+            if now >= timestamp {
+                format!("{} ago", duration_to_brief(now - timestamp))
+            } else {
+                "in future".to_string()
+            }
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn duration_to_brief(duration: TimeDuration) -> String {
+    let mut seconds = duration.whole_seconds();
+    if seconds <= 0 {
+        return "0s".to_string();
+    }
+
+    let mut parts = Vec::new();
+    let days = seconds / 86_400;
+    if days > 0 {
+        parts.push(format!("{}d", days));
+        seconds -= days * 86_400;
+    }
+
+    let hours = seconds / 3_600;
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+        seconds -= hours * 3_600;
+    }
+
+    let minutes = seconds / 60;
+    if minutes > 0 && parts.len() < 2 {
+        parts.push(format!("{}m", minutes));
+        seconds -= minutes * 60;
+    }
+
+    if seconds > 0 && parts.len() < 2 {
+        parts.push(format!("{}s", seconds));
+    }
+
+    if parts.is_empty() {
+        "0s".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 
@@ -1137,31 +1580,89 @@ fn resolve_server_targets(
         }
     } else {
         let discovered = discover_servers(&cfg.discovery)?;
-        let query = server.to_lowercase();
+        let query = server.to_ascii_lowercase();
+        let compact_query: String = query.chars().filter(|c| *c != '-').collect();
+
+        let mut host_matches: Vec<DiscoveredServer> = Vec::new();
+        let mut id_matches: Vec<DiscoveredServer> = Vec::new();
+
         for entry in discovered {
-            let mut matched = false;
-            if let Some(id) = entry.server_id {
-                if id.to_string().eq_ignore_ascii_case(&query) || id.to_string() == server {
-                    matched = true;
-                    server_id_hint = Some(id);
-                }
-            }
-            if !matched
-                && (entry.instance_name.eq_ignore_ascii_case(&server)
-                    || entry.hostname.eq_ignore_ascii_case(&server))
+            if entry.instance_name.eq_ignore_ascii_case(server)
+                || entry.hostname.eq_ignore_ascii_case(server)
             {
-                matched = true;
                 if server_id_hint.is_none() {
                     server_id_hint = entry.server_id;
                 }
+                host_matches.push(entry);
+                continue;
             }
-            if matched {
-                addresses.extend(entry.addresses.clone());
-                if resolved_port.is_none() {
-                    resolved_port = Some(entry.port);
+
+            if let Some(id) = entry.server_id {
+                let canonical_lower = id.to_string().to_ascii_lowercase();
+                let simple_lower = id.simple().to_string().to_ascii_lowercase();
+                if canonical_lower == query
+                    || canonical_lower.starts_with(&query)
+                    || (!compact_query.is_empty() && simple_lower.starts_with(&compact_query))
+                {
+                    if server_id_hint.is_none() {
+                        server_id_hint = Some(id);
+                    }
+                    id_matches.push(entry);
                 }
             }
         }
+
+        let mut matches = if !host_matches.is_empty() {
+            host_matches
+        } else {
+            id_matches
+        };
+
+        if matches.is_empty() {
+            bail!(
+                "Unable to resolve server '{server}'. Run 'handcontrol-cli discover' or supply --address"
+            );
+        }
+
+        if matches.len() > 1 {
+            let descriptions = matches
+                .iter()
+                .map(|entry| {
+                    entry
+                        .server_id
+                        .map(|id| id.to_string())
+                        .or_else(|| {
+                            if !entry.instance_name.is_empty() {
+                                Some(entry.instance_name.clone())
+                            } else if !entry.hostname.is_empty() {
+                                Some(entry.hostname.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Server identifier '{}' is ambiguous; matches: {}",
+                server,
+                descriptions
+            );
+        }
+
+        let entry = matches.pop().unwrap();
+        let entry_port = entry.port;
+        let entry_server_id = entry.server_id;
+        let entry_addresses = entry.addresses;
+
+        if resolved_port.is_none() {
+            resolved_port = Some(entry_port);
+        }
+        if server_id_hint.is_none() {
+            server_id_hint = entry_server_id;
+        }
+        addresses.extend(entry_addresses);
     }
 
     addresses.sort();
@@ -1359,11 +1860,273 @@ fn find_enrolled_server<'a>(
         }
     }
 
+    let normalized = identifier.to_ascii_lowercase();
+    if !normalized.is_empty() {
+        let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+        let matches: Vec<&ServerRegistryEntry> = registry
+            .iter()
+            .filter(|entry| {
+                let canonical = entry.id.to_string().to_ascii_lowercase();
+                let simple = entry.id.simple().to_string().to_ascii_lowercase();
+                canonical.starts_with(&normalized)
+                    || (!compact.is_empty() && simple.starts_with(&compact))
+            })
+            .collect();
+
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches[0]),
+            _ => {
+                let candidates = matches
+                    .iter()
+                    .map(|entry| entry.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Server identifier '{}' is ambiguous. Matching IDs: {}",
+                    identifier,
+                    candidates
+                );
+            }
+        }
+    }
+
     bail!(
         "Server '{}' is not enrolled. Run 'handcontrol-cli enroll' to register it first.",
         identifier
     );
 }
+
+fn collect_server_candidates(prefix: &str, registry: &ServerRegistry) -> Vec<String> {
+    let normalized = prefix.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+    let mut candidates: HashSet<String> = HashSet::new();
+
+    for entry in registry.iter() {
+        let id_str = entry.id.to_string();
+        let id_lower = id_str.to_ascii_lowercase();
+        let simple_lower = entry.id.simple().to_string().to_ascii_lowercase();
+        let id_matches = normalized.is_empty()
+            || id_lower.starts_with(&normalized)
+            || (!compact.is_empty() && simple_lower.starts_with(&compact));
+        if id_matches {
+            candidates.insert(id_str);
+        }
+
+        if let Some(host) = &entry.hostname {
+            if normalized.is_empty() || host.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(host.clone());
+            }
+        }
+
+        if let Some(ip) = &entry.ip {
+            if normalized.is_empty() || ip.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(ip.clone());
+            }
+        }
+
+        for address in &entry.addresses {
+            if normalized.is_empty() || address.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(address.clone());
+            }
+        }
+    }
+
+    let mut results: Vec<String> = candidates.into_iter().collect();
+    results.sort();
+    results
+}
+
+fn collect_session_candidates(sessions: &[ServerSessionInfo], prefix: &str) -> Vec<String> {
+    let normalized = prefix.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+    let mut results: Vec<String> = sessions
+        .iter()
+        .filter_map(|session| {
+            let id_lower = session.session_id.to_ascii_lowercase();
+            let simple_lower: String = id_lower.chars().filter(|c| *c != '-').collect();
+            if normalized.is_empty()
+                || id_lower.starts_with(&normalized)
+                || (!compact.is_empty() && simple_lower.starts_with(&compact))
+            {
+                Some(session.session_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    results.sort();
+    results.dedup();
+    results
+}
+
+fn enhance_bash_completion(script: &mut String) {
+    if let Some(idx) = script.find("\n# HandControl dynamic completion helpers") {
+        script.truncate(idx);
+    }
+
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+
+    script.push_str(
+        r#"
+# HandControl dynamic completion helpers
+__handcontrol_cli_collect_servers() {
+    local prefix="${1-}"
+    HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic servers "${prefix}"
+}
+
+__handcontrol_cli_collect_sessions() {
+    local server="$1"
+    local prefix="${2-}"
+    if [[ -z "$server" ]]; then
+        return
+    fi
+    HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic sessions "${server}" "${prefix}"
+}
+
+__handcontrol_cli_complete_dynamic() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev=""
+    if (( COMP_CWORD > 0 )); then
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+    fi
+
+    if [[ "$cur" == -* || "$prev" == -* ]]; then
+        _handcontrol-cli
+        return
+    fi
+
+    local primary=""
+    local secondary=""
+    local server_arg=""
+    local positional_after_primary=0
+    for ((i=1; i<COMP_CWORD; ++i)); do
+        local word="${COMP_WORDS[i]}"
+        if [[ "$word" == -* ]]; then
+            continue
+        fi
+        if [[ -z "$primary" ]]; then
+            primary="$word"
+            continue
+        fi
+        if [[ "$primary" == "enroll" && -z "$secondary" ]]; then
+            secondary="$word"
+            continue
+        fi
+        if [[ -z "$server_arg" ]]; then
+            server_arg="$word"
+            positional_after_primary=1
+            continue
+        fi
+        positional_after_primary=2
+        break
+    done
+
+    case "$primary" in
+        info|list|exec|sessions|remove)
+            if [[ -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+        resume)
+            if [[ -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            elif (( positional_after_primary == 1 )); then
+                local server="$server_arg"
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_sessions "$server" "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+        enroll)
+            if [[ "$secondary" == "approve" && -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+    esac
+
+    _handcontrol-cli
+}
+complete -F __handcontrol_cli_complete_dynamic -o nosort -o bashdefault -o default handcontrol-cli
+"#,
+    );
+}
+
+fn enhance_zsh_completion(script: &mut String) {
+    if let Some(idx) = script.find("\n_handcontrol_cli_servers()") {
+        script.truncate(idx);
+    }
+
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+
+    let server_patterns = [
+        ":server -- Server identifier (UUID, instance name, or hostname):_default",
+        ":server -- Server identifier (UUID, hostname, or alias):_default",
+    ];
+
+    for pattern in server_patterns {
+        if script.contains(pattern) {
+            let replacement = pattern.replace("_default", "_handcontrol_cli_servers");
+            *script = script.replace(pattern, &replacement);
+        }
+    }
+
+    let session_pattern = ":session-id -- Session identifier (UUID):_default";
+    if script.contains(session_pattern) {
+        *script = script.replace(
+            session_pattern,
+            ":session-id -- Session identifier (UUID):_handcontrol_cli_sessions",
+        );
+    }
+
+    script.push_str(
+        r#"
+_handcontrol_cli_servers() {
+    local -a suggestions
+    local prefix="$words[CURRENT]"
+    suggestions=(${(f)"$(HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic servers \"$prefix\" 2>/dev/null)"})
+    compadd -Q -- "${suggestions[@]}"
+}
+
+_handcontrol_cli_sessions() {
+    local server="$words[3]"
+    local prefix="$words[CURRENT]"
+    if [[ -z "$server" ]]; then
+        return
+    fi
+    local -a suggestions
+    suggestions=(${(f)"$(HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic sessions \"$server\" \"$prefix\" 2>/dev/null)"})
+    compadd -Q -- "${suggestions[@]}"
+}
+"#,
+    );
+}
+
+fn enhance_fish_completion(_script: &mut String) {}
 
 fn set_config_value(cfg: &mut ClientConfig, key: &str, value: &str) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();

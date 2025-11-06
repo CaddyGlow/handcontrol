@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, SystemTime};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tonic::transport::Server;
@@ -23,9 +23,10 @@ use super::proto::{
     CheckPairingStatusResponse, ConfigUpdateNotification, EnrollRequest, EnrollResponse,
     GenerateEnrollmentQrRequest, GenerateEnrollmentQrResponse, GetConfigVersionRequest,
     GetConfigVersionResponse, ListCapabilitiesRequest, ListCapabilitiesResponse,
-    ListPendingPairingsRequest, ListPendingPairingsResponse, PendingPairingInfo,
-    RequestPairingRequest, RequestPairingResponse, ServerInfoRequest, ServerInfoResponse,
-    SessionClientMessage, SessionServerMessage, WatchConfigUpdatesRequest,
+    ListPendingPairingsRequest, ListPendingPairingsResponse, ListSessionsRequest,
+    ListSessionsResponse, PendingPairingInfo, RequestPairingRequest, RequestPairingResponse,
+    ServerInfoRequest, ServerInfoResponse, SessionClientMessage, SessionServerMessage,
+    WatchConfigUpdatesRequest,
 };
 use super::proto::{session_client_message, session_server_message};
 
@@ -45,7 +46,7 @@ use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
 use crate::relay::tokens::{BINDING_TYPE_CLIENT_ID, BINDING_TYPE_ENROLLMENT_TOKEN};
 use crate::sessions::manager::{
-    AttachmentMetadata, SessionBroadcastEvent, SessionHandle, SessionManagerError,
+    AttachmentMetadata, SessionBroadcastEvent, SessionHandle, SessionManagerError, SessionSnapshot,
 };
 use crate::sessions::{SessionClientEvent, SessionId, SessionServerEvent};
 use crate::storage::clients::ClientStore;
@@ -1013,6 +1014,36 @@ impl RemoteControl for RemoteControlService {
         }))
     }
 
+    async fn list_sessions(
+        &self,
+        request: Request<ListSessionsRequest>,
+    ) -> Result<Response<ListSessionsResponse>, Status> {
+        let client_ip = crate::utils::network::extract_client_ip_from_headers(
+            request.metadata(),
+            request.remote_addr(),
+        );
+
+        info!(
+            "ListSessions RPC called (IP: {})",
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+
+        let _ = self.ensure_enrolled_client(&request)?;
+
+        let sessions = self.session_manager.list_sessions();
+        let sessions_proto = sessions
+            .into_iter()
+            .map(session_snapshot_to_proto)
+            .collect();
+
+        Ok(Response::new(ListSessionsResponse {
+            sessions: sessions_proto,
+        }))
+    }
+
     type OpenSessionStream =
         tokio_stream::wrappers::ReceiverStream<Result<SessionServerMessage, Status>>;
 
@@ -1465,6 +1496,47 @@ fn session_event_to_proto(
     SessionServerMessage {
         session_id: session_id.to_string(),
         payload: Some(payload),
+    }
+}
+
+fn session_snapshot_to_proto(snapshot: SessionSnapshot) -> super::proto::SessionInfo {
+    let session_mode_proto = match snapshot.session_mode {
+        CapabilitySessionMode::OneShot => super::proto::SessionMode::OneShot as i32,
+        CapabilitySessionMode::Realtime => super::proto::SessionMode::Realtime as i32,
+        CapabilitySessionMode::Upload => super::proto::SessionMode::Upload as i32,
+        CapabilitySessionMode::Download => super::proto::SessionMode::Download as i32,
+    };
+
+    let created_at_ms = system_time_to_millis(snapshot.state.created_at);
+    let last_activity_ms = system_time_to_millis(snapshot.state.last_activity);
+    let last_detached_ms = snapshot.state.last_detached_at.map(system_time_to_millis);
+    let buffer_len = snapshot.state.buffer_len.min(u32::MAX as usize) as u32;
+    let attached = snapshot.state.attachment.is_some();
+
+    super::proto::SessionInfo {
+        session_id: snapshot.id.to_string(),
+        capability_id: snapshot.capability_id,
+        capability_name: snapshot.metadata.name,
+        session_mode: session_mode_proto,
+        owner_fingerprint: snapshot.owner_fingerprint,
+        created_at_ms,
+        last_activity_ms,
+        last_detached_ms,
+        attached,
+        resume_token: snapshot.state.resume_token.clone(),
+        stdout_next_sequence: snapshot.state.stdout_next_sequence,
+        stderr_next_sequence: snapshot.state.stderr_next_sequence,
+        buffer_len,
+    }
+}
+
+fn system_time_to_millis(time: SystemTime) -> i64 {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_millis().min(i64::MAX as u128) as i64,
+        Err(err) => {
+            let duration = err.duration();
+            -(duration.as_millis().min(i64::MAX as u128) as i64)
+        }
     }
 }
 

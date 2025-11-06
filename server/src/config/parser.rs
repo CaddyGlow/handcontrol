@@ -217,8 +217,10 @@ pub struct ShellScriptDefinition {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShellInteractiveDefinition {
-    #[serde(default = "default_interactive_shell")]
-    pub shell: String,
+    #[serde(default = "default_interactive_shell_path", alias = "shell")]
+    pub path: String,
+    #[serde(default = "default_interactive_shell_argv")]
+    pub argv: Vec<String>,
     pub working_directory: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -230,12 +232,16 @@ pub struct ShellInteractiveDefinition {
     pub session_mode: Option<CapabilitySessionMode>,
 }
 
-fn default_interactive_shell() -> String {
+fn default_interactive_shell_path() -> String {
     if cfg!(target_os = "windows") {
         "cmd.exe".to_string()
     } else {
         "/bin/sh".to_string()
     }
+}
+
+fn default_interactive_shell_argv() -> Vec<String> {
+    vec!["-i".to_string()]
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

@@ -154,7 +154,7 @@ fn validate_capability(capability: &CapabilityConfig) -> Result<()> {
             validate_parameter_placeholders(&capability.id, &def.command, &capability.parameters)?;
         }
         CapabilityDefinition::ShellInteractive(def) => {
-            if def.shell.trim().is_empty() {
+            if def.path.trim().is_empty() {
                 bail!(
                     "Capability '{}' interactive shell cannot be empty",
                     capability.id

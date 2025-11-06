@@ -23,6 +23,8 @@ service RemoteControl {
 
   // List available capabilities
   rpc ListCapabilities(ListCapabilitiesRequest) returns (ListCapabilitiesResponse);
+  // List active sessions
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse);
 
   // Open a capability session (one-shot or realtime)
   rpc OpenSession(stream SessionClientMessage) returns (stream SessionServerMessage);
@@ -207,7 +209,29 @@ message CapabilityParameter {
   optional string label_on = 9;
   optional string label_off = 10;
   optional string default_value_command = 11;
-  optional string default_value_pattern = 12;
+optional string default_value_pattern = 12;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated SessionInfo sessions = 1;
+}
+
+message SessionInfo {
+  string session_id = 1;
+  string capability_id = 2;
+  string capability_name = 3;
+  SessionMode session_mode = 4;
+  optional string owner_fingerprint = 5;
+  int64 created_at_ms = 6;
+  int64 last_activity_ms = 7;
+  optional int64 last_detached_ms = 8;
+  bool attached = 9;
+  string resume_token = 10;
+  uint64 stdout_next_sequence = 11;
+  uint64 stderr_next_sequence = 12;
+  uint32 buffer_len = 13;
 }
 
 // Session streaming

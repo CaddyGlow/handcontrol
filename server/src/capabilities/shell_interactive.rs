@@ -302,6 +302,12 @@ async fn run_interactive_shell(
                         });
                         terminate_child(child_pid);
                     }
+                    Some(SessionClientEvent::Resume { .. }) => {
+                        debug!(
+                            capability_id = %capability_id,
+                            "Received resume event at capability layer; ignoring"
+                        );
+                    }
                     None => {
                         debug!(
                             capability_id = %capability_id,

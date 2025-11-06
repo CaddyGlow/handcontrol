@@ -43,7 +43,9 @@ use crate::security::tls::build_permissive_server_config;
 use crate::security::verification::generate_verification_code;
 // Network utilities (using qualified paths to avoid unused import warnings)
 use crate::relay::tokens::{BINDING_TYPE_CLIENT_ID, BINDING_TYPE_ENROLLMENT_TOKEN};
-use crate::sessions::manager::SessionHandle;
+use crate::sessions::manager::{
+    AttachmentMetadata, SessionBroadcastEvent, SessionHandle, SessionManagerError,
+};
 use crate::sessions::{SessionClientEvent, SessionId, SessionServerEvent};
 use crate::storage::clients::ClientStore;
 use sha2::{Digest, Sha256};
@@ -199,6 +201,21 @@ impl RemoteControlService {
                 fingerprint_hex
             );
             Ok(None)
+        }
+    }
+}
+
+fn status_from_session_error(err: SessionManagerError) -> Status {
+    match err {
+        SessionManagerError::NotFound => Status::not_found("session not found"),
+        SessionManagerError::AlreadyAttached => {
+            Status::resource_exhausted("session already has an active attachment")
+        }
+        SessionManagerError::NotAttached => {
+            Status::failed_precondition("session is not currently attached")
+        }
+        SessionManagerError::InvalidResumeToken => {
+            Status::permission_denied("invalid resume token")
         }
     }
 }
@@ -920,25 +937,29 @@ impl RemoteControl for RemoteControlService {
         let SessionHandle {
             id: session_id,
             capability_id,
-            metadata,
+            metadata: _metadata,
             session_mode,
             client_sender,
-            server_receiver,
+            event_receiver,
+            resume_token: _initial_resume_token,
         } = session_handle;
+
+        session_manager
+            .attach(&session_id, AttachmentMetadata::new(fingerprint.clone()))
+            .map_err(status_from_session_error)?;
 
         let (response_tx, response_rx) = tokio::sync::mpsc::channel(128);
 
         tokio::spawn(forward_session_events(
-            session_manager,
             session_id.clone(),
             capability_id,
-            metadata,
             session_mode,
-            server_receiver,
+            event_receiver,
             response_tx.clone(),
         ));
 
         tokio::spawn(forward_client_events(
+            session_manager,
             session_id.clone(),
             stream,
             client_sender,
@@ -1107,33 +1128,43 @@ fn proto_from_parameter(param: &CapabilityParameterRuntime) -> super::proto::Cap
 }
 
 async fn forward_session_events(
-    session_manager: crate::sessions::manager::SessionManager,
     session_id: SessionId,
     capability_id: String,
-    metadata: CapabilityMetadataRuntime,
     session_mode: CapabilitySessionMode,
-    mut receiver: tokio::sync::mpsc::Receiver<SessionServerEvent>,
+    mut receiver: tokio::sync::broadcast::Receiver<SessionBroadcastEvent>,
     tx: tokio::sync::mpsc::Sender<Result<SessionServerMessage, Status>>,
 ) {
     let session_id_str = session_id.to_string();
 
-    while let Some(event) = receiver.recv().await {
-        let message = session_event_to_proto(
-            &session_id_str,
-            &capability_id,
-            &metadata,
-            session_mode,
-            event,
-        );
-        if tx.send(Ok(message)).await.is_err() {
-            break;
+    loop {
+        match receiver.recv().await {
+            Ok(event) => {
+                let message = session_event_to_proto(
+                    &session_id_str,
+                    &capability_id,
+                    session_mode,
+                    event.event,
+                    event.buffered_output.as_ref(),
+                    event.resume_token.as_deref(),
+                );
+                if tx.send(Ok(message)).await.is_err() {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    session_id = %session_id_str,
+                    skipped,
+                    "Session event consumer lagged behind broadcast buffer"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
-
-    session_manager.remove(&session_id);
 }
 
 async fn forward_client_events(
+    session_manager: crate::sessions::manager::SessionManager,
     session_id: SessionId,
     mut stream: tonic::Streaming<SessionClientMessage>,
     sender: tokio::sync::mpsc::Sender<SessionClientEvent>,
@@ -1152,7 +1183,22 @@ async fn forward_client_events(
                 }
 
                 if let Some(event) = client_message_to_event(message) {
-                    if sender.send(event).await.is_err() {
+                    let forward = match &event {
+                        SessionClientEvent::Heartbeat { .. } => {
+                            let _ = session_manager.touch_heartbeat(&session_id);
+                            true
+                        }
+                        SessionClientEvent::Resume { .. } => {
+                            warn!(
+                                "Received resume request on active attachment for session {}",
+                                session_id_str
+                            );
+                            false
+                        }
+                        _ => true,
+                    };
+
+                    if forward && sender.send(event).await.is_err() {
                         break;
                     }
                 }
@@ -1176,6 +1222,8 @@ async fn forward_client_events(
             }
         }
     }
+
+    let _ = session_manager.detach(&session_id);
 }
 
 fn client_message_to_event(message: SessionClientMessage) -> Option<SessionClientEvent> {
@@ -1196,6 +1244,11 @@ fn client_message_to_event(message: SessionClientMessage) -> Option<SessionClien
         Some(session_client_message::Payload::Close(close)) => Some(SessionClientEvent::Close {
             reason: close.reason,
         }),
+        Some(session_client_message::Payload::Resume(resume)) => Some(SessionClientEvent::Resume {
+            resume_token: resume.resume_token,
+            last_stdout_sequence: resume.last_output_sequence,
+            last_stderr_sequence: resume.last_error_sequence,
+        }),
         None => None,
         Some(session_client_message::Payload::Open(_)) => None,
     }
@@ -1204,9 +1257,10 @@ fn client_message_to_event(message: SessionClientMessage) -> Option<SessionClien
 fn session_event_to_proto(
     session_id: &str,
     capability_id: &str,
-    _metadata: &CapabilityMetadataRuntime,
     session_mode: CapabilitySessionMode,
     event: SessionServerEvent,
+    buffered_output: Option<&crate::sessions::BufferedOutput>,
+    resume_token: Option<&str>,
 ) -> SessionServerMessage {
     let session_mode_proto = match session_mode {
         CapabilitySessionMode::OneShot => super::proto::SessionMode::OneShot as i32,
@@ -1221,6 +1275,7 @@ fn session_event_to_proto(
                 capability_id: capability_id.to_string(),
                 session_mode: session_mode_proto,
                 message,
+                resume_token: resume_token.unwrap_or_default().to_string(),
             })
         }
         SessionServerEvent::Output {
@@ -1233,6 +1288,7 @@ fn session_event_to_proto(
             stderr: Some(stderr),
             binary: Some(binary),
             timestamp_ms,
+            sequence: buffered_output.map(|frame| frame.sequence).unwrap_or(0),
         }),
         SessionServerEvent::Exit {
             exit_code,

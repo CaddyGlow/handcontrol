@@ -1,4 +1,9 @@
 pub mod manager;
+pub mod state;
+
+pub use state::{
+    AttachmentState, BufferedOutput, OutputStream, SessionStateError, SessionStateSnapshot,
+};
 
 use tokio::sync::mpsc;
 
@@ -10,13 +15,28 @@ pub struct SessionEndpoints {
 
 #[derive(Debug)]
 pub enum SessionClientEvent {
-    Input { data: bytes::Bytes, binary: bool },
-    Resize { cols: u32, rows: u32 },
-    Heartbeat { timestamp_ms: i64 },
-    Close { reason: Option<String> },
+    Input {
+        data: bytes::Bytes,
+        binary: bool,
+    },
+    Resize {
+        cols: u32,
+        rows: u32,
+    },
+    Heartbeat {
+        timestamp_ms: i64,
+    },
+    Close {
+        reason: Option<String>,
+    },
+    Resume {
+        resume_token: String,
+        last_stdout_sequence: Option<u64>,
+        last_stderr_sequence: Option<u64>,
+    },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum SessionServerEvent {
     Ready {
         message: Option<String>,

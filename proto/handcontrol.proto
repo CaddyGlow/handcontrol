@@ -216,6 +216,7 @@ message SessionClientMessage {
     SessionResize resize = 4;
     SessionHeartbeat heartbeat = 5;
     SessionClose close = 6;
+    SessionResume resume = 7;
   }
 }
 
@@ -228,6 +229,7 @@ message SessionServerMessage {
     SessionError error = 5;
     SessionHeartbeatAck heartbeat = 6;
     SessionClosed closed = 7;
+    SessionResumeAck resume_ack = 8;
   }
 }
 
@@ -235,6 +237,12 @@ message SessionOpen {
   string capability_id = 1;
   map<string, string> parameters = 2;
   optional string request_id = 3;
+}
+
+message SessionResume {
+  string resume_token = 1;
+  optional uint64 last_output_sequence = 2;
+  optional uint64 last_error_sequence = 3;
 }
 
 message SessionInput {
@@ -259,6 +267,7 @@ message SessionReady {
   string capability_id = 1;
   SessionMode session_mode = 2;
   optional string message = 3;
+  string resume_token = 4;
 }
 
 message SessionOutput {
@@ -266,6 +275,7 @@ message SessionOutput {
   optional bool stderr = 2;
   optional bool binary = 3;
   optional int64 timestamp_ms = 4;
+  uint64 sequence = 5;
 }
 
 message SessionExit {
@@ -286,6 +296,12 @@ message SessionHeartbeatAck {
 
 message SessionClosed {
   optional string reason = 1;
+}
+
+message SessionResumeAck {
+  string resume_token = 1;
+  optional bool replay_complete = 2;
+  optional string message = 3;
 }
 
 // Config hot-reload messages

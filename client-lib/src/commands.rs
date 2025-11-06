@@ -172,6 +172,10 @@ impl CapabilitySession {
                         reason: closed.reason,
                     }));
                 }
+                Some(session_server_message::Payload::ResumeAck(_)) => {
+                    // Resume acknowledgements are not yet surfaced to callers.
+                    continue;
+                }
                 Some(session_server_message::Payload::Ready(_)) => {
                     // Should not arrive after initial handshake; ignore gracefully.
                     continue;

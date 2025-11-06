@@ -24,6 +24,7 @@ import io.grpc.StatusException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.map
@@ -38,9 +39,11 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.channels.awaitClose
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
+import kotlin.text.Charsets
 
 @Singleton
 class GrpcCommandRepository @Inject constructor(
@@ -388,18 +391,25 @@ class GrpcCommandRepository @Inject constructor(
                             }
                             message.hasOutput() -> {
                                 val output = message.output
-                                val isBinary = output.binary ?: false
-                                val data = output.data
-                                val text = if (isBinary) {
-                                    "[binary output: ${data.size()} bytes]"
-                                } else {
-                                    data.toStringUtf8()
+                                val rawBinary = output.binary ?: false
+                                val dataBytes = output.data.toByteArray()
+                                val decoded = try {
+                                    dataBytes.toString(Charsets.UTF_8)
+                                } catch (_: Exception) {
+                                    ""
                                 }
+                                val hasReplacement = decoded.contains('\uFFFD')
+                                val displayText = if (rawBinary && (decoded.isEmpty() || hasReplacement)) {
+                                    "[binary output: ${dataBytes.size} bytes]"
+                                } else {
+                                    decoded
+                                }
+
                                 trySend(
                                     ShellSessionEvent.Output(
-                                        text = text,
+                                        text = displayText,
                                         isError = output.stderr ?: false,
-                                        isBinary = isBinary,
+                                        isBinary = rawBinary && (decoded.isEmpty() || hasReplacement),
                                         timestampMs = output.timestampMs
                                     )
                                 )
@@ -454,6 +464,11 @@ class GrpcCommandRepository @Inject constructor(
                         )
                     }
                     close()
+                    try {
+                        connectionManager.disconnect(connectionResult)
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to disconnect shell session channel")
+                    }
                 }
             }
 
@@ -461,7 +476,6 @@ class GrpcCommandRepository @Inject constructor(
                 heartbeatJob?.cancel()
                 collectorJob.cancel()
                 requestChannel.close()
-                connectionManager.disconnect(connectionResult)
             }
         }
 
@@ -536,32 +550,32 @@ class GrpcCommandRepository @Inject constructor(
 
     private fun mapCapabilityKind(protoKind: ProtoCapabilityKind): CommandKind {
         return when (protoKind) {
-            ProtoCapabilityKind.SHELL_SCRIPT -> CommandKind.SHELL_SCRIPT
-            ProtoCapabilityKind.SHELL_INTERACTIVE -> CommandKind.SHELL_INTERACTIVE
-            ProtoCapabilityKind.FILE_TRANSFER -> CommandKind.FILE_TRANSFER
-            ProtoCapabilityKind.UNSPECIFIED,
+            ProtoCapabilityKind.CAPABILITY_KIND_SHELL_SCRIPT -> CommandKind.SHELL_SCRIPT
+            ProtoCapabilityKind.CAPABILITY_KIND_SHELL_INTERACTIVE -> CommandKind.SHELL_INTERACTIVE
+            ProtoCapabilityKind.CAPABILITY_KIND_FILE_TRANSFER -> CommandKind.FILE_TRANSFER
+            ProtoCapabilityKind.CAPABILITY_KIND_UNSPECIFIED,
             ProtoCapabilityKind.UNRECOGNIZED -> CommandKind.UNKNOWN
         }
     }
 
     private fun mapSessionMode(protoMode: ProtoSessionMode): CommandSessionMode {
         return when (protoMode) {
-            ProtoSessionMode.ONE_SHOT -> CommandSessionMode.ONE_SHOT
-            ProtoSessionMode.REALTIME -> CommandSessionMode.REALTIME
-            ProtoSessionMode.UPLOAD -> CommandSessionMode.UPLOAD
-            ProtoSessionMode.DOWNLOAD -> CommandSessionMode.DOWNLOAD
-            ProtoSessionMode.UNSPECIFIED,
+            ProtoSessionMode.SESSION_MODE_ONE_SHOT -> CommandSessionMode.ONE_SHOT
+            ProtoSessionMode.SESSION_MODE_REALTIME -> CommandSessionMode.REALTIME
+            ProtoSessionMode.SESSION_MODE_UPLOAD -> CommandSessionMode.UPLOAD
+            ProtoSessionMode.SESSION_MODE_DOWNLOAD -> CommandSessionMode.DOWNLOAD
+            ProtoSessionMode.SESSION_MODE_UNSPECIFIED,
             ProtoSessionMode.UNRECOGNIZED -> CommandSessionMode.UNSPECIFIED
         }
     }
 
     private fun mapParameterType(protoType: ProtoCapabilityParameterType): ParameterType {
         return when (protoType) {
-            ProtoCapabilityParameterType.SLIDER -> ParameterType.SLIDER
-            ProtoCapabilityParameterType.TEXT -> ParameterType.TEXT
-            ProtoCapabilityParameterType.TOGGLE -> ParameterType.TOGGLE
-            ProtoCapabilityParameterType.DROPDOWN -> ParameterType.DROPDOWN
-            ProtoCapabilityParameterType.UNSPECIFIED,
+            ProtoCapabilityParameterType.CAPABILITY_PARAMETER_TYPE_SLIDER -> ParameterType.SLIDER
+            ProtoCapabilityParameterType.CAPABILITY_PARAMETER_TYPE_TEXT -> ParameterType.TEXT
+            ProtoCapabilityParameterType.CAPABILITY_PARAMETER_TYPE_TOGGLE -> ParameterType.TOGGLE
+            ProtoCapabilityParameterType.CAPABILITY_PARAMETER_TYPE_DROPDOWN -> ParameterType.DROPDOWN
+            ProtoCapabilityParameterType.CAPABILITY_PARAMETER_TYPE_UNSPECIFIED,
             ProtoCapabilityParameterType.UNRECOGNIZED -> ParameterType.UNSPECIFIED
         }
     }

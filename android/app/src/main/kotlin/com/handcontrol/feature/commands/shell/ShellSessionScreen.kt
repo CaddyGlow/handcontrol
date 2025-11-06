@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -85,6 +86,8 @@ fun ShellSessionScreen(
         }
     }
 
+    val errorMessage = uiState.errorMessage
+
     Scaffold(
         modifier = modifier,
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -124,9 +127,9 @@ fun ShellSessionScreen(
             uiState.isLoading -> {
                 LoadingShellContent(Modifier.padding(paddingValues))
             }
-            uiState.errorMessage != null && uiState.command == null -> {
+            errorMessage != null && uiState.command == null -> {
                 ErrorShellContent(
-                    message = uiState.errorMessage,
+                    message = errorMessage,
                     onRetry = { viewModel.load(serverId, commandId) },
                     modifier = Modifier.padding(paddingValues)
                 )
@@ -180,23 +183,34 @@ private fun ShellSessionContent(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
-            if (command.parameters.isNotEmpty() &&
-                uiState.connectionState !is ShellConnectionState.Active
-            ) {
-                ParameterSection(
-                    command = command,
-                    parameterStates = uiState.parameterStates,
-                    dynamicLoading = uiState.dynamicLoading,
-                    onUpdateParameter = onUpdateParameter,
-                    onRefreshDefault = onRefreshDefault
-                )
+            val showStartControls =
+                uiState.connectionState !is ShellConnectionState.Active &&
+                    uiState.connectionState !is ShellConnectionState.Connecting
+
+            if (showStartControls) {
+                if (command.parameters.isNotEmpty()) {
+                    ParameterSection(
+                        command = command,
+                        parameterStates = uiState.parameterStates,
+                        dynamicLoading = uiState.dynamicLoading,
+                        onUpdateParameter = onUpdateParameter,
+                        onRefreshDefault = onRefreshDefault
+                    )
+                }
+
+                val startLabel = when (uiState.connectionState) {
+                    is ShellConnectionState.Completed -> "Restart Session"
+                    is ShellConnectionState.Failed -> "Retry Session"
+                    is ShellConnectionState.Closed -> "Start Session"
+                    else -> "Start Session"
+                }
 
                 Button(
                     onClick = onStartSession,
-                    enabled = uiState.isFormValid && uiState.connectionState !is ShellConnectionState.Connecting,
+                    enabled = uiState.isFormValid,
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("Start Session")
+                    Text(startLabel)
                 }
             }
         }

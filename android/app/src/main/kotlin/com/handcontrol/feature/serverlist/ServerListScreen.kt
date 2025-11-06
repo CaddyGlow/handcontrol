@@ -280,22 +280,26 @@ private fun ServerCard(
 
                 Spacer(modifier = Modifier.height(4.dp))
 
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
+                    // Address line with overflow handling
                     Text(
                         text = "${server.ips.firstOrNull() ?: server.serverHost ?: "unknown"}:${server.serverPort}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                        style = MaterialTheme.typography.bodyMedium.copy(
+                            fontFeatureSettings = "tnum"
+                        ),
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
 
-                    // Connection mode indicator
-                    if (server.relayEnabled && !server.relayUrl.isNullOrEmpty()) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(4.dp)
-                        ) {
+                    // Connection mode indicator on separate line
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (server.relayEnabled && !server.relayUrl.isNullOrEmpty()) {
                             Icon(
                                 imageVector = Icons.Filled.Cloud,
                                 contentDescription = "Relay available",
@@ -307,19 +311,19 @@ private fun ServerCard(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.secondary
                             )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Filled.Wifi,
+                                contentDescription = "Direct connection only",
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Text(
+                                text = "Direct only",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                            )
                         }
-                    } else {
-                        Icon(
-                            imageVector = Icons.Filled.Wifi,
-                            contentDescription = "Direct connection only",
-                            tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
-                            modifier = Modifier.size(14.dp)
-                        )
-                        Text(
-                            text = "Direct only",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
-                        )
                     }
                 }
 

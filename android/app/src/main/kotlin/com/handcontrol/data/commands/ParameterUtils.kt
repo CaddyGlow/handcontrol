@@ -93,7 +93,8 @@ fun validateParameterValue(
                 ValidationResult.Invalid("Invalid selection")
             }
         }
-        CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_UNSPECIFIED -> {
+        CapabilityParameterType.CAPABILITY_PARAMETER_TYPE_UNSPECIFIED,
+        CapabilityParameterType.UNRECOGNIZED -> {
             ValidationResult.Invalid("Unknown parameter type")
         }
     }

@@ -10,6 +10,7 @@ import com.google.protobuf.ByteString
 import com.handcontrol.grpc.CapabilityKind as ProtoCapabilityKind
 import com.handcontrol.grpc.CapabilityParameterType as ProtoCapabilityParameterType
 import com.handcontrol.grpc.ListCapabilitiesRequest
+import com.handcontrol.grpc.ListSessionsRequest
 import com.handcontrol.grpc.RemoteControlGrpcKt
 import com.handcontrol.grpc.ServerInfoRequest
 import com.handcontrol.grpc.SessionClientMessage
@@ -19,11 +20,15 @@ import com.handcontrol.grpc.SessionInput
 import com.handcontrol.grpc.SessionMode as ProtoSessionMode
 import com.handcontrol.grpc.SessionOpen
 import com.handcontrol.grpc.SessionResize
+import com.handcontrol.grpc.SessionResume
 import io.grpc.Status
 import io.grpc.StatusException
+import io.grpc.StatusRuntimeException
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -44,6 +49,7 @@ import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlin.text.Charsets
+import kotlin.math.max
 
 @Singleton
 class GrpcCommandRepository @Inject constructor(
@@ -285,44 +291,265 @@ class GrpcCommandRepository @Inject constructor(
             }
     }
 
+    override suspend fun listSessions(serverId: String): Result<List<ActiveCommandSession>> =
+        withContext(Dispatchers.IO) {
+            val server = enrolledServerRepository.getServerById(serverId)
+                ?: return@withContext Result.failure(Exception("Server not found: $serverId"))
+
+            val connectionResult = try {
+                connectionManager.connect(server)
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to connect for listing sessions")
+                return@withContext Result.failure(e)
+            }
+
+            val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(connectionResult.channel)
+
+            try {
+                val response = stub.listSessions(ListSessionsRequest.newBuilder().build())
+                try {
+                    verifyServerCertificate(server, connectionResult)
+                    enrolledServerRepository.updateConnectionMode(serverId, connectionResult.mode)
+                } catch (e: SecurityException) {
+                    Timber.e(e, "Certificate verification failed while listing sessions")
+                    return@withContext Result.failure(e)
+                }
+
+                val sessions = response.sessionsList.map { info ->
+                    ActiveCommandSession(
+                        sessionId = info.sessionId,
+                        capabilityId = info.capabilityId,
+                        capabilityName = info.capabilityName,
+                        sessionMode = mapSessionMode(info.sessionMode),
+                        attached = info.attached,
+                        ownerFingerprint = info.ownerFingerprint,
+                        createdAtMs = info.createdAtMs,
+                        lastActivityMs = info.lastActivityMs,
+                        lastDetachedMs = if (info.hasLastDetachedMs()) info.lastDetachedMs else null,
+                        resumeToken = info.resumeToken,
+                        stdoutNextSequence = info.stdoutNextSequence,
+                        stderrNextSequence = info.stderrNextSequence,
+                        bufferLength = info.bufferLen
+                    )
+                }
+
+                Result.success(sessions)
+            } catch (e: StatusException) {
+                Timber.e(e, "ListSessions RPC failed")
+                Result.failure(Exception(mapGrpcError(e.status)))
+            } catch (e: Exception) {
+                Timber.e(e, "Failed to list sessions")
+                Result.failure(e)
+            } finally {
+                connectionManager.disconnect(connectionResult)
+            }
+        }
+
     override suspend fun openShellSession(
         serverId: String,
         commandId: String,
         parameters: Map<String, String>,
-        terminalSize: TerminalSize?
+        terminalSize: TerminalSize?,
+        resumeSpec: ResumeSessionSpec?
     ): Result<ShellSession> = withContext(Dispatchers.IO) {
         val server = enrolledServerRepository.getServerById(serverId)
             ?: return@withContext Result.failure(Exception("Server not found: $serverId"))
 
         Timber.i("Opening realtime shell session to capability $commandId on ${server.serverName}")
 
-        val connectionResult = try {
-            connectionManager.connect(server)
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to connect for shell session")
-            return@withContext Result.failure(e)
+        val writeHandler = AtomicReference<suspend (ByteArray) -> Unit> {
+            throw IllegalStateException("Shell session is not ready yet")
         }
-
-        val channel = connectionResult.channel
-        val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(channel)
-
-        val requestChannel = Channel<SessionClientMessage>(capacity = Channel.BUFFERED)
-        val sessionIdDeferred = CompletableDeferred<String>()
-        val certificateVerified = AtomicBoolean(false)
-        var heartbeatJob: Job? = null
-        val responseFlow = stub.openSession(requestChannel.receiveAsFlow())
-
-        val heartbeatIntervalMs = 15_000L
+        val resizeHandler = AtomicReference<suspend (TerminalSize) -> Unit> { _ -> }
+        val closeHandler = AtomicReference<suspend (String?) -> Unit> { _ -> }
+        val lastTerminalSize = AtomicReference(terminalSize)
+        val userClosed = AtomicBoolean(false)
 
         val events = callbackFlow<ShellSessionEvent> {
-            var pendingResize = terminalSize != null
+            val resumeState = CapabilityResumeState().apply {
+                if (resumeSpec != null) {
+                    sessionId = resumeSpec.sessionId
+                    resumeToken = resumeSpec.resumeToken
+                    lastStdoutSequence = resumeSpec.lastStdoutSequence
+                    lastStderrSequence = resumeSpec.lastStderrSequence
+                }
+            }
+            var resumeAttempts = 0
+            var pendingReconnect = resumeSpec != null
 
-            val collectorJob = launch {
+            fun shouldAttemptResume(throwable: Throwable): Boolean {
+                if (userClosed.get() || !resumeState.canResume()) return false
+                val status = when (throwable) {
+                    is StatusException -> throwable.status
+                    is StatusRuntimeException -> throwable.status
+                    else -> null
+                }
+                return when (status?.code) {
+                    Status.Code.CANCELLED,
+                    Status.Code.INVALID_ARGUMENT,
+                    Status.Code.NOT_FOUND,
+                    Status.Code.PERMISSION_DENIED,
+                    Status.Code.UNIMPLEMENTED,
+                    Status.Code.ALREADY_EXISTS,
+                    Status.Code.DATA_LOSS -> false
+                    Status.Code.UNAVAILABLE,
+                    Status.Code.UNKNOWN,
+                    Status.Code.DEADLINE_EXCEEDED,
+                    Status.Code.INTERNAL,
+                    Status.Code.ABORTED -> true
+                    null -> throwable is java.io.IOException
+                    else -> false
+                }
+            }
+
+            while (isActive && !userClosed.get()) {
+                val connectionResult = try {
+                    connectionManager.connect(server)
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to connect for shell session")
+                    trySend(ShellSessionEvent.Error(e.message ?: "Failed to connect to server"))
+                    break
+                }
+
+                Timber.d("Connected via ${connectionResult.mode} mode for realtime session")
+
+                val requestChannel = Channel<SessionClientMessage>(capacity = Channel.BUFFERED)
+                val sessionIdDeferred = CompletableDeferred<String>()
+                if (pendingReconnect && resumeState.sessionId != null) {
+                    sessionIdDeferred.complete(resumeState.sessionId!!)
+                }
+                val certificateVerified = AtomicBoolean(false)
+                val heartbeatIntervalMs = 15_000L
+                var heartbeatJob: Job? = null
+                var pendingResize = lastTerminalSize.get()
+                var resumePlanned = false
+                var failure: Throwable? = null
+
+                fun scheduleHeartbeat() {
+                    if (heartbeatJob != null) return
+                    heartbeatJob = launch {
+                        val sessionId = sessionIdDeferred.await()
+                        while (isActive && !userClosed.get()) {
+                            try {
+                                delay(heartbeatIntervalMs)
+                                val heartbeat = SessionClientMessage.newBuilder()
+                                    .setSessionId(sessionId)
+                                    .setHeartbeat(
+                                        SessionHeartbeat.newBuilder()
+                                            .setTimestampMs(System.currentTimeMillis())
+                                            .build()
+                                    )
+                                    .build()
+                                requestChannel.send(heartbeat)
+                            } catch (e: Exception) {
+                                Timber.v(e, "Heartbeat loop terminating for $commandId")
+                                break
+                            }
+                        }
+                    }
+                }
+
+                val stub = RemoteControlGrpcKt.RemoteControlCoroutineStub(connectionResult.channel)
+
+                writeHandler.set { data ->
+                    val sessionId = sessionIdDeferred.await()
+                    val inputMessage = SessionClientMessage.newBuilder()
+                        .setSessionId(sessionId)
+                        .setInput(
+                            SessionInput.newBuilder()
+                                .setData(ByteString.copyFrom(data))
+                                .build()
+                        )
+                        .build()
+                    requestChannel.send(inputMessage)
+                }
+
+                resizeHandler.set { size ->
+                    lastTerminalSize.set(size)
+                    val sessionId = sessionIdDeferred.await()
+                    val resizeMessage = SessionClientMessage.newBuilder()
+                        .setSessionId(sessionId)
+                        .setResize(
+                            SessionResize.newBuilder()
+                                .setCols(size.cols)
+                                .setRows(size.rows)
+                                .build()
+                        )
+                        .build()
+                    requestChannel.send(resizeMessage)
+                }
+
+                closeHandler.set { reason ->
+                    if (userClosed.compareAndSet(false, true)) {
+                        Timber.d("Closing realtime shell session locally (reason=$reason)")
+                    }
+                    val sessionId = sessionIdDeferred.await()
+                    val closeMessage = SessionClientMessage.newBuilder()
+                        .setSessionId(sessionId)
+                        .setClose(
+                            SessionClose.newBuilder()
+                                .apply { reason?.let { setReason(it) } }
+                                .build()
+                        )
+                        .build()
+                    try {
+                        requestChannel.send(closeMessage)
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to send close message for shell session")
+                    } finally {
+                        requestChannel.close()
+                    }
+                }
+
+                val resuming = pendingReconnect && resumeState.canResume()
+                val initialMessage = if (resuming) {
+                    val resume = SessionResume.newBuilder()
+                        .setResumeToken(resumeState.resumeToken)
+                        .setLastOutputSequence(resumeState.lastStdoutSequence)
+                        .setLastErrorSequence(resumeState.lastStderrSequence)
+                        .build()
+                    SessionClientMessage.newBuilder()
+                        .setSessionId(resumeState.sessionId)
+                        .setResume(resume)
+                        .build()
+                } else {
+                    SessionClientMessage.newBuilder()
+                        .setOpen(
+                            SessionOpen.newBuilder()
+                                .setCapabilityId(commandId)
+                                .putAllParameters(parameters)
+                                .build()
+                        )
+                        .build()
+                }
+
+                try {
+                    requestChannel.send(initialMessage)
+                } catch (e: Exception) {
+                    Timber.e(e, "Failed to send session ${if (resuming) "resume" else "open"} message")
+                    requestChannel.close()
+                    connectionManager.disconnect(connectionResult)
+                    trySend(ShellSessionEvent.Error(e.message ?: "Failed to start shell session"))
+                    break
+                }
+
+                pendingReconnect = false
+
+                if (sessionIdDeferred.isCompleted) {
+                    scheduleHeartbeat()
+                }
+
+                val responseFlow = stub.openSession(requestChannel.receiveAsFlow())
+
                 try {
                     responseFlow.collect { message ->
                         val sessionIdValue = message.sessionId.takeIf { it.isNotBlank() }
-                        if (sessionIdValue != null && !sessionIdDeferred.isCompleted) {
-                            sessionIdDeferred.complete(sessionIdValue)
+                        if (sessionIdValue != null) {
+                            resumeState.sessionId = sessionIdValue
+                            if (!sessionIdDeferred.isCompleted) {
+                                sessionIdDeferred.complete(sessionIdValue)
+                                scheduleHeartbeat()
+                            }
                         }
 
                         if (!certificateVerified.get()) {
@@ -345,49 +572,41 @@ class GrpcCommandRepository @Inject constructor(
                         when {
                             message.hasReady() -> {
                                 val ready = message.ready
-                                val sessionId = if (sessionIdDeferred.isCompleted) {
-                                    sessionIdDeferred.getCompleted()
-                                } else {
-                                    null
-                                }
-
-                                if (heartbeatJob == null && sessionId != null) {
-                                    heartbeatJob = launch {
-                                        while (isActive) {
-                                            delay(heartbeatIntervalMs)
-                                            val heartbeat = SessionClientMessage.newBuilder()
-                                                .setSessionId(sessionId)
-                                                .setHeartbeat(
-                                                    SessionHeartbeat.newBuilder()
-                                                        .setTimestampMs(System.currentTimeMillis())
-                                                        .build()
-                                                )
-                                                .build()
-                                            requestChannel.send(heartbeat)
-                                        }
-                                    }
-                                }
-
-                                if (pendingResize && sessionId != null && terminalSize != null) {
-                                    pendingResize = false
-                                    val resizeMessage = SessionClientMessage.newBuilder()
-                                        .setSessionId(sessionId)
-                                        .setResize(
-                                            SessionResize.newBuilder()
-                                                .setCols(terminalSize.cols)
-                                                .setRows(terminalSize.rows)
-                                                .build()
-                                        )
-                                        .build()
-                                    requestChannel.send(resizeMessage)
-                                }
-
+                                resumeState.resumeToken = ready.resumeToken
                                 trySend(
                                     ShellSessionEvent.Ready(
                                         capabilityId = ready.capabilityId,
                                         message = ready.message
                                     )
                                 )
+                                resumeAttempts = 0
+
+                                pendingResize?.let { size ->
+                                    pendingResize = null
+                                    launch {
+                                        try {
+                                            resizeHandler.get().invoke(size)
+                                        } catch (e: Exception) {
+                                            Timber.w(e, "Failed to send initial terminal resize")
+                                        }
+                                    }
+                                }
+                            }
+                            message.hasResumeAck() -> {
+                                val ack = message.resumeAck
+                                resumeState.resumeToken = ack.resumeToken
+                                resumeAttempts = 0
+                                trySend(ShellSessionEvent.ResumeAcknowledged(ack.message))
+                                pendingResize?.let { size ->
+                                    pendingResize = null
+                                    launch {
+                                        try {
+                                            resizeHandler.get().invoke(size)
+                                        } catch (e: Exception) {
+                                            Timber.w(e, "Failed to send terminal resize after resume")
+                                        }
+                                    }
+                                }
                             }
                             message.hasOutput() -> {
                                 val output = message.output
@@ -397,6 +616,13 @@ class GrpcCommandRepository @Inject constructor(
                                     dataBytes.toString(Charsets.UTF_8)
                                 }.getOrNull()
                                 val hasReplacement = decoded?.contains('\uFFFD') == true
+
+                                val sequence = output.sequence
+                                if (output.stderr == true) {
+                                    resumeState.lastStderrSequence = max(resumeState.lastStderrSequence, sequence)
+                                } else {
+                                    resumeState.lastStdoutSequence = max(resumeState.lastStdoutSequence, sequence)
+                                }
 
                                 trySend(
                                     ShellSessionEvent.Output(
@@ -410,6 +636,7 @@ class GrpcCommandRepository @Inject constructor(
                             }
                             message.hasExit() -> {
                                 val exit = message.exit
+                                resumeState.clear()
                                 trySend(
                                     ShellSessionEvent.Exit(
                                         exitCode = exit.exitCode,
@@ -438,6 +665,7 @@ class GrpcCommandRepository @Inject constructor(
                             }
                             message.hasClosed() -> {
                                 val closed = message.closed
+                                resumeState.clear()
                                 trySend(ShellSessionEvent.Closed(closed.reason))
                             }
                             else -> {
@@ -446,100 +674,76 @@ class GrpcCommandRepository @Inject constructor(
                         }
                     }
                 } catch (e: StatusException) {
-                    Timber.e(e, "Shell session stream failed")
-                    trySend(ShellSessionEvent.Error(mapGrpcError(e.status)))
-                } catch (e: Exception) {
-                    Timber.e(e, "Shell session terminated unexpectedly")
-                    trySend(ShellSessionEvent.Error(e.message ?: "Shell session failed"))
-                } finally {
-                    if (!sessionIdDeferred.isCompleted) {
-                        sessionIdDeferred.completeExceptionally(
-                            IllegalStateException("Session ended before it was ready")
-                        )
+                    failure = e
+                    resumePlanned = shouldAttemptResume(e)
+                    if (resumePlanned) {
+                        resumeAttempts += 1
+                        trySend(ShellSessionEvent.Resuming(resumeAttempts))
+                    } else if (!userClosed.get()) {
+                        Timber.e(e, "Shell session stream failed")
+                        trySend(ShellSessionEvent.Error(mapGrpcError(e.status)))
                     }
-                    close()
+                } catch (e: StatusRuntimeException) {
+                    failure = e
+                    resumePlanned = shouldAttemptResume(e)
+                    if (resumePlanned) {
+                        resumeAttempts += 1
+                        trySend(ShellSessionEvent.Resuming(resumeAttempts))
+                    } else if (!userClosed.get()) {
+                        Timber.e(e, "Shell session stream failed")
+                        trySend(ShellSessionEvent.Error(mapGrpcError(e.status)))
+                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException && userClosed.get()) {
+                        failure = null
+                        resumePlanned = false
+                    } else {
+                        failure = e
+                        resumePlanned = shouldAttemptResume(e)
+                        if (resumePlanned) {
+                            resumeAttempts += 1
+                            trySend(ShellSessionEvent.Resuming(resumeAttempts))
+                        } else if (!userClosed.get()) {
+                            Timber.e(e, "Shell session terminated unexpectedly")
+                            trySend(ShellSessionEvent.Error(e.message ?: "Shell session failed"))
+                        }
+                    }
+                } finally {
+                    heartbeatJob?.cancel()
+                    requestChannel.close()
                     try {
                         connectionManager.disconnect(connectionResult)
                     } catch (e: Exception) {
                         Timber.w(e, "Failed to disconnect shell session channel")
                     }
+
+                    if (!sessionIdDeferred.isCompleted && failure == null) {
+                        sessionIdDeferred.completeExceptionally(
+                            IllegalStateException("Session ended before it was ready")
+                        )
+                    }
                 }
+
+                if (!resumePlanned || userClosed.get()) {
+                    break
+                }
+
+                pendingReconnect = true
             }
 
             awaitClose {
-                heartbeatJob?.cancel()
-                collectorJob.cancel()
-                requestChannel.close()
+                userClosed.set(true)
             }
         }
 
-        val openMessage = SessionClientMessage.newBuilder()
-            .setOpen(
-                SessionOpen.newBuilder()
-                    .setCapabilityId(commandId)
-                    .putAllParameters(parameters)
-                    .build()
-            )
-            .build()
-
-        try {
-            requestChannel.send(openMessage)
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to send session open message")
-            requestChannel.close()
-            connectionManager.disconnect(connectionResult)
-            return@withContext Result.failure(e)
-        }
-
-        val writeInput: suspend (ByteArray) -> Unit = { data ->
-            val sessionId = sessionIdDeferred.await()
-            val inputMessage = SessionClientMessage.newBuilder()
-                .setSessionId(sessionId)
-                .setInput(
-                    SessionInput.newBuilder()
-                        .setData(ByteString.copyFrom(data))
-                        .build()
-                )
-                .build()
-            requestChannel.send(inputMessage)
-        }
-
-        val resize: suspend (TerminalSize) -> Unit = { size ->
-            val sessionId = sessionIdDeferred.await()
-            val resizeMessage = SessionClientMessage.newBuilder()
-                .setSessionId(sessionId)
-                .setResize(
-                    SessionResize.newBuilder()
-                        .setCols(size.cols)
-                        .setRows(size.rows)
-                        .build()
-                )
-                .build()
-            requestChannel.send(resizeMessage)
-        }
-
-        val close: suspend (String?) -> Unit = { reason ->
-            val sessionId = sessionIdDeferred.await()
-            val closeMessage = SessionClientMessage.newBuilder()
-                .setSessionId(sessionId)
-                .setClose(
-                    SessionClose.newBuilder()
-                        .apply { reason?.let { setReason(it) } }
-                        .build()
-                )
-                .build()
-            requestChannel.send(closeMessage)
-            requestChannel.close()
-        }
-
-        Result.success(
-            ShellSession(
-                events = events,
-                writeInput = writeInput,
-                resize = resize,
-                close = close
-            )
+        val shellSession = ShellSession(
+            events = events,
+            writeInput = { data -> writeHandler.get()(data) },
+            resize = { size -> resizeHandler.get()(size) },
+            close = { reason -> closeHandler.get()(reason) }
         )
+
+        Result.success(shellSession)
     }
 
     private fun mapCapabilityKind(protoKind: ProtoCapabilityKind): CommandKind {
@@ -612,6 +816,20 @@ class GrpcCommandRepository @Inject constructor(
             Status.Code.DEADLINE_EXCEEDED -> "Request timeout"
             Status.Code.UNAVAILABLE -> "Server unavailable"
             else -> "Network error: ${status.description ?: status.code}"
+        }
+    }
+
+    private data class CapabilityResumeState(
+        var sessionId: String? = null,
+        var resumeToken: String? = null,
+        var lastStdoutSequence: Long = 0,
+        var lastStderrSequence: Long = 0
+    ) {
+        fun canResume(): Boolean = !sessionId.isNullOrBlank() && !resumeToken.isNullOrBlank()
+        fun clear() {
+            resumeToken = null
+            lastStdoutSequence = 0
+            lastStderrSequence = 0
         }
     }
 }

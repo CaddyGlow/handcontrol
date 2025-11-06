@@ -21,6 +21,7 @@ import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -32,6 +33,7 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
@@ -39,12 +41,15 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterInputState
 import com.handcontrol.ui.components.parameters.ParameterInput
@@ -53,6 +58,8 @@ import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import timber.log.Timber
+import java.text.DateFormat
+import java.util.Date
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -75,6 +82,20 @@ fun ShellSessionScreen(
         }
     }
 
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_STOP) {
+                viewModel.detachSession()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.detachSession()
+        }
+    }
+
     val errorMessage = uiState.errorMessage
 
     Scaffold(
@@ -90,7 +111,12 @@ fun ShellSessionScreen(
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onNavigateBack) {
+                    IconButton(
+                        onClick = {
+                            viewModel.detachSession()
+                            onNavigateBack()
+                        }
+                    ) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back"
@@ -135,6 +161,7 @@ fun ShellSessionScreen(
                     uiState = uiState,
                     onUpdateParameter = viewModel::updateParameter,
                     onRefreshDefault = viewModel::refreshDefault,
+                    onResumeSession = viewModel::resumeSession,
                     onStartSession = viewModel::startSession,
                     onSendCtrlC = viewModel::sendCtrlC,
                     onRegisterBridge = viewModel::registerTerminalBridge,
@@ -152,6 +179,7 @@ private fun ShellSessionContent(
     uiState: ShellSessionUiState,
     onUpdateParameter: (String, String) -> Unit,
     onRefreshDefault: (String) -> Unit,
+    onResumeSession: (ResumeCandidate) -> Unit,
     onStartSession: () -> Unit,
     onSendCtrlC: () -> Unit,
     onRegisterBridge: (ComposeTerminalBridgeHandle) -> Unit,
@@ -177,6 +205,18 @@ private fun ShellSessionContent(
                     uiState.connectionState !is ShellConnectionState.Connecting
 
             if (showStartControls) {
+                if (uiState.resumeCandidates.isNotEmpty()) {
+                    ResumeSessionSection(
+                        candidates = uiState.resumeCandidates,
+                        onResumeSession = onResumeSession,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (command.parameters.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                    }
+                }
+
                 if (command.parameters.isNotEmpty()) {
                     ParameterSection(
                         command = command,
@@ -584,6 +624,86 @@ private class ComposeTerminalBridge(
     override fun onEmulatorSet() {
         Timber.d("Terminal emulator attached")
         focusAndShowKeyboard()
+    }
+}
+
+@Composable
+private fun ResumeSessionSection(
+    candidates: List<ResumeCandidate>,
+    onResumeSession: (ResumeCandidate) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = "Resume an existing session",
+            style = MaterialTheme.typography.titleMedium
+        )
+
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            candidates.forEach { candidate ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text(
+                            text = candidate.capabilityName,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+
+                        val shortId = remember(candidate.sessionId) {
+                            if (candidate.sessionId.length > 12) {
+                                candidate.sessionId.take(8) + "…"
+                            } else {
+                                candidate.sessionId
+                            }
+                        }
+
+                        Text(
+                            text = "Session ID: $shortId",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+
+                        val lastActivity = candidate.lastActivityMs.takeIf { it > 0 }
+                        if (lastActivity != null) {
+                            val lastActivityText = remember(lastActivity) {
+                                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+                                    .format(Date(lastActivity))
+                            }
+                            Text(
+                                text = "Last activity: $lastActivityText",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        if (candidate.bufferLength > 0) {
+                            Text(
+                                text = "Buffered frames: ${candidate.bufferLength}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+
+                        Button(
+                            onClick = { onResumeSession(candidate) },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Resume session")
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

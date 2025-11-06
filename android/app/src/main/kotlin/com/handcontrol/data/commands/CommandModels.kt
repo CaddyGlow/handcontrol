@@ -120,6 +120,8 @@ data class TerminalSize(val cols: Int, val rows: Int)
  */
 sealed class ShellSessionEvent {
     data class Ready(val capabilityId: String, val message: String?) : ShellSessionEvent()
+    data class Resuming(val attempt: Int) : ShellSessionEvent()
+    data class ResumeAcknowledged(val message: String?) : ShellSessionEvent()
     data class Output(
         val data: ByteArray,
         val isError: Boolean,
@@ -141,4 +143,33 @@ data class ShellSession(
     val writeInput: suspend (ByteArray) -> Unit,
     val resize: suspend (TerminalSize) -> Unit,
     val close: suspend (String?) -> Unit
+)
+
+/**
+ * Server-tracked realtime session metadata.
+ */
+data class ActiveCommandSession(
+    val sessionId: String,
+    val capabilityId: String,
+    val capabilityName: String,
+    val sessionMode: CommandSessionMode,
+    val attached: Boolean,
+    val ownerFingerprint: String?,
+    val createdAtMs: Long,
+    val lastActivityMs: Long,
+    val lastDetachedMs: Long?,
+    val resumeToken: String,
+    val stdoutNextSequence: Long,
+    val stderrNextSequence: Long,
+    val bufferLength: Int
+)
+
+/**
+ * Minimal state required to resume a realtime session.
+ */
+data class ResumeSessionSpec(
+    val sessionId: String,
+    val resumeToken: String,
+    val lastStdoutSequence: Long,
+    val lastStderrSequence: Long
 )

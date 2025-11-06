@@ -30,6 +30,12 @@ interface CommandRepository {
         serverId: String,
         commandId: String,
         parameters: Map<String, String>,
-        terminalSize: TerminalSize? = null
+        terminalSize: TerminalSize? = null,
+        resumeSpec: ResumeSessionSpec? = null
     ): Result<ShellSession>
+
+    /**
+     * List active capability sessions tracked by the server.
+     */
+    suspend fun listSessions(serverId: String): Result<List<ActiveCommandSession>>
 }

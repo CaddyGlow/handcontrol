@@ -48,3 +48,6 @@ The server can be configured to auto-connect, register its public key, and mint 
 
 ## Known Gaps
 - Documentation predates portions of the workspace split. Double-check crate names and paths against the current tree when following older guides.
+
+## License
+HandControl is released under the MIT License; see `LICENSE` for details. Third-party modules, such as the Termux-derived terminal components, remain under their original open-source terms and are documented in `THIRD_PARTY_NOTICES.md` and `docs/android-terminal-integration-plan.md`.

@@ -25,7 +25,7 @@ cargo run -p handcontrol-server -- serve
 cargo run -p handcontrol-server -- enroll --qr
 ```
 
-The server writes its configuration to `~/.config/handcontrol/config.toml` (or the platform equivalent) on first run. Edit this file to curate command definitions, adjust enrollment policies, or enable the relay client.
+The server writes its configuration to `~/.config/handcontrol/config.toml` (or the platform equivalent) on first run. Edit this file to curate command definitions, adjust enrollment policies, or enable the relay client. Set `HANDCONTROL_CONFIG_DIR=/path/to/dir` before launching any HandControl binary to override the entire suite's config root (server, CLI, TUI, and shared client storage).
 
 ## Clients
 - **CLI:** `cargo run -p handcontrol-cli -- discover` for mDNS discovery, `... -- enroll qr --payload '<json>'` for QR onboarding, and `... -- exec <server> <command_id>` to invoke commands.
@@ -40,11 +40,16 @@ cargo run -p handcontrol-relay -- --config relay.toml
 ```
 The server can be configured to auto-connect, register its public key, and mint JWT relay tokens for enrolled clients.
 
+Relay also respects `HANDCONTROL_RELAY_CONFIG_DIR` (preferred) or `HANDCONTROL_CONFIG_DIR` to locate `relay.toml` automatically and to store generated credentials.
+
 ## Development Notes
 - Protobuf code is generated automatically during builds via `tonic-prost`; rerun `cargo build` after modifying `proto/handcontrol.proto`.
 - `docs/` contains the PRD, security model, and feature design notes. Start with `docs/PROJECT_STRUCTURE.md` and `docs/SECURITY.md`.
 - A Nix flake (`flake.nix`) is provided for reproducible toolchains and cross-compilation targets.
 - Unit tests are available across the workspace: `cargo test --workspace`.
+
+### Local Test Harness
+Run `scripts/setup-test-env.sh` to spin up a self-contained environment that builds the binaries, launches a relay + server with aligned configs, enrolls the CLI via QR payload, and captures artifacts under `.handcontrol-test-env/` (configurable with `--dir`). Use `--keep-running` to leave the services alive for manual experimentation.
 
 ## Known Gaps
 - Documentation predates portions of the workspace split. Double-check crate names and paths against the current tree when following older guides.

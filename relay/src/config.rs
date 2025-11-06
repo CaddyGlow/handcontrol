@@ -5,6 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+const RELAY_CONFIG_DIR_ENV: &str = "HANDCONTROL_RELAY_CONFIG_DIR";
+const SHARED_CONFIG_DIR_ENV: &str = "HANDCONTROL_CONFIG_DIR";
+const RELAY_CONFIG_FILE: &str = "relay.toml";
+
 #[derive(Debug, Deserialize)]
 pub struct RelayConfig {
     #[serde(default = "default_bind_address")]
@@ -33,7 +37,30 @@ pub fn load_config(path: impl AsRef<Path>) -> Result<RelayConfig> {
 }
 
 pub fn default_config_path() -> PathBuf {
-    PathBuf::from("relay.toml")
+    if let Some(dir) = env_config_dir(RELAY_CONFIG_DIR_ENV) {
+        return dir.join(RELAY_CONFIG_FILE);
+    }
+
+    if let Some(dir) = env_config_dir(SHARED_CONFIG_DIR_ENV) {
+        return dir.join(RELAY_CONFIG_FILE);
+    }
+
+    PathBuf::from(RELAY_CONFIG_FILE)
+}
+
+fn env_config_dir(var: &str) -> Option<PathBuf> {
+    let value = std::env::var_os(var)?;
+    let dir = PathBuf::from(value);
+    if dir.as_os_str().is_empty() {
+        panic!("{var} is set but empty; provide a valid directory path");
+    }
+    fs::create_dir_all(&dir).unwrap_or_else(|err| {
+        panic!(
+            "Failed to create config directory {} from {var}: {err}",
+            dir.display()
+        )
+    });
+    Some(dir)
 }
 
 fn default_bind_address() -> String {

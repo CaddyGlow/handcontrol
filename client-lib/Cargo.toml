@@ -38,6 +38,8 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 url = { workspace = true }
 async-trait = "0.1"
+quinn = { workspace = true }
+webpki-roots = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

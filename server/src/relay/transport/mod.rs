@@ -4,6 +4,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::Stream;
 
+pub mod quic;
 pub mod websocket;
 
 /// TLS behavior required by the underlying transport implementation.
@@ -19,6 +20,7 @@ pub struct ControlConnectParams {
     pub register_url: String,
     pub subprotocol: String,
     pub tls: TlsOptions,
+    pub quic_port: Option<u16>,
 }
 
 /// Parameters required to establish and bridge an individual relay tunnel.
@@ -29,6 +31,7 @@ pub struct TunnelConnectParams {
     pub subprotocol: String,
     pub local_endpoint: SocketAddr,
     pub tls: TlsOptions,
+    pub quic_port: Option<u16>,
 }
 
 /// Transport-agnostic representation of frames exchanged on the control channel.

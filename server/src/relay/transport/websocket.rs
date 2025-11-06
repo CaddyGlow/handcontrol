@@ -70,6 +70,7 @@ impl RelayTransport for WebSocketTransport {
             subprotocol,
             local_endpoint,
             tls,
+            quic_port: _,
         } = params;
 
         tokio::spawn(async move {

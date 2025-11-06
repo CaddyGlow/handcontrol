@@ -4,11 +4,13 @@ Capability session + QUIC transport integration progress
 Server
 ------
 - Added transport abstraction for relay control/tunnel flows with WebSocket adapter, preparing for QUIC implementation.
+- Added server-side QUIC transport stub that advertises capability but still falls back to WebSocket until the relay listener lands.
 - gRPC relay tests still require privileged sockets; relay QUIC endpoint implementation pending.
 
 Client
 ------
 - Client lib owns transport trait with WebSocket implementation and QUIC scaffold; relay tunnel handshake now negotiates per transport preference.
+- Client QUIC transport now establishes real sessions via Quinn, mirroring WebSocket framing semantics and sharing tunnel plumbing.
 - Config exposes `network.relay.transport` setting plus CLI `--transport` override (`HANDCONTROL_CLIENT_TRANSPORT` env) for runtime selection.
 - Enrollment and CLI workflows honour transport preference and fall back gracefully when QUIC is unavailable.
 
@@ -16,3 +18,5 @@ Testing
 -------
 - `cargo check`
 - `cargo test` (relay integration still fails under sandboxed sockets; expected permission errors).
+
+Next: deploy relay QUIC listener and tighten CI coverage across both transports.

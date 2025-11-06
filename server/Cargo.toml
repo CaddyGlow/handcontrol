@@ -61,6 +61,7 @@ base64ct = { workspace = true }
 spki = { workspace = true }
 bytes = "1.6"
 async-trait = "0.1"
+quinn = { workspace = true }
 
 # Platform-specific notification support
 [target.'cfg(target_os = "linux")'.dependencies]

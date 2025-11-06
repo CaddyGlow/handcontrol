@@ -1,5 +1,6 @@
 use crate::config::parser::{DEFAULT_RELAY_SUBPROTOCOL, RelayConfig};
 use crate::relay::tokens::TokenIssuer;
+use crate::relay::transport::quic::QuicTransport;
 use crate::relay::transport::websocket::WebSocketTransport;
 use crate::relay::transport::{
     ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport, TlsOptions,
@@ -53,7 +54,7 @@ pub struct RelayClient {
     local_grpc_endpoint: SocketAddr,
     state: Arc<RwLock<RelayClientState>>,
     tls_authority: String,
-    transport: Arc<dyn RelayTransport>,
+    transport: Arc<RwLock<Arc<dyn RelayTransport>>>,
 }
 
 impl RelayClient {
@@ -72,12 +73,12 @@ impl RelayClient {
             local_grpc_endpoint,
             state: Arc::new(RwLock::new(RelayClientState::Disconnected)),
             tls_authority: format!("handcontrol.local:{}", local_grpc_endpoint.port()),
-            transport,
+            transport: Arc::new(RwLock::new(transport)),
         }
     }
 
     pub fn with_transport(mut self, transport: Arc<dyn RelayTransport>) -> Self {
-        self.transport = transport;
+        self.transport = Arc::new(RwLock::new(transport));
         self
     }
 
@@ -165,14 +166,74 @@ impl RelayClient {
         let tls_options = self.tls_options()?;
         let subprotocol = self.relay_subprotocol().to_string();
 
-        let mut control_session = self
-            .transport
-            .connect_control(ControlConnectParams {
-                register_url: register_url.clone(),
-                subprotocol,
-                tls: tls_options,
-            })
-            .await?;
+        let control_params = ControlConnectParams {
+            register_url: register_url.clone(),
+            subprotocol,
+            tls: tls_options,
+            quic_port: self.config.quic_port,
+        };
+
+        #[derive(Clone, Copy)]
+        enum TransportKind {
+            Websocket,
+            Quic,
+        }
+
+        impl TransportKind {
+            fn label(&self) -> &'static str {
+                match self {
+                    TransportKind::Websocket => "websocket",
+                    TransportKind::Quic => "quic",
+                }
+            }
+        }
+
+        let mut attempt_order = Vec::new();
+        let quic_enabled = self.config.quic_port.is_some();
+        if quic_enabled && self.config.quic_preferred {
+            attempt_order.push(TransportKind::Quic);
+            attempt_order.push(TransportKind::Websocket);
+        } else {
+            attempt_order.push(TransportKind::Websocket);
+            if quic_enabled {
+                attempt_order.push(TransportKind::Quic);
+            }
+        }
+
+        let mut attempt_errors = Vec::new();
+        let mut control_session_opt: Option<ControlSession> = None;
+
+        for kind in attempt_order {
+            let transport: Arc<dyn RelayTransport> = match kind {
+                TransportKind::Websocket => Arc::new(WebSocketTransport::default()),
+                TransportKind::Quic => Arc::new(QuicTransport::default()),
+            };
+
+            match transport.connect_control(control_params.clone()).await {
+                Ok(session) => {
+                    {
+                        let mut guard = self.transport.write().await;
+                        *guard = transport;
+                    }
+                    control_session_opt = Some(session);
+                    break;
+                }
+                Err(err) => {
+                    attempt_errors.push(format!("{} transport: {:#}", kind.label(), err));
+                }
+            }
+        }
+
+        let mut control_session = control_session_opt.ok_or_else(|| {
+            if attempt_errors.is_empty() {
+                anyhow!("Failed to establish relay control connection (no transports attempted)")
+            } else {
+                anyhow!(
+                    "Failed to establish relay control connection:\n{}",
+                    attempt_errors.join("\n")
+                )
+            }
+        })?;
 
         let relay_secret = self
             .config
@@ -324,13 +385,15 @@ impl RelayClient {
 
         let subprotocol = self.relay_subprotocol().to_string();
 
-        self.transport
+        let transport = self.transport.read().await.clone();
+        transport
             .spawn_tunnel(TunnelConnectParams {
                 tunnel_url,
                 tunnel_id,
                 subprotocol,
                 local_endpoint,
                 tls: tls_options,
+                quic_port: self.config.quic_port,
             })
             .await
     }

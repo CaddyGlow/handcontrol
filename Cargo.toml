@@ -5,7 +5,10 @@ resolver = "2"
 [workspace.dependencies]
 anyhow = "1.0"
 prost = "0.14"
-tonic = { version = "0.14", features = ["tls-webpki-roots", "tls-connect-info"] }
+tonic = { version = "0.14", features = [
+  "tls-webpki-roots",
+  "tls-connect-info",
+] }
 tonic-prost = "0.14"
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync", "net"] }
@@ -21,7 +24,10 @@ webpki-roots = "1.0"
 toml = "0.9"
 axum = { version = "0.7", features = ["ws", "macros"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
-tokio-tungstenite = { version = "0.25", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-tungstenite = { version = "0.25", default-features = false, features = [
+  "rustls-tls-webpki-roots",
+  "connect",
+] }
 tungstenite = "0.21"
 futures-util = "0.3"
 tower = "0.5"
@@ -44,6 +50,10 @@ http = "1"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 regex = "1.11"
 libc = "0.2"
+quinn = { version = "0.11", default-features = false, features = [
+  "runtime-tokio",
+  "rustls",
+] }
 
 [workspace.dependencies.prost-build]
 version = "0.14"

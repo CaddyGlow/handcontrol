@@ -127,14 +127,25 @@ impl RelayClient {
         loop {
             *self.state.write().await = RelayClientState::Connecting;
 
+            let mut reset_backoff = false;
+
             match self.connect_and_run().await {
                 Ok(_) => {
                     info!("Relay connection closed gracefully");
-                    reconnect_delay = 1;
+                    reset_backoff = true;
+                    *self.state.write().await = RelayClientState::Disconnected;
                 }
                 Err(e) => {
                     error!("Relay connection failed: {:#}", e);
-                    *self.state.write().await = RelayClientState::Error(e.to_string());
+                    let was_connected = {
+                        let state = self.state.read().await;
+                        matches!(*state, RelayClientState::Connected)
+                    };
+                    {
+                        let mut state = self.state.write().await;
+                        *state = RelayClientState::Error(e.to_string());
+                    }
+                    reset_backoff = was_connected;
                 }
             }
 
@@ -143,10 +154,18 @@ impl RelayClient {
                 break;
             }
 
+            if reset_backoff {
+                reconnect_delay = 1;
+            }
+
             info!("Reconnecting to relay in {} seconds", reconnect_delay);
             sleep(Duration::from_secs(reconnect_delay)).await;
 
-            reconnect_delay = (reconnect_delay * 2).min(max_delay);
+            if reset_backoff {
+                reconnect_delay = 1;
+            } else {
+                reconnect_delay = (reconnect_delay * 2).min(max_delay);
+            }
         }
     }
 

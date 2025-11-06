@@ -217,6 +217,25 @@ impl SessionManager {
         })
     }
 
+    pub fn attach_with_token(
+        &self,
+        session_id: &SessionId,
+        metadata: AttachmentMetadata,
+        resume_token: &str,
+    ) -> Result<(AttachmentState, String), SessionManagerError> {
+        let client_fingerprint = metadata.client_fingerprint.clone();
+        self.with_session_state(session_id, |_entry, state| {
+            if !state.validate_resume_token(resume_token) {
+                return Err(SessionManagerError::InvalidResumeToken);
+            }
+            let attachment = state
+                .try_attach(client_fingerprint.clone())
+                .map_err(SessionManagerError::from)?;
+            let next_token = state.rotate_resume_token();
+            Ok((attachment, next_token))
+        })
+    }
+
     pub fn touch_heartbeat(&self, session_id: &SessionId) -> Result<(), SessionManagerError> {
         self.with_session_state(session_id, |_entry, state| {
             state.touch_heartbeat().map_err(Into::into)

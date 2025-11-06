@@ -6,6 +6,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use std::convert::TryFrom;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration as StdDuration;
@@ -202,6 +203,131 @@ impl RemoteControlService {
             );
             Ok(None)
         }
+    }
+
+    async fn handle_resume_session(
+        &self,
+        session_id_str: String,
+        resume: super::proto::SessionResume,
+        stream: tonic::Streaming<SessionClientMessage>,
+        client_ip: Option<std::net::IpAddr>,
+        fingerprint: Option<String>,
+    ) -> Result<
+        Response<tokio_stream::wrappers::ReceiverStream<Result<SessionServerMessage, Status>>>,
+        Status,
+    > {
+        if session_id_str.is_empty() {
+            return Err(Status::invalid_argument(
+                "Resume request missing session identifier",
+            ));
+        }
+
+        let session_id = SessionId::from_str(&session_id_str).map_err(|_| {
+            Status::invalid_argument("Resume request contained invalid session identifier")
+        })?;
+
+        info!(
+            "ResumeSession RPC called: session_id={} (IP: {}, fingerprint={})",
+            session_id,
+            client_ip
+                .as_ref()
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
+        );
+
+        let snapshot = self
+            .session_manager
+            .snapshot(&session_id)
+            .map_err(status_from_session_error)?;
+
+        let capability_id = snapshot.capability_id.clone();
+        let session_mode = snapshot.session_mode;
+
+        let event_receiver = self
+            .session_manager
+            .subscribe_events(&session_id)
+            .map_err(status_from_session_error)?;
+
+        let client_sender = self
+            .session_manager
+            .get_sender(&session_id)
+            .ok_or_else(|| Status::not_found("Session not found"))?;
+
+        let (_attachment, next_token) = self
+            .session_manager
+            .attach_with_token(
+                &session_id,
+                AttachmentMetadata::new(fingerprint.clone()),
+                &resume.resume_token,
+            )
+            .map_err(status_from_session_error)?;
+
+        let buffered_outputs = self
+            .session_manager
+            .buffered_output_since(
+                &session_id,
+                resume.last_output_sequence,
+                resume.last_error_sequence,
+            )
+            .map_err(status_from_session_error)?;
+
+        let (response_tx, response_rx) = tokio::sync::mpsc::channel(128);
+
+        tokio::spawn(forward_session_events(
+            session_id.clone(),
+            capability_id.clone(),
+            session_mode,
+            event_receiver,
+            response_tx.clone(),
+        ));
+
+        tokio::spawn(forward_client_events(
+            self.session_manager.clone(),
+            session_id.clone(),
+            stream,
+            client_sender,
+        ));
+
+        let session_id_string = session_id.to_string();
+
+        for frame in &buffered_outputs {
+            let event = SessionServerEvent::Output {
+                data: frame.data.clone(),
+                stderr: matches!(frame.stream, crate::sessions::OutputStream::Stderr),
+                binary: frame.binary,
+                timestamp_ms: frame.timestamp_ms,
+            };
+
+            let message = session_event_to_proto(
+                &session_id_string,
+                &capability_id,
+                session_mode,
+                event,
+                Some(frame),
+                None,
+            );
+
+            if response_tx.send(Ok(message)).await.is_err() {
+                break;
+            }
+        }
+
+        let resume_ack = SessionServerMessage {
+            session_id: session_id_string,
+            payload: Some(session_server_message::Payload::ResumeAck(
+                super::proto::SessionResumeAck {
+                    resume_token: next_token,
+                    replay_complete: Some(true),
+                    message: None,
+                },
+            )),
+        };
+
+        let _ = response_tx.send(Ok(resume_ack)).await;
+
+        let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
+        Ok(Response::new(stream))
     }
 }
 
@@ -888,85 +1014,98 @@ impl RemoteControl for RemoteControlService {
             .await?
             .ok_or_else(|| Status::invalid_argument("Missing initial session message"))?;
 
-        let open = match initial_message.payload {
-            Some(session_client_message::Payload::Open(open)) => open,
-            _ => {
-                warn!("First message for OpenSession must be SessionOpen");
-                return Err(Status::invalid_argument(
-                    "First message must be SessionOpen",
+        let initial_session_id = initial_message.session_id.clone();
+
+        match initial_message.payload {
+            Some(session_client_message::Payload::Open(open)) => {
+                info!(
+                    "OpenSession RPC called: capability_id={} (IP: {}, fingerprint={})",
+                    open.capability_id,
+                    client_ip
+                        .as_ref()
+                        .map(|ip| ip.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
+                );
+
+                let config_snapshot = {
+                    let guard = self.config.read().unwrap();
+                    guard.clone()
+                };
+                let registry = CapabilityRegistry::from_config(&config_snapshot).map_err(|e| {
+                    warn!("Failed to build capability registry: {}", e);
+                    Status::internal("Failed to load capabilities")
+                })?;
+
+                let capability_handle = registry.get(&open.capability_id).ok_or_else(|| {
+                    warn!("Capability not found: {}", open.capability_id);
+                    Status::not_found(format!("Capability '{}' not found", open.capability_id))
+                })?;
+
+                let capability = capability_handle.capability();
+
+                let session_handle = self
+                    .session_manager
+                    .open_session(capability, open.parameters.clone(), fingerprint.clone())
+                    .await
+                    .map_err(|e| {
+                        warn!("Failed to open capability session: {}", e);
+                        Status::internal("Failed to open capability session")
+                    })?;
+
+                let session_manager = self.session_manager.clone();
+                let SessionHandle {
+                    id: session_id,
+                    capability_id,
+                    metadata: _metadata,
+                    session_mode,
+                    client_sender,
+                    event_receiver,
+                    resume_token: _initial_resume_token,
+                } = session_handle;
+
+                session_manager
+                    .attach(&session_id, AttachmentMetadata::new(fingerprint.clone()))
+                    .map_err(status_from_session_error)?;
+
+                let (response_tx, response_rx) = tokio::sync::mpsc::channel(128);
+
+                tokio::spawn(forward_session_events(
+                    session_id.clone(),
+                    capability_id,
+                    session_mode,
+                    event_receiver,
+                    response_tx.clone(),
                 ));
+
+                tokio::spawn(forward_client_events(
+                    session_manager,
+                    session_id,
+                    stream,
+                    client_sender,
+                ));
+
+                let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
+                Ok(Response::new(stream))
             }
-        };
 
-        info!(
-            "OpenSession RPC called: capability_id={} (IP: {}, fingerprint={})",
-            open.capability_id,
-            client_ip
-                .as_ref()
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "unknown".to_string()),
-            fingerprint.clone().unwrap_or_else(|| "legacy".to_string())
-        );
-
-        let config_snapshot = {
-            let guard = self.config.read().unwrap();
-            guard.clone()
-        };
-        let registry = CapabilityRegistry::from_config(&config_snapshot).map_err(|e| {
-            warn!("Failed to build capability registry: {}", e);
-            Status::internal("Failed to load capabilities")
-        })?;
-
-        let capability_handle = registry.get(&open.capability_id).ok_or_else(|| {
-            warn!("Capability not found: {}", open.capability_id);
-            Status::not_found(format!("Capability '{}' not found", open.capability_id))
-        })?;
-
-        let capability = capability_handle.capability();
-
-        let session_handle = self
-            .session_manager
-            .open_session(capability, open.parameters.clone(), fingerprint.clone())
-            .await
-            .map_err(|e| {
-                warn!("Failed to open capability session: {}", e);
-                Status::internal("Failed to open capability session")
-            })?;
-
-        let session_manager = self.session_manager.clone();
-        let SessionHandle {
-            id: session_id,
-            capability_id,
-            metadata: _metadata,
-            session_mode,
-            client_sender,
-            event_receiver,
-            resume_token: _initial_resume_token,
-        } = session_handle;
-
-        session_manager
-            .attach(&session_id, AttachmentMetadata::new(fingerprint.clone()))
-            .map_err(status_from_session_error)?;
-
-        let (response_tx, response_rx) = tokio::sync::mpsc::channel(128);
-
-        tokio::spawn(forward_session_events(
-            session_id.clone(),
-            capability_id,
-            session_mode,
-            event_receiver,
-            response_tx.clone(),
-        ));
-
-        tokio::spawn(forward_client_events(
-            session_manager,
-            session_id.clone(),
-            stream,
-            client_sender,
-        ));
-
-        let stream = tokio_stream::wrappers::ReceiverStream::new(response_rx);
-        Ok(Response::new(stream))
+            Some(session_client_message::Payload::Resume(resume)) => {
+                self.handle_resume_session(
+                    initial_session_id,
+                    resume,
+                    stream,
+                    client_ip,
+                    fingerprint,
+                )
+                .await
+            }
+            _ => {
+                warn!("First message for OpenSession must be SessionOpen or SessionResume");
+                Err(Status::invalid_argument(
+                    "First message must be SessionOpen or SessionResume",
+                ))
+            }
+        }
     }
 
     async fn get_config_version(
@@ -1204,20 +1343,10 @@ async fn forward_client_events(
                 }
             }
             Ok(None) => {
-                let _ = sender
-                    .send(SessionClientEvent::Close {
-                        reason: Some("Client stream closed".to_string()),
-                    })
-                    .await;
                 break;
             }
             Err(status) => {
                 warn!("Error reading client session stream: {}", status);
-                let _ = sender
-                    .send(SessionClientEvent::Close {
-                        reason: Some("Stream error".to_string()),
-                    })
-                    .await;
                 break;
             }
         }

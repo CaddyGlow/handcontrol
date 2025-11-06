@@ -110,6 +110,10 @@ impl SessionState {
         token
     }
 
+    pub fn validate_resume_token(&self, token: &str) -> bool {
+        self.resume_token == token
+    }
+
     pub fn snapshot(&self) -> SessionStateSnapshot {
         SessionStateSnapshot {
             resume_token: self.resume_token.clone(),

@@ -3,10 +3,11 @@ use clap::{Parser, Subcommand};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
-    list_commands as fetch_command_list, open_capability_session,
+    list_commands as fetch_command_list, open_capability_session, resume_capability_session,
     storage::{ServerRegistry, ServerRegistryEntry},
-    validate_parameters, ApprovalEnrollmentInput, CapabilitySessionEvent, CommandKind, CommandList,
-    CommandSessionMode, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CapabilitySessionEvent, CapabilitySessionSender,
+    CommandKind, CommandList, CommandSessionMode, CommandStreamEvent, CommandSummary,
+    DiscoveredServer, QrEnrollmentInput,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -518,67 +519,17 @@ async fn run_interactive_shell(
 
     let raw_guard = RawModeGuard::new()?;
 
-    let sender = session.sender();
+    let mut sender = session.sender();
+    send_initial_resize(&sender).await;
 
-    if let Ok((cols, rows)) = terminal_size() {
-        if let Err(err) = sender.send_resize(u32::from(cols), u32::from(rows)).await {
-            warn!("Failed to send initial terminal size: {}", err);
-        }
-    }
-
-    let input_sender = sender.clone();
-    let input_handle = tokio::spawn(async move {
-        let mut stdin = tokio::io::stdin();
-        let mut buf = [0u8; 1024];
-        loop {
-            match stdin.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = input_sender.close(None).await;
-                    break;
-                }
-                Ok(n) => {
-                    if input_sender
-                        .send_input(buf[..n].to_vec(), false)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = input_sender
-                        .close(Some("stdin read error".to_string()))
-                        .await;
-                    break;
-                }
-            }
-        }
-    });
-
-    #[cfg(unix)]
-    let resize_handle = {
-        let resize_sender = sender.clone();
-        tokio::spawn(async move {
-            if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
-                while sigwinch.recv().await.is_some() {
-                    if let Ok((cols, rows)) = terminal_size() {
-                        if resize_sender
-                            .send_resize(u32::from(cols), u32::from(rows))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-    };
+    let mut input_handle = spawn_input_task(sender.clone());
+    let mut resize_handle = spawn_resize_task(sender.clone());
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
+    let mut resume_attempts: usize = 0;
 
     while let Some(event) = session.recv().await? {
         match event {
@@ -598,6 +549,7 @@ async fn run_interactive_shell(
                     }
                     let _ = stdout.flush().await;
                 }
+                resume_attempts = 0;
             }
             CapabilitySessionEvent::Exit {
                 exit_code: code,
@@ -632,6 +584,94 @@ async fn run_interactive_shell(
                 break;
             }
         }
+
+        continue;
+    }
+
+    while exit_code.is_none() {
+        // Stream ended without an exit event; attempt to resume if possible.
+        let resume_state = session.resume_state();
+
+        println!("\nConnection interrupted. Attempting to resume...");
+
+        input_handle.abort();
+        let _ = input_handle.await;
+        if let Some(handle) = &mut resize_handle {
+            handle.abort();
+            let _ = handle.await;
+        }
+
+        match resume_capability_session(entry, resume_state).await {
+            Ok(new_session) => {
+                session = new_session;
+                sender = session.sender();
+                send_initial_resize(&sender).await;
+                input_handle = spawn_input_task(sender.clone());
+                resize_handle = spawn_resize_task(sender.clone());
+                resume_attempts += 1;
+                println!("Session resumed (attempt #{resume_attempts}).");
+            }
+            Err(err) => {
+                return Err(anyhow!("Failed to resume session: {}", err));
+            }
+        }
+
+        while let Some(event) = session.recv().await? {
+            match event {
+                CapabilitySessionEvent::Output {
+                    data,
+                    stderr: is_stderr,
+                    ..
+                } => {
+                    if is_stderr {
+                        if stderr.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        let _ = stderr.flush().await;
+                    } else {
+                        if stdout.write_all(&data).await.is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                }
+                CapabilitySessionEvent::Exit {
+                    exit_code: code,
+                    timed_out: was_timeout,
+                    message,
+                } => {
+                    exit_code = Some(code);
+                    timed_out = was_timeout;
+                    if let Some(message) = message {
+                        let mut bytes = message.into_bytes();
+                        if !bytes.ends_with(&[b'\n']) {
+                            bytes.push(b'\n');
+                        }
+                        let _ = stderr.write_all(&bytes).await;
+                        let _ = stderr.flush().await;
+                    }
+                    break;
+                }
+                CapabilitySessionEvent::Error { message, .. } => {
+                    return Err(anyhow!("Server reported capability error: {}", message));
+                }
+                CapabilitySessionEvent::HeartbeatAck { .. } => {}
+                CapabilitySessionEvent::Closed { reason } => {
+                    if exit_code.is_none() {
+                        if let Some(reason) = reason {
+                            return Err(anyhow!("Capability session closed: {}", reason));
+                        } else {
+                            return Err(anyhow!("Capability session closed unexpectedly"));
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if exit_code.is_some() {
+            break;
+        }
     }
 
     drop(raw_guard);
@@ -640,10 +680,9 @@ async fn run_interactive_shell(
     input_handle.abort();
     let _ = input_handle.await;
 
-    #[cfg(unix)]
-    {
-        resize_handle.abort();
-        let _ = resize_handle.await;
+    if let Some(handle) = &mut resize_handle {
+        handle.abort();
+        let _ = handle.await;
     }
 
     if timed_out {
@@ -656,6 +695,64 @@ async fn run_interactive_shell(
     }
 
     Ok(())
+}
+
+async fn send_initial_resize(sender: &CapabilitySessionSender) {
+    if let Ok((cols, rows)) = terminal_size() {
+        if let Err(err) = sender.send_resize(u32::from(cols), u32::from(rows)).await {
+            warn!("Failed to send terminal size: {}", err);
+        }
+    }
+}
+
+fn spawn_input_task(sender: CapabilitySessionSender) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) => {
+                    let _ = sender.close(None).await;
+                    break;
+                }
+                Ok(n) => {
+                    if sender.send_input(buf[..n].to_vec(), false).await.is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = sender.close(Some("stdin read error".to_string())).await;
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn spawn_resize_task(sender: CapabilitySessionSender) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(unix)]
+    {
+        Some(tokio::spawn(async move {
+            if let Ok(mut sigwinch) = signal(SignalKind::window_change()) {
+                while sigwinch.recv().await.is_some() {
+                    if let Ok((cols, rows)) = terminal_size() {
+                        if sender
+                            .send_resize(u32::from(cols), u32::from(rows))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = sender;
+        None
+    }
 }
 
 fn run_remove(cmd: RemoveCommand) -> Result<()> {

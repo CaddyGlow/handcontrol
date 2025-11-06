@@ -13,9 +13,10 @@ pub mod proto {
 
 pub use certificates::CertificatePaths;
 pub use commands::{
-    execute_command, list_commands, open_capability_session, validate_parameters,
-    CapabilitySession, CapabilitySessionEvent, CapabilitySessionSender, CommandKind, CommandList,
-    CommandParameter, CommandParameterType, CommandSessionMode, CommandStreamEvent, CommandSummary,
+    execute_command, list_commands, open_capability_session, resume_capability_session,
+    validate_parameters, CapabilitySession, CapabilitySessionEvent, CapabilitySessionResumeState,
+    CapabilitySessionSender, CommandKind, CommandList, CommandParameter, CommandParameterType,
+    CommandSessionMode, CommandStreamEvent, CommandSummary,
 };
 pub use config::{
     CliConfig, ClientConfig, ConnectionConfig, DeviceConfig, DiscoveryConfig, NetworkConfig,

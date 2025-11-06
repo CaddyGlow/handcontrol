@@ -76,10 +76,22 @@ impl SessionId {
     pub fn as_uuid(&self) -> uuid::Uuid {
         self.0
     }
+
+    pub fn from_uuid(uuid: uuid::Uuid) -> Self {
+        SessionId(uuid)
+    }
 }
 
 impl std::fmt::Display for SessionId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = uuid::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        uuid::Uuid::parse_str(s).map(SessionId)
     }
 }

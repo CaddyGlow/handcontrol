@@ -6,14 +6,15 @@ use crate::{
         CapabilityKind as ProtoCapabilityKind, CapabilityParameter as ProtoCapabilityParameter,
         CapabilityParameterType as ProtoCapabilityParameterType, ListCapabilitiesRequest,
         SessionClientMessage, SessionClose, SessionHeartbeat, SessionInput,
-        SessionMode as ProtoSessionMode, SessionOpen, SessionResize, SessionServerMessage,
+        SessionMode as ProtoSessionMode, SessionOpen, SessionResize, SessionResume,
+        SessionServerMessage,
     },
     storage::ServerRegistryEntry,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use regex::Regex;
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -118,6 +119,33 @@ impl CapabilitySession {
         self.ready_message.as_deref()
     }
 
+    /// Returns the current resume token issued by the server.
+    pub fn resume_token(&self) -> &str {
+        &self.resume_token
+    }
+
+    /// Returns the last stdout sequence observed for replay alignment.
+    pub fn last_stdout_sequence(&self) -> u64 {
+        self.last_stdout_sequence
+    }
+
+    /// Returns the last stderr sequence observed for replay alignment.
+    pub fn last_stderr_sequence(&self) -> u64 {
+        self.last_stderr_sequence
+    }
+
+    /// Produces a snapshot of the session suitable for resumable reconnects.
+    pub fn resume_state(&self) -> CapabilitySessionResumeState {
+        CapabilitySessionResumeState {
+            session_id: self.session_id.clone(),
+            capability_id: self.capability_id.clone(),
+            resume_token: self.resume_token.clone(),
+            last_stdout_sequence: self.last_stdout_sequence,
+            last_stderr_sequence: self.last_stderr_sequence,
+            session_mode: self.session_mode,
+        }
+    }
+
     /// Returns a cloneable sender for pushing input/control messages to the server.
     pub fn sender(&self) -> CapabilitySessionSender {
         CapabilitySessionSender {
@@ -128,6 +156,10 @@ impl CapabilitySession {
 
     /// Receive the next event from the capability session.
     pub async fn recv(&mut self) -> Result<Option<CapabilitySessionEvent>> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
+
         loop {
             let message = match self
                 .stream
@@ -141,11 +173,21 @@ impl CapabilitySession {
 
             match message.payload {
                 Some(session_server_message::Payload::Output(output)) => {
+                    let stderr = output.stderr.unwrap_or(false);
+                    let sequence = output.sequence;
+                    if sequence != 0 {
+                        if stderr {
+                            self.last_stderr_sequence = sequence;
+                        } else {
+                            self.last_stdout_sequence = sequence;
+                        }
+                    }
                     return Ok(Some(CapabilitySessionEvent::Output {
                         data: output.data,
-                        stderr: output.stderr.unwrap_or(false),
+                        stderr,
                         binary: output.binary.unwrap_or(false),
                         timestamp_ms: output.timestamp_ms,
+                        sequence,
                     }));
                 }
                 Some(session_server_message::Payload::Exit(exit)) => {
@@ -172,8 +214,10 @@ impl CapabilitySession {
                         reason: closed.reason,
                     }));
                 }
-                Some(session_server_message::Payload::ResumeAck(_)) => {
-                    // Resume acknowledgements are not yet surfaced to callers.
+                Some(session_server_message::Payload::ResumeAck(ack)) => {
+                    if !ack.resume_token.is_empty() {
+                        self.resume_token = ack.resume_token;
+                    }
                     continue;
                 }
                 Some(session_server_message::Payload::Ready(_)) => {
@@ -241,6 +285,10 @@ pub struct CapabilitySession {
     ready_message: Option<String>,
     sender: mpsc::Sender<SessionClientMessage>,
     stream: Streaming<SessionServerMessage>,
+    resume_token: String,
+    last_stdout_sequence: u64,
+    last_stderr_sequence: u64,
+    pending_events: VecDeque<CapabilitySessionEvent>,
 }
 
 /// Cloneable helper for sending input/control messages to an active capability session.
@@ -248,6 +296,17 @@ pub struct CapabilitySession {
 pub struct CapabilitySessionSender {
     session_id: String,
     sender: mpsc::Sender<SessionClientMessage>,
+}
+
+/// Snapshot of resumable session state for reconnect attempts.
+#[derive(Debug, Clone)]
+pub struct CapabilitySessionResumeState {
+    pub session_id: String,
+    pub capability_id: String,
+    pub resume_token: String,
+    pub last_stdout_sequence: u64,
+    pub last_stderr_sequence: u64,
+    pub session_mode: CommandSessionMode,
 }
 
 /// Events emitted by an active capability session.
@@ -258,6 +317,7 @@ pub enum CapabilitySessionEvent {
         stderr: bool,
         binary: bool,
         timestamp_ms: Option<i64>,
+        sequence: u64,
     },
     Exit {
         exit_code: i32,
@@ -590,6 +650,132 @@ pub async fn open_capability_session(
         ready_message: ready.message.filter(|m| !m.is_empty()),
         sender: tx,
         stream,
+        resume_token: ready.resume_token,
+        last_stdout_sequence: 0,
+        last_stderr_sequence: 0,
+        pending_events: VecDeque::new(),
+    })
+}
+
+/// Resume an existing capability session using previously captured resume state.
+pub async fn resume_capability_session(
+    entry: &ServerRegistryEntry,
+    state: CapabilitySessionResumeState,
+) -> Result<CapabilitySession> {
+    let CapabilitySessionResumeState {
+        session_id,
+        capability_id,
+        resume_token: saved_resume_token,
+        mut last_stdout_sequence,
+        mut last_stderr_sequence,
+        session_mode,
+    } = state;
+
+    let cert_paths = CertificatePaths::for_server(&entry.id)?;
+    let mut client = connect_registered(entry, &cert_paths).await?;
+
+    let (tx, rx) = mpsc::channel(32);
+    tx.send(SessionClientMessage {
+        session_id: session_id.clone(),
+        payload: Some(session_client_message::Payload::Resume(SessionResume {
+            resume_token: saved_resume_token.clone(),
+            last_output_sequence: (last_stdout_sequence > 0).then_some(last_stdout_sequence),
+            last_error_sequence: (last_stderr_sequence > 0).then_some(last_stderr_sequence),
+        })),
+    })
+    .await
+    .context("Failed to send session resume message")?;
+
+    let request_stream = ReceiverStream::new(rx);
+    let mut stream = client
+        .inner()
+        .open_session(Request::new(request_stream))
+        .await
+        .context("OpenSession RPC failed")?
+        .into_inner();
+
+    let mut pending_events = VecDeque::new();
+    let mut resume_token = saved_resume_token;
+
+    loop {
+        let message = stream
+            .message()
+            .await
+            .context("Capability stream closed unexpectedly during resume")?
+            .ok_or_else(|| anyhow!("Capability stream ended before resume acknowledgement"))?;
+
+        if !message.session_id.is_empty() && message.session_id != session_id {
+            bail!(
+                "Received session message for mismatched session_id={} (expected {})",
+                message.session_id,
+                session_id
+            );
+        }
+
+        match message.payload {
+            Some(session_server_message::Payload::ResumeAck(ack)) => {
+                if !ack.resume_token.is_empty() {
+                    resume_token = ack.resume_token;
+                }
+                break;
+            }
+            Some(session_server_message::Payload::Output(output)) => {
+                let stderr = output.stderr.unwrap_or(false);
+                let sequence = output.sequence;
+                if sequence != 0 {
+                    if stderr {
+                        last_stderr_sequence = sequence;
+                    } else {
+                        last_stdout_sequence = sequence;
+                    }
+                }
+                pending_events.push_back(CapabilitySessionEvent::Output {
+                    data: output.data,
+                    stderr,
+                    binary: output.binary.unwrap_or(false),
+                    timestamp_ms: output.timestamp_ms,
+                    sequence,
+                });
+            }
+            Some(session_server_message::Payload::Error(err)) => {
+                bail!(
+                    "Server reported capability error while resuming session: {}",
+                    err.message
+                );
+            }
+            Some(session_server_message::Payload::Closed(closed)) => {
+                let reason = closed
+                    .reason
+                    .unwrap_or_else(|| "session closed while resuming".to_string());
+                bail!(reason);
+            }
+            Some(session_server_message::Payload::Exit(exit)) => {
+                let message = exit
+                    .message
+                    .unwrap_or_else(|| "session exited while resuming".to_string());
+                bail!(
+                    "Capability session exited (code {}): {}",
+                    exit.exit_code,
+                    message
+                );
+            }
+            Some(session_server_message::Payload::Heartbeat(_)) => continue,
+            Some(session_server_message::Payload::Ready(_)) => continue,
+            None => continue,
+        }
+    }
+
+    Ok(CapabilitySession {
+        session_id,
+        capability_id,
+        session_mode,
+        ready_message: None,
+        sender: tx,
+        stream,
+        resume_token,
+        last_stdout_sequence,
+        last_stderr_sequence,
+        pending_events,
     })
 }
 

@@ -23,6 +23,8 @@ pub struct RelayConfig {
     pub tls_key_path: Option<PathBuf>,
     #[serde(default)]
     pub quic_port: Option<u16>,
+    #[serde(default)]
+    pub allow_all_audiences: bool,
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<RelayConfig> {

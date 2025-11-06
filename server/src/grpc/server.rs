@@ -1543,8 +1543,10 @@ mod tests {
         EnrollmentConfig, NetworkConfig, RelayConfig, SecurityConfig, ServerConfig,
         ShellScriptDefinition,
     };
-    use crate::grpc::proto::ListCapabilitiesRequest;
-    use crate::grpc::proto::remote_control_client::RemoteControlClient;
+    use crate::grpc::proto::{
+        ListCapabilitiesRequest, SessionClientMessage, SessionOpen, SessionResume,
+        remote_control_client::RemoteControlClient, session_client_message, session_server_message,
+    };
     use crate::notifications::{NotificationManager, NotificationProvider};
     use crate::security::certificates::ClientCertificate;
     use crate::security::enrollment::EnrollmentTokenManager;
@@ -1557,6 +1559,7 @@ mod tests {
     use std::sync::{Arc, Mutex, RwLock};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
+    use tokio_stream::wrappers::ReceiverStream;
     use tonic::Request;
     use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -1822,6 +1825,106 @@ mod tests {
             .into_inner();
 
         assert_eq!(response.capabilities.len(), 1);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn open_session_includes_resume_token() {
+        let harness = match TestHarness::new().await {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to initialize test harness: {e}"),
+        };
+
+        let (identity, cert_der) = generate_client_identity("resume-ready");
+        {
+            let mut store = harness.client_store.lock().unwrap();
+            let client_cert = ClientCertificate::from_der(cert_der.clone());
+            store
+                .add_client(&client_cert, "resume-ready".to_string(), None)
+                .expect("store client cert");
+        }
+
+        let mut client = make_client(&harness, Some(identity)).await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(SessionClientMessage {
+            session_id: String::new(),
+            payload: Some(session_client_message::Payload::Open(SessionOpen {
+                capability_id: "echo".to_string(),
+                parameters: std::collections::HashMap::new(),
+                request_id: None,
+            })),
+        })
+        .await
+        .expect("send open message");
+        drop(tx);
+
+        let mut stream = client
+            .open_session(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect("open session")
+            .into_inner();
+
+        let ready_message = stream
+            .message()
+            .await
+            .expect("receive ready message")
+            .expect("ready payload present");
+
+        let resume_token = match ready_message.payload.unwrap() {
+            session_server_message::Payload::Ready(ready) => ready.resume_token,
+            other => panic!("expected ready payload, got {:?}", other),
+        };
+
+        assert!(
+            !resume_token.is_empty(),
+            "resume token should be populated for new sessions"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn resume_with_unknown_session_is_rejected() {
+        let harness = match TestHarness::new().await {
+            Ok(h) => h,
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("failed to initialize test harness: {e}"),
+        };
+
+        let (identity, cert_der) = generate_client_identity("resume-invalid");
+        {
+            let mut store = harness.client_store.lock().unwrap();
+            let client_cert = ClientCertificate::from_der(cert_der.clone());
+            store
+                .add_client(&client_cert, "resume-invalid".to_string(), None)
+                .expect("store client cert");
+        }
+
+        let mut client = make_client(&harness, Some(identity)).await;
+        let random_session = Uuid::new_v4().to_string();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(SessionClientMessage {
+            session_id: random_session.clone(),
+            payload: Some(session_client_message::Payload::Resume(SessionResume {
+                resume_token: "bad-token".to_string(),
+                last_output_sequence: None,
+                last_error_sequence: None,
+            })),
+        })
+        .await
+        .expect("send resume message");
+        drop(tx);
+
+        let status = client
+            .open_session(Request::new(ReceiverStream::new(rx)))
+            .await
+            .expect_err("resume should fail for unknown session");
+
+        assert_eq!(status.code(), tonic::Code::NotFound);
 
         harness.shutdown().await;
     }

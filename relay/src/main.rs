@@ -55,6 +55,9 @@ struct Cli {
     /// Path to relay configuration file
     #[arg(long, value_hint = ValueHint::FilePath)]
     config: Option<std::path::PathBuf>,
+    /// Allow any relay token audience (for development/testing)
+    #[arg(long, default_value_t = false)]
+    allow_all_audiences: bool,
 }
 
 #[tokio::main]
@@ -65,8 +68,13 @@ async fn main() -> Result<()> {
 
     let config_path = cli.config.unwrap_or_else(default_config_path);
 
-    let config = load_config(&config_path)
+    let mut config = load_config(&config_path)
         .with_context(|| format!("Failed to load relay configuration {:?}", config_path))?;
+
+    if cli.allow_all_audiences {
+        config.allow_all_audiences = true;
+        tracing::warn!("allow-all-audiences flag enabled; audience validation will be skipped");
+    }
 
     // Keep TLS paths before moving config
     let tls_cert_path = config.tls_cert_path.clone();
@@ -933,6 +941,7 @@ struct AppState {
     listen_addr: String,
     listen_port: u16,
     relay_host: String,
+    allow_all_audiences: bool,
     secrets: Arc<HashMap<Uuid, String>>,
     registered_servers: Arc<RwLock<HashMap<Uuid, Arc<RegisteredServer>>>>,
     tunnels: Arc<RwLock<HashMap<Uuid, Arc<TunnelHandle>>>>,
@@ -1172,6 +1181,7 @@ impl AppState {
             tls_cert_path: _,
             tls_key_path: _,
             quic_port,
+            allow_all_audiences,
         } = config;
 
         let listen_addr = match bind_address.parse::<IpAddr>() {
@@ -1203,6 +1213,7 @@ impl AppState {
             listen_addr,
             listen_port: port,
             relay_host,
+            allow_all_audiences,
             secrets: Arc::new(registration_secrets),
             registered_servers: Arc::new(RwLock::new(HashMap::new())),
             tunnels: Arc::new(RwLock::new(HashMap::new())),
@@ -1265,6 +1276,10 @@ impl AppState {
     }
 
     fn is_allowed_audience(&self, audience: &str) -> bool {
+        if self.allow_all_audiences {
+            return true;
+        }
+
         let aud = audience.trim();
         if aud.eq_ignore_ascii_case(&self.relay_host) {
             return true;
@@ -2713,6 +2728,8 @@ mod tests {
             registration_secrets: secrets,
             tls_cert_path: None,
             tls_key_path: None,
+            quic_port: None,
+            allow_all_audiences: false,
         }
     }
 

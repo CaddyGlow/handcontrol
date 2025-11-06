@@ -21,6 +21,8 @@ pub struct RelayConfig {
     pub tls_cert_path: Option<PathBuf>,
     #[serde(default)]
     pub tls_key_path: Option<PathBuf>,
+    #[serde(default)]
+    pub quic_port: Option<u16>,
 }
 
 pub fn load_config(path: impl AsRef<Path>) -> Result<RelayConfig> {

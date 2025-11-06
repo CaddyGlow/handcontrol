@@ -1,7 +1,7 @@
 mod config;
 
 use crate::config::{RelayConfig, default_config_path, load_config};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Router,
     extract::{
@@ -19,11 +19,15 @@ use futures_util::{
 };
 use handcontrol_relay::tunnel::state::TunnelState;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
+use quinn::{Endpoint, ReadExactError};
 use rand::RngCore;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
+    fs::File,
+    io::BufReader,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket},
     sync::Arc,
     time::{Duration, Instant, SystemTime},
@@ -62,6 +66,23 @@ async fn main() -> Result<()> {
     let tls_key_path = config.tls_key_path.clone();
 
     let state = Arc::new(AppState::new(config));
+
+    if let Some(port) = state.quic_port {
+        match (tls_cert_path.as_ref(), tls_key_path.as_ref()) {
+            (Some(cert), Some(key)) => {
+                if let Err(err) =
+                    start_quic_listener(state.clone(), port, cert.as_path(), key.as_path())
+                {
+                    warn!("Failed to start QUIC listener: {err:#}");
+                }
+            }
+            _ => {
+                warn!(
+                    "QUIC port configured but TLS certificate/key not provided; skipping QUIC listener"
+                );
+            }
+        }
+    }
 
     let app = build_router(state.clone());
 
@@ -141,8 +162,684 @@ async fn serve_with_tls(
         .context("TLS server failed")
 }
 
+fn start_quic_listener(
+    state: Arc<AppState>,
+    quic_port: u16,
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<()> {
+    let server_config = build_quic_server_config(cert_path, key_path)?;
+    let bind_ip = state
+        .bind_address
+        .parse::<IpAddr>()
+        .unwrap_or(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+    let quic_addr = SocketAddr::new(bind_ip, quic_port);
+
+    info!("Starting QUIC listener on {}", quic_addr);
+    let endpoint = Endpoint::server(server_config, quic_addr)
+        .with_context(|| format!("Failed to bind QUIC listener on {}", quic_addr))?;
+
+    let accept_state = Arc::clone(&state);
+    tokio::spawn(async move {
+        if let Err(err) = run_quic_accept_loop(endpoint, accept_state).await {
+            warn!("QUIC listener stopped: {err:#}");
+        }
+    });
+
+    Ok(())
+}
+
+fn build_quic_server_config(
+    cert_path: &std::path::Path,
+    key_path: &std::path::Path,
+) -> Result<quinn::ServerConfig> {
+    use rustls_pemfile::{certs, private_key};
+
+    let cert_file = File::open(cert_path)
+        .with_context(|| format!("Failed to open QUIC certificate {}", cert_path.display()))?;
+    let mut cert_reader = BufReader::new(cert_file);
+    let cert_chain: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .context("Failed to parse QUIC certificate chain")?;
+    if cert_chain.is_empty() {
+        bail!(
+            "No certificates found in QUIC certificate file {}",
+            cert_path.display()
+        );
+    }
+
+    let key_file = File::open(key_path)
+        .with_context(|| format!("Failed to open QUIC private key {}", key_path.display()))?;
+    let mut key_reader = BufReader::new(key_file);
+    let key: PrivateKeyDer<'static> = private_key(&mut key_reader)
+        .context("Failed to read QUIC private key")?
+        .context("No private key found for QUIC listener")?;
+
+    let mut server_crypto = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .context("Failed to build QUIC TLS config")?;
+    server_crypto
+        .alpn_protocols
+        .push(RELAY_SUBPROTOCOL.as_bytes().to_vec());
+
+    let quic_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+        .context("Failed to adapt TLS config for QUIC")?;
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(Arc::new(quinn::TransportConfig::default()));
+    Ok(server_config)
+}
+
+async fn run_quic_accept_loop(endpoint: Endpoint, state: Arc<AppState>) -> Result<()> {
+    while let Some(connecting) = endpoint.accept().await {
+        let state_clone = Arc::clone(&state);
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(connection) => {
+                    if let Err(err) = process_quic_connection(connection, state_clone).await {
+                        warn!("QUIC connection terminated with error: {err:#}");
+                    }
+                }
+                Err(err) => {
+                    warn!("QUIC handshake failed: {err}");
+                }
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn process_quic_connection(
+    connection: quinn::Connection,
+    state: Arc<AppState>,
+) -> Result<()> {
+    let remote = connection.remote_address();
+    trace!(%remote, "Accepted QUIC connection");
+
+    let (send, mut recv) = connection
+        .accept_bi()
+        .await
+        .context("Failed to accept QUIC bidirectional stream")?;
+    let first_frame = quic_read_frame(&mut recv).await?;
+    let Some(QuicFrame::Text(payload)) = first_frame else {
+        bail!(
+            "QUIC connection {} did not start with a control frame",
+            remote
+        );
+    };
+
+    let message_type = serde_json::from_str::<serde_json::Value>(&payload)
+        .context("Failed to parse QUIC control JSON")?
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    match message_type.as_str() {
+        "register" => {
+            let register: RegisterPayload =
+                serde_json::from_str(&payload).context("Failed to deserialize register payload")?;
+            handle_quic_register(state, register, send, recv).await
+        }
+        "connect" => {
+            let connect: ConnectPayload =
+                serde_json::from_str(&payload).context("Failed to deserialize connect payload")?;
+            handle_quic_connect(state, connect, send, recv).await
+        }
+        "tunnel_ready" => {
+            let ready: TunnelReadyPayload = serde_json::from_str(&payload)
+                .context("Failed to deserialize tunnel_ready payload")?;
+            handle_quic_server_tunnel(state, ready, send, recv).await
+        }
+        other => bail!("Unexpected QUIC control message type '{other}'"),
+    }
+}
+
+async fn handle_quic_register(
+    state: Arc<AppState>,
+    payload: RegisterPayload,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    if payload.r#type != "register" {
+        bail!("Unexpected message type {}", payload.r#type);
+    }
+
+    let server_id = Uuid::parse_str(&payload.server_id).context("invalid server_id")?;
+    if !state
+        .validate_secret(&server_id, &payload.relay_secret)
+        .await
+    {
+        warn!("Server {} failed relay secret validation", server_id);
+        let error_ack = serde_json::json!({
+            "type": "register_ack",
+            "status": "error",
+            "error": "unauthorized"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    let raw_key = Base64
+        .decode(payload.public_key.as_bytes())
+        .context("public_key is not valid base64")?;
+    let key_bytes: [u8; 32] = raw_key
+        .try_into()
+        .map_err(|_| anyhow!("public_key must be 32 bytes (Ed25519)"))?;
+
+    let public_key_b64url = URL_SAFE_NO_PAD.encode(&key_bytes);
+    let decoding_key = Arc::new(
+        DecodingKey::from_ed_components(&public_key_b64url)
+            .context("failed to create decoding key from public key")?,
+    );
+
+    info!(
+        "Registered server {} with capabilities {:?}",
+        server_id, payload.capabilities
+    );
+
+    let tls_authority = payload
+        .tls_authority
+        .as_ref()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string());
+
+    let ack = RegisterAck {
+        r#type: "register_ack",
+        status: "ok",
+        retry_after_seconds: 0,
+    };
+    let ack_json = serde_json::to_string(&ack)?;
+    quic_write_frame(&mut send, QuicFrameType::Text, ack_json.as_bytes()).await?;
+
+    let send = Arc::new(Mutex::new(send));
+    let (tx, mut rx) = mpsc::channel(32);
+    let registration_id = Uuid::new_v4();
+    let server_entry = Arc::new(RegisteredServer {
+        registration_id,
+        control_tx: tx.clone(),
+        decoding_key,
+        tls_authority,
+    });
+
+    state.upsert_server(server_id, server_entry.clone()).await;
+
+    loop {
+        tokio::select! {
+            maybe_cmd = rx.recv() => {
+                match maybe_cmd {
+                    Some(ServerCommand::OpenTunnel { tunnel_id, client_id, preferred_protocol, expires_at, server_secret }) => {
+                        trace!("Dispatching control command to server {}", server_id);
+                        let payload = serde_json::json!({
+                            "type": "open_tunnel",
+                            "tunnel_id": tunnel_id.to_string(),
+                            "client_id": client_id.to_string(),
+                            "preferred_protocol": preferred_protocol,
+                            "expires_at": expires_at,
+                            "server_secret": server_secret,
+                        })
+                        .to_string();
+                        let mut guard = send.lock().await;
+                        if let Err(err) =
+                            quic_write_frame(&mut *guard, QuicFrameType::Text, payload.as_bytes())
+                                .await
+                        {
+                            warn!("Control channel send failed for {server_id}: {err}");
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+            frame = quic_read_frame(&mut recv) => {
+                match frame {
+                    Ok(Some(QuicFrame::Ping(payload))) => {
+                        let mut guard = send.lock().await;
+                        let _ = quic_write_frame(&mut *guard, QuicFrameType::Pong, payload.as_slice()).await;
+                        trace!("Control channel ping handled for server {}", server_id);
+                    }
+                    Ok(Some(QuicFrame::Pong(_))) => {
+                        trace!("Control channel pong received for server {}", server_id);
+                    }
+                    Ok(Some(QuicFrame::Close)) | Ok(None) => break,
+                    Ok(Some(QuicFrame::Binary(_))) => {
+                        trace!("Ignoring unexpected binary frame on register control channel");
+                    }
+                    Ok(Some(QuicFrame::Text(_))) => {
+                        trace!("Ignoring unexpected text frame on register control channel");
+                    }
+                    Err(err) => {
+                        warn!("Control channel read failed for {server_id}: {err}");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    state
+        .remove_server_if_current(&server_id, &registration_id)
+        .await;
+    trace!("Removed server registration {}", server_id);
+    Ok(())
+}
+
+async fn handle_quic_connect(
+    state: Arc<AppState>,
+    payload: ConnectPayload,
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+) -> Result<()> {
+    let server_id = Uuid::parse_str(&payload.server_id).context("invalid server_id")?;
+    let client_id = Uuid::parse_str(&payload.client_id).context("invalid client_id")?;
+    let client_id_str = client_id.to_string();
+    trace!(
+        "QUIC connect request server={} client={}",
+        server_id, client_id
+    );
+
+    let Some(server_entry) = state.server_entry(&server_id).await else {
+        warn!("Connect rejected for unregistered server {server_id}");
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "server_not_registered"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    };
+
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.validate_aud = false;
+    let claims = match decode::<RelayClaims>(
+        &payload.relay_token,
+        server_entry.decoding_key.as_ref(),
+        &validation,
+    ) {
+        Ok(data) => data.claims,
+        Err(err) => {
+            warn!("Relay token validation failed: {err}");
+            let error_ack = serde_json::json!({
+                "type": "connect_ack",
+                "status": "error",
+                "error": "invalid_token"
+            })
+            .to_string();
+            quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    };
+
+    trace!("Relay token validated for client {}", client_id);
+
+    if !state.is_allowed_audience(&claims.aud) {
+        warn!(
+            "Relay token audience '{}' did not match expected host '{}'",
+            claims.aud, state.relay_host
+        );
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "invalid_token"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    let binding_type = claims.binding_type.as_deref().unwrap_or("client_id");
+    let binding_value = claims.binding_value.as_deref().unwrap_or(&claims.sub);
+
+    if claims.sub != binding_value || claims.sub != client_id_str {
+        warn!(
+            "Relay token subject mismatch (sub={}, binding={}, client={})",
+            claims.sub, binding_value, client_id
+        );
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "binding_mismatch"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    match binding_type {
+        "client_id" | "enrollment_token" => {
+            if binding_value != client_id_str {
+                warn!(
+                    "Relay token binding value '{}' did not match client {}",
+                    binding_value, client_id
+                );
+                let error_ack = serde_json::json!({
+                    "type": "connect_ack",
+                    "status": "error",
+                    "error": "binding_mismatch"
+                })
+                .to_string();
+                quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+                let _ = send.finish();
+                return Ok(());
+            }
+        }
+        other => {
+            warn!("Unsupported relay token binding type '{}'", other);
+            let error_ack = serde_json::json!({
+                "type": "connect_ack",
+                "status": "error",
+                "error": "invalid_token"
+            })
+            .to_string();
+            quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+            let _ = send.finish();
+            return Ok(());
+        }
+    }
+
+    let claims_server = Uuid::parse_str(&claims.server_id).context("invalid server_id in token")?;
+    if claims_server != server_id {
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "server_mismatch"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    let server_audience = claims
+        .server_audience
+        .as_deref()
+        .unwrap_or(&claims.server_id);
+    let audience_uuid =
+        Uuid::parse_str(server_audience).context("server_audience is not a UUID")?;
+    if audience_uuid != server_id {
+        warn!(
+            "Relay token server_audience {} did not match requested server {}",
+            audience_uuid, server_id
+        );
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "server_mismatch"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    if !claims.permissions.iter().any(|p| p == "connect") {
+        trace!("Relay token missing connect permission");
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "permission_denied"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        return Ok(());
+    }
+
+    let tunnel_id = Uuid::new_v4();
+    let expires_at = SystemTime::now()
+        .checked_add(state.handshake_timeout)
+        .and_then(|deadline| deadline.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_secs())
+        .unwrap_or(0);
+
+    let (tunnel_entry, server_secret) = state.create_tunnel(tunnel_id, Instant::now()).await;
+    let mut tunnel_guard = TunnelCleanupGuard::new(state.clone(), tunnel_id);
+
+    if server_entry
+        .control_tx
+        .send(ServerCommand::OpenTunnel {
+            tunnel_id,
+            client_id,
+            preferred_protocol: "binary",
+            expires_at,
+            server_secret: server_secret.clone(),
+        })
+        .await
+        .is_err()
+    {
+        warn!("Failed to notify server {server_id} about new tunnel");
+        let error_ack = serde_json::json!({
+            "type": "connect_ack",
+            "status": "error",
+            "error": "server_unreachable"
+        })
+        .to_string();
+        quic_write_frame(&mut send, QuicFrameType::Text, error_ack.as_bytes()).await?;
+        let _ = send.finish();
+        state.remove_tunnel(&tunnel_id).await;
+        tunnel_guard.disarm();
+        return Ok(());
+    }
+
+    let ack = ConnectAck {
+        r#type: "connect_ack",
+        status: "ok",
+        tunnel_id: tunnel_id.to_string(),
+        relay_host: state.relay_host.clone(),
+        expires_at,
+        server_authority: server_entry.tls_authority.clone(),
+    };
+    let ack_json = serde_json::to_string(&ack)?;
+    quic_write_frame(&mut send, QuicFrameType::Text, ack_json.as_bytes()).await?;
+
+    let ready_frame = loop {
+        match quic_read_frame(&mut recv).await? {
+            Some(QuicFrame::Text(payload)) => break payload,
+            Some(QuicFrame::Ping(payload)) => {
+                quic_write_frame(&mut send, QuicFrameType::Pong, payload.as_slice()).await?;
+            }
+            Some(QuicFrame::Pong(_)) => {}
+            Some(QuicFrame::Binary(_)) => {
+                warn!("Client sent unexpected binary frame before tunnel_ready");
+            }
+            Some(QuicFrame::Close) | None => {
+                bail!("client closed before tunnel_ready");
+            }
+        }
+    };
+
+    let ready: TunnelReadyPayload =
+        serde_json::from_str(&ready_frame).context("Failed to parse tunnel_ready")?;
+
+    if ready.r#type != "tunnel_ready"
+        || ready.role != "client"
+        || ready.tunnel_id != tunnel_id.to_string()
+    {
+        bail!("invalid tunnel_ready payload from client");
+    }
+
+    {
+        let mut guard = tunnel_entry.state.lock().await;
+        guard.mark_client_ready(Instant::now());
+    }
+    tunnel_entry.notify.notify_waiters();
+    trace!("Client readiness recorded for tunnel {}", tunnel_id);
+
+    let endpoint = QuicTunnelEndpoint::new(send, recv);
+
+    if let Some(pair) = tunnel_entry.attach_client_quic(endpoint).await {
+        info!("Tunnel {} became active immediately", tunnel_id);
+        tunnel_guard.disarm();
+        spawn_forwarders(state.clone(), tunnel_id, pair);
+        return Ok(());
+    }
+
+    let handle_wait = tunnel_entry.clone();
+    let handle_cleanup = tunnel_entry.clone();
+    let state_clone = state.clone();
+    let wait_result = timeout(state.handshake_timeout, async move {
+        loop {
+            handle_wait.notify.notified().await;
+
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                info!("Tunnel {} is now active", tunnel_id);
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            let already_active = {
+                let guard = handle_wait.state.lock().await;
+                guard.is_fully_ready()
+            };
+
+            if already_active {
+                trace!(
+                    "Tunnel {} already active; connect handler exiting",
+                    tunnel_id
+                );
+                break;
+            }
+        }
+    })
+    .await;
+
+    if wait_result.is_err() {
+        let already_ready = {
+            let guard = tunnel_entry.state.lock().await;
+            guard.is_fully_ready()
+        };
+
+        if already_ready {
+            trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
+        } else {
+            warn!(
+                "Tunnel {} expired waiting for server (client side)",
+                tunnel_id
+            );
+            if let Some(mut endpoint) = handle_cleanup.take_client_endpoint().await {
+                let _ = notify_tunnel_failed(&mut endpoint, "timeout").await;
+            }
+            state.remove_tunnel(&tunnel_id).await;
+            tunnel_guard.disarm();
+        }
+    } else {
+        tunnel_guard.disarm();
+    }
+
+    Ok(())
+}
+
+async fn handle_quic_server_tunnel(
+    state: Arc<AppState>,
+    payload: TunnelReadyPayload,
+    send: quinn::SendStream,
+    recv: quinn::RecvStream,
+) -> Result<()> {
+    if payload.r#type != "tunnel_ready" || payload.role != "server" {
+        bail!("Unexpected QUIC tunnel payload type {}", payload.r#type);
+    }
+
+    let tunnel_id = Uuid::parse_str(&payload.tunnel_id).context("invalid tunnel_id")?;
+    trace!("Server tunnel QUIC attachment for {}", tunnel_id);
+
+    let Some(entry) = state.get_tunnel(&tunnel_id).await else {
+        warn!("Received tunnel for unknown id {}", tunnel_id);
+        return Ok(());
+    };
+
+    let token = payload
+        .token
+        .as_ref()
+        .ok_or_else(|| anyhow!("Server tunnel attach missing authentication token"))?;
+
+    if !entry.verify_server_secret(token).await {
+        warn!(
+            "Tunnel {} received invalid server authentication token",
+            tunnel_id
+        );
+        return Ok(());
+    }
+
+    {
+        let mut guard = entry.state.lock().await;
+        guard.mark_server_ready(Instant::now());
+    }
+    entry.notify.notify_waiters();
+    trace!("Server readiness recorded for tunnel {}", tunnel_id);
+
+    let endpoint = QuicTunnelEndpoint::new(send, recv);
+
+    if let Some(pair) = entry.attach_server_quic(endpoint).await {
+        trace!("Attached server QUIC endpoint; tunnel active immediately");
+        spawn_forwarders(state.clone(), tunnel_id, pair);
+        return Ok(());
+    }
+
+    let handle_wait = entry.clone();
+    let handle_cleanup = entry.clone();
+    let state_clone = state.clone();
+    let wait_result = timeout(state.handshake_timeout, async move {
+        loop {
+            handle_wait.notify.notified().await;
+
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            let already_active = {
+                let guard = handle_wait.state.lock().await;
+                guard.is_fully_ready()
+            };
+
+            if already_active {
+                trace!(
+                    "Tunnel {} already active; server QUIC handler exiting",
+                    tunnel_id
+                );
+                break;
+            }
+        }
+    })
+    .await;
+
+    if wait_result.is_err() {
+        let already_ready = {
+            let guard = entry.state.lock().await;
+            guard.is_fully_ready()
+        };
+
+        if already_ready {
+            trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
+        } else {
+            warn!(
+                "Tunnel {} expired waiting for client (server side)",
+                tunnel_id
+            );
+            if let Some(mut server_endpoint) = handle_cleanup.take_server_endpoint().await {
+                let _ = close_server_endpoint(&mut server_endpoint).await;
+            }
+            state.remove_tunnel(&tunnel_id).await;
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 struct AppState {
+    bind_address: String,
     listen_addr: String,
     listen_port: u16,
     relay_host: String,
@@ -150,6 +847,7 @@ struct AppState {
     registered_servers: Arc<RwLock<HashMap<Uuid, Arc<RegisteredServer>>>>,
     tunnels: Arc<RwLock<HashMap<Uuid, Arc<TunnelHandle>>>>,
     handshake_timeout: Duration,
+    quic_port: Option<u16>,
 }
 
 struct RegisteredServer {
@@ -197,6 +895,8 @@ struct TunnelHandle {
     state: Mutex<TunnelState>,
     client_ws: Mutex<Option<WebSocket>>,
     server_ws: Mutex<Option<WebSocket>>,
+    client_quic: Mutex<Option<QuicTunnelEndpoint>>,
+    server_quic: Mutex<Option<QuicTunnelEndpoint>>,
     server_secret: Mutex<Option<String>>,
     notify: Notify,
 }
@@ -207,12 +907,14 @@ impl TunnelHandle {
             state: Mutex::new(TunnelState::new(now)),
             client_ws: Mutex::new(None),
             server_ws: Mutex::new(None),
+            client_quic: Mutex::new(None),
+            server_quic: Mutex::new(None),
             server_secret: Mutex::new(Some(server_secret)),
             notify: Notify::new(),
         }
     }
 
-    async fn attach_client(&self, ws: WebSocket) -> Option<(WebSocket, WebSocket)> {
+    async fn attach_client_ws(&self, ws: WebSocket) -> Option<TunnelPair> {
         {
             let mut guard = self.client_ws.lock().await;
             *guard = Some(ws);
@@ -221,7 +923,7 @@ impl TunnelHandle {
         self.take_pair_if_ready().await
     }
 
-    async fn attach_server(&self, ws: WebSocket) -> Option<(WebSocket, WebSocket)> {
+    async fn attach_server_ws(&self, ws: WebSocket) -> Option<TunnelPair> {
         {
             let mut guard = self.server_ws.lock().await;
             *guard = Some(ws);
@@ -230,37 +932,65 @@ impl TunnelHandle {
         self.take_pair_if_ready().await
     }
 
-    async fn take_pair_if_ready(&self) -> Option<(WebSocket, WebSocket)> {
-        let client_opt = {
-            let mut guard = self.client_ws.lock().await;
-            guard.take()
-        };
+    async fn attach_client_quic(&self, endpoint: QuicTunnelEndpoint) -> Option<TunnelPair> {
+        {
+            let mut guard = self.client_quic.lock().await;
+            *guard = Some(endpoint);
+        }
+        self.notify.notify_waiters();
+        self.take_pair_if_ready().await
+    }
 
-        let Some(client_ws) = client_opt else {
-            return None;
-        };
+    async fn attach_server_quic(&self, endpoint: QuicTunnelEndpoint) -> Option<TunnelPair> {
+        {
+            let mut guard = self.server_quic.lock().await;
+            *guard = Some(endpoint);
+        }
+        self.notify.notify_waiters();
+        self.take_pair_if_ready().await
+    }
 
-        let server_opt = {
-            let mut guard = self.server_ws.lock().await;
-            guard.take()
-        };
-
-        match server_opt {
-            Some(server_ws) => Some((client_ws, server_ws)),
-            None => {
+    async fn take_pair_if_ready(&self) -> Option<TunnelPair> {
+        // Prefer WebSocket pairing if both sides are present.
+        if let Some(client_ws) = self.client_ws.lock().await.take() {
+            if let Some(server_ws) = self.server_ws.lock().await.take() {
+                return Some(TunnelPair::WebSocket(client_ws, server_ws));
+            } else {
                 let mut guard = self.client_ws.lock().await;
                 *guard = Some(client_ws);
-                None
             }
         }
+
+        if let Some(client_quic) = self.client_quic.lock().await.take() {
+            if let Some(server_quic) = self.server_quic.lock().await.take() {
+                return Some(TunnelPair::Quic(client_quic, server_quic));
+            } else {
+                let mut guard = self.client_quic.lock().await;
+                *guard = Some(client_quic);
+            }
+        }
+
+        None
     }
 
-    async fn take_client_socket(&self) -> Option<WebSocket> {
-        self.client_ws.lock().await.take()
+    async fn take_client_endpoint(&self) -> Option<TunnelEndpoint> {
+        if let Some(ws) = self.client_ws.lock().await.take() {
+            return Some(TunnelEndpoint::WebSocket(ws));
+        }
+        if let Some(quic) = self.client_quic.lock().await.take() {
+            return Some(TunnelEndpoint::Quic(quic));
+        }
+        None
     }
 
-    async fn take_server_socket(&self) -> Option<WebSocket> {
-        self.server_ws.lock().await.take()
+    async fn take_server_endpoint(&self) -> Option<TunnelEndpoint> {
+        if let Some(ws) = self.server_ws.lock().await.take() {
+            return Some(TunnelEndpoint::WebSocket(ws));
+        }
+        if let Some(quic) = self.server_quic.lock().await.take() {
+            return Some(TunnelEndpoint::Quic(quic));
+        }
+        None
     }
 
     async fn verify_server_secret(&self, provided: &str) -> bool {
@@ -272,6 +1002,39 @@ impl TunnelHandle {
             }
         }
         false
+    }
+}
+
+enum TunnelPair {
+    WebSocket(WebSocket, WebSocket),
+    Quic(QuicTunnelEndpoint, QuicTunnelEndpoint),
+}
+
+enum TunnelEndpoint {
+    WebSocket(WebSocket),
+    Quic(QuicTunnelEndpoint),
+}
+
+#[derive(Debug)]
+struct QuicTunnelEndpoint {
+    send: Arc<Mutex<quinn::SendStream>>,
+    recv: Mutex<Option<quinn::RecvStream>>,
+}
+
+impl QuicTunnelEndpoint {
+    fn new(send: quinn::SendStream, recv: quinn::RecvStream) -> Self {
+        Self {
+            send: Arc::new(Mutex::new(send)),
+            recv: Mutex::new(Some(recv)),
+        }
+    }
+
+    async fn take_stream(&self) -> Option<quinn::RecvStream> {
+        self.recv.lock().await.take()
+    }
+
+    fn send_handle(&self) -> Arc<Mutex<quinn::SendStream>> {
+        Arc::clone(&self.send)
     }
 }
 
@@ -318,6 +1081,7 @@ impl AppState {
             registration_secrets,
             tls_cert_path: _,
             tls_key_path: _,
+            quic_port,
         } = config;
 
         let listen_addr = match bind_address.parse::<IpAddr>() {
@@ -345,6 +1109,7 @@ impl AppState {
         let handshake_timeout = Duration::from_secs(handshake_timeout_seconds.max(1));
 
         Self {
+            bind_address,
             listen_addr,
             listen_port: port,
             relay_host,
@@ -352,6 +1117,7 @@ impl AppState {
             registered_servers: Arc::new(RwLock::new(HashMap::new())),
             tunnels: Arc::new(RwLock::new(HashMap::new())),
             handshake_timeout,
+            quic_port,
         }
     }
 
@@ -582,6 +1348,8 @@ struct TunnelReadyPayload {
     r#type: String,
     tunnel_id: String,
     role: String,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1125,10 +1893,10 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         client_id, tunnel_id
     );
 
-    if let Some((client_ws, server_ws)) = tunnel_entry.attach_client(socket).await {
+    if let Some(pair) = tunnel_entry.attach_client_ws(socket).await {
         info!("Tunnel {} became active immediately", tunnel_id);
         tunnel_guard.disarm();
-        spawn_forwarders(state.clone(), tunnel_id, client_ws, server_ws);
+        spawn_forwarders(state.clone(), tunnel_id, pair);
         return Ok(());
     }
 
@@ -1139,9 +1907,9 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         loop {
             handle_wait.notify.notified().await;
 
-            if let Some((client_ws, server_ws)) = handle_wait.take_pair_if_ready().await {
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
                 info!("Tunnel {} is now active", tunnel_id);
-                spawn_forwarders(state_clone.clone(), tunnel_id, client_ws, server_ws);
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
                 break;
             }
 
@@ -1173,17 +1941,8 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
             trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
         } else {
             warn!("Tunnel {} expired waiting for server", tunnel_id);
-            if let Some(mut client_ws) = handle_cleanup.take_client_socket().await {
-                let _ = client_ws
-                    .send(Message::Text(
-                        serde_json::json!({
-                            "type": "tunnel_failed",
-                            "reason": "timeout"
-                        })
-                        .to_string(),
-                    ))
-                    .await;
-                let _ = client_ws.close().await;
+            if let Some(mut endpoint) = handle_cleanup.take_client_endpoint().await {
+                let _ = notify_tunnel_failed(&mut endpoint, "timeout").await;
             }
             state.remove_tunnel(&tunnel_id).await;
             tunnel_guard.disarm();
@@ -1286,9 +2045,9 @@ async fn handle_tunnel_socket(
 
     info!("Server confirmed tunnel {}", tunnel_id);
 
-    if let Some((client_ws, server_ws)) = entry.attach_server(socket).await {
+    if let Some(pair) = entry.attach_server_ws(socket).await {
         trace!("Attached server socket; tunnel active immediately");
-        spawn_forwarders(state.clone(), tunnel_id, client_ws, server_ws);
+        spawn_forwarders(state.clone(), tunnel_id, pair);
         return Ok(());
     }
 
@@ -1299,8 +2058,8 @@ async fn handle_tunnel_socket(
         loop {
             handle_wait.notify.notified().await;
 
-            if let Some((client_ws, server_ws)) = handle_wait.take_pair_if_ready().await {
-                spawn_forwarders(state_clone.clone(), tunnel_id, client_ws, server_ws);
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
                 break;
             }
 
@@ -1330,14 +2089,9 @@ async fn handle_tunnel_socket(
             trace!("Tunnel {} became active before timeout elapsed", tunnel_id);
         } else {
             warn!("Tunnel {} expired waiting for client", tunnel_id);
-            if let Some(mut server_ws) = handle_cleanup.take_server_socket().await {
-                trace!("Closing server websocket after timeout");
-                let _ = server_ws
-                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                        code: u16::from(CloseCode::Normal),
-                        reason: "timeout".into(),
-                    })))
-                    .await;
+            if let Some(mut server_endpoint) = handle_cleanup.take_server_endpoint().await {
+                trace!("Closing server tunnel endpoint after timeout");
+                let _ = close_server_endpoint(&mut server_endpoint).await;
             }
             state.remove_tunnel(&tunnel_id).await;
         }
@@ -1346,21 +2100,31 @@ async fn handle_tunnel_socket(
     Ok(())
 }
 
-#[instrument(level = "trace", skip(state, client_ws, server_ws))]
-fn spawn_forwarders(
-    state: Arc<AppState>,
-    tunnel_id: Uuid,
-    client_ws: WebSocket,
-    server_ws: WebSocket,
-) {
+#[instrument(level = "trace", skip(state, pair))]
+fn spawn_forwarders(state: Arc<AppState>, tunnel_id: Uuid, pair: TunnelPair) {
     trace!("Spawning forwarders for tunnel {}", tunnel_id);
-    tokio::spawn(async move {
-        if let Err(err) = forward_bidirectional(tunnel_id, client_ws, server_ws).await {
-            warn!("Tunnel {tunnel_id} forwarding error: {err:?}");
+    match pair {
+        TunnelPair::WebSocket(client_ws, server_ws) => {
+            tokio::spawn(async move {
+                if let Err(err) = forward_bidirectional(tunnel_id, client_ws, server_ws).await {
+                    warn!("Tunnel {tunnel_id} forwarding error: {err:?}");
+                }
+                trace!("Tunnel {tunnel_id} forwarding task finished");
+                state.remove_tunnel(&tunnel_id).await;
+            });
         }
-        trace!("Tunnel {tunnel_id} forwarding task finished");
-        state.remove_tunnel(&tunnel_id).await;
-    });
+        TunnelPair::Quic(client_quic, server_quic) => {
+            tokio::spawn(async move {
+                if let Err(err) =
+                    forward_quic_bidirectional(tunnel_id, client_quic, server_quic).await
+                {
+                    warn!("Tunnel {tunnel_id} QUIC forwarding error: {err:?}");
+                }
+                trace!("Tunnel {tunnel_id} QUIC forwarding task finished");
+                state.remove_tunnel(&tunnel_id).await;
+            });
+        }
+    }
 }
 
 #[instrument(level = "trace", skip(client_ws, server_ws))]
@@ -1433,6 +2197,224 @@ async fn forward_stream(
     }
 
     let _ = outbound.send(Message::Close(None)).await;
+    Ok(())
+}
+
+const QUIC_FRAME_HEADER_LEN: usize = 5;
+
+#[repr(u8)]
+enum QuicFrameType {
+    Text = 0,
+    Binary = 1,
+    Close = 2,
+    Ping = 3,
+    Pong = 4,
+}
+
+enum QuicFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Close,
+    Ping(Vec<u8>),
+    Pong(Vec<u8>),
+}
+
+async fn forward_quic_bidirectional(
+    tunnel_id: Uuid,
+    client: QuicTunnelEndpoint,
+    server: QuicTunnelEndpoint,
+) -> Result<()> {
+    let client_send = client.send_handle();
+    let server_send = server.send_handle();
+    let client_recv = client
+        .take_stream()
+        .await
+        .context("Client QUIC receive stream unavailable")?;
+    let server_recv = server
+        .take_stream()
+        .await
+        .context("Server QUIC receive stream unavailable")?;
+
+    let client_to_server = pipe_quic_stream(
+        tunnel_id,
+        "client->server",
+        client_recv,
+        Arc::clone(&server_send),
+        Arc::clone(&client_send),
+    );
+    let server_to_client = pipe_quic_stream(
+        tunnel_id,
+        "server->client",
+        server_recv,
+        Arc::clone(&client_send),
+        Arc::clone(&server_send),
+    );
+
+    tokio::try_join!(client_to_server, server_to_client)?;
+
+    Ok(())
+}
+
+async fn pipe_quic_stream(
+    tunnel_id: Uuid,
+    direction: &'static str,
+    mut recv: quinn::RecvStream,
+    dest_send: Arc<Mutex<quinn::SendStream>>,
+    source_send: Arc<Mutex<quinn::SendStream>>,
+) -> Result<()> {
+    loop {
+        match quic_read_frame(&mut recv).await? {
+            Some(QuicFrame::Binary(payload)) => {
+                let mut guard = dest_send.lock().await;
+                quic_write_frame(&mut *guard, QuicFrameType::Binary, payload.as_slice()).await?;
+            }
+            Some(QuicFrame::Text(_)) => {
+                trace!(
+                    tunnel = %tunnel_id,
+                    %direction,
+                    "Ignoring unexpected text frame on QUIC tunnel"
+                );
+            }
+            Some(QuicFrame::Ping(payload)) => {
+                let mut guard = source_send.lock().await;
+                quic_write_frame(&mut *guard, QuicFrameType::Pong, payload.as_slice()).await?;
+            }
+            Some(QuicFrame::Pong(_)) => {
+                trace!(
+                    tunnel = %tunnel_id,
+                    %direction,
+                    "Received QUIC pong frame"
+                );
+            }
+            Some(QuicFrame::Close) | None => break,
+        }
+    }
+
+    trace!(tunnel = %tunnel_id, %direction, "QUIC stream pipeline finished");
+    Ok(())
+}
+
+async fn quic_read_frame(stream: &mut quinn::RecvStream) -> Result<Option<QuicFrame>> {
+    let mut header = [0u8; QUIC_FRAME_HEADER_LEN];
+    match stream.read_exact(&mut header).await {
+        Ok(()) => {}
+        Err(ReadExactError::FinishedEarly(_)) => return Ok(None),
+        Err(ReadExactError::ReadError(err)) => {
+            return Err(anyhow!("Failed to read QUIC frame header: {err}"));
+        }
+    }
+
+    let frame_type = match header[0] {
+        0 => QuicFrameType::Text,
+        1 => QuicFrameType::Binary,
+        2 => QuicFrameType::Close,
+        3 => QuicFrameType::Ping,
+        4 => QuicFrameType::Pong,
+        other => bail!("Unknown QUIC frame type {}", other),
+    };
+
+    let length = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+    let mut payload = vec![0u8; length];
+    if length > 0 {
+        match stream.read_exact(&mut payload).await {
+            Ok(()) => {}
+            Err(ReadExactError::FinishedEarly(_)) => return Ok(None),
+            Err(ReadExactError::ReadError(err)) => {
+                return Err(anyhow!("Failed to read QUIC frame payload: {err}"));
+            }
+        }
+    }
+
+    let frame = match frame_type {
+        QuicFrameType::Text => {
+            let text =
+                String::from_utf8(payload).context("QUIC control frame contained invalid UTF-8")?;
+            QuicFrame::Text(text)
+        }
+        QuicFrameType::Binary => QuicFrame::Binary(payload),
+        QuicFrameType::Close => QuicFrame::Close,
+        QuicFrameType::Ping => QuicFrame::Ping(payload),
+        QuicFrameType::Pong => QuicFrame::Pong(payload),
+    };
+
+    Ok(Some(frame))
+}
+
+async fn quic_write_frame(
+    stream: &mut quinn::SendStream,
+    frame_type: QuicFrameType,
+    payload: &[u8],
+) -> Result<()> {
+    if payload.len() > u32::MAX as usize {
+        bail!("QUIC frame payload exceeds u32::MAX");
+    }
+
+    let mut header = [0u8; QUIC_FRAME_HEADER_LEN];
+    header[0] = frame_type as u8;
+    header[1..5].copy_from_slice(&(payload.len() as u32).to_be_bytes());
+
+    stream
+        .write_all(&header)
+        .await
+        .context("Failed to write QUIC frame header")?;
+    if !payload.is_empty() {
+        stream
+            .write_all(payload)
+            .await
+            .context("Failed to write QUIC frame payload")?;
+    }
+    Ok(())
+}
+
+async fn quic_send_text(endpoint: &QuicTunnelEndpoint, text: &str) -> Result<()> {
+    let send = endpoint.send_handle();
+    let mut guard = send.lock().await;
+    quic_write_frame(&mut *guard, QuicFrameType::Text, text.as_bytes()).await
+}
+
+async fn quic_send_close(endpoint: &QuicTunnelEndpoint) -> Result<()> {
+    let send = endpoint.send_handle();
+    let mut guard = send.lock().await;
+    quic_write_frame(&mut *guard, QuicFrameType::Close, &[]).await?;
+    guard
+        .finish()
+        .map_err(|err| anyhow!("Failed to finish QUIC stream: {err}"))
+}
+
+async fn notify_tunnel_failed(endpoint: &mut TunnelEndpoint, reason: &str) -> Result<()> {
+    let payload = serde_json::json!({
+        "type": "tunnel_failed",
+        "reason": reason,
+    })
+    .to_string();
+
+    match endpoint {
+        TunnelEndpoint::WebSocket(ws) => {
+            let _ = ws.send(Message::Text(payload)).await;
+            let _ = ws.close().await;
+        }
+        TunnelEndpoint::Quic(quic) => {
+            let _ = quic_send_text(quic, &payload).await;
+            let _ = quic_send_close(quic).await;
+        }
+    }
+    Ok(())
+}
+
+async fn close_server_endpoint(endpoint: &mut TunnelEndpoint) -> Result<()> {
+    match endpoint {
+        TunnelEndpoint::WebSocket(ws) => {
+            let _ = ws
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: u16::from(CloseCode::Normal),
+                    reason: "timeout".into(),
+                })))
+                .await;
+        }
+        TunnelEndpoint::Quic(quic) => {
+            let _ = quic_send_close(quic).await;
+        }
+    }
     Ok(())
 }
 

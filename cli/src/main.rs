@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::{generate, Shell};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig, TransportPreference, TRANSPORT_OVERRIDE_ENV},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,

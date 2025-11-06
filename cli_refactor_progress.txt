@@ -4,8 +4,8 @@ Capability session + QUIC transport integration progress
 Server
 ------
 - Added transport abstraction for relay control/tunnel flows with WebSocket adapter, preparing for QUIC implementation.
-- Added server-side QUIC transport stub that advertises capability but still falls back to WebSocket until the relay listener lands.
-- gRPC relay tests still require privileged sockets; relay QUIC endpoint implementation pending.
+- Implemented Quinn-backed QUIC listener on the relay plus server-side transport, mirroring the WebSocket control loop and tunnel bridging.
+- gRPC relay tests still require privileged sockets; QUIC paths rely on the same UDP permissions.
 
 Client
 ------
@@ -19,4 +19,4 @@ Testing
 - `cargo check`
 - `cargo test` (relay integration still fails under sandboxed sockets; expected permission errors).
 
-Next: deploy relay QUIC listener and tighten CI coverage across both transports.
+Next: extend automated coverage (integration smoke) and soak tests across both transports.

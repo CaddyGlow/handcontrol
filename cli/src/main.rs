@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
-    list_commands as fetch_command_list, open_capability_session, resume_capability_session,
+    list_commands as fetch_command_list, list_sessions as fetch_sessions, open_capability_session,
+    resume_capability_session,
     storage::{ServerRegistry, ServerRegistryEntry},
-    validate_parameters, ApprovalEnrollmentInput, CapabilitySessionEvent, CapabilitySessionSender,
-    CommandKind, CommandList, CommandSessionMode, CommandStreamEvent, CommandSummary,
-    DiscoveredServer, QrEnrollmentInput,
+    validate_parameters, ApprovalEnrollmentInput, CapabilitySession, CapabilitySessionEvent,
+    CapabilitySessionResumeState, CapabilitySessionSender, CommandKind, CommandList,
+    CommandSessionMode, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
+    ServerSessionInfo,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -20,6 +22,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -53,6 +56,10 @@ enum Command {
     List(ListCommand),
     /// Execute a command on an enrolled server
     Exec(ExecCommand),
+    /// Inspect active sessions on an enrolled server
+    Sessions(SessionsCommand),
+    /// Resume an existing interactive session
+    Resume(ResumeCommand),
     /// Remove stored enrollment for a server
     Remove(RemoveCommand),
     /// Manage client configuration
@@ -135,6 +142,23 @@ struct RemoveCommand {
     /// Skip confirmation prompt
     #[arg(long, alias = "yes")]
     confirm: bool,
+}
+
+#[derive(Parser)]
+struct SessionsCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Output JSON instead of a table
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser)]
+struct ResumeCommand {
+    /// Server identifier (UUID, hostname, or alias)
+    server: String,
+    /// Session identifier (UUID)
+    session_id: String,
 }
 
 #[derive(Subcommand)]
@@ -221,6 +245,8 @@ async fn main() -> Result<()> {
         Command::Info(cmd) => run_info(cmd).await,
         Command::List(cmd) => run_list_commands(cmd).await,
         Command::Exec(cmd) => run_exec_command(cmd).await,
+        Command::Sessions(cmd) => run_sessions(cmd).await,
+        Command::Resume(cmd) => run_resume(cmd).await,
         Command::Remove(cmd) => run_remove(cmd),
         Command::Config { command } => run_config(command),
         Command::Enroll { command } => run_enroll(command).await,
@@ -478,7 +504,20 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
                     command.name
                 );
             }
-            run_interactive_shell(entry, command, sanitized).await
+            let session = open_capability_session(entry, &command.id, sanitized).await?;
+            if session.session_mode() != CommandSessionMode::Realtime {
+                bail!(
+                    "Capability '{}' reported unsupported session mode {:?}",
+                    command.name,
+                    session.session_mode()
+                );
+            }
+            let session_label = if command.name.is_empty() {
+                command.id.clone()
+            } else {
+                command.name.clone()
+            };
+            run_interactive_shell(entry, &server, &session_label, session, false).await
         }
         _ => bail!(
             "Capability '{}' requires {:?} sessions which are not supported by this CLI",
@@ -490,200 +529,107 @@ async fn run_exec_command(cmd: ExecCommand) -> Result<()> {
 
 async fn run_interactive_shell(
     entry: &ServerRegistryEntry,
-    command: &CommandSummary,
-    parameters: HashMap<String, String>,
+    server_label: &str,
+    session_name: &str,
+    mut session: CapabilitySession,
+    resumed: bool,
 ) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("Realtime capabilities require an interactive TTY");
     }
 
-    let mut session = open_capability_session(entry, &command.id, parameters).await?;
-    if session.session_mode() != CommandSessionMode::Realtime {
-        bail!(
-            "Capability '{}' reported unsupported session mode {:?}",
-            command.name,
-            session.session_mode()
-        );
-    }
-
-    if let Some(message) = session.ready_message() {
+    if resumed {
+        println!("Resumed interactive session '{session_name}'.");
+    } else if let Some(message) = session.ready_message() {
         if !message.is_empty() {
             println!("{message}");
         }
     } else {
-        println!(
-            "Interactive session '{}' ready. Press Ctrl+C to terminate.",
-            command.name
-        );
+        println!("Interactive session '{session_name}' ready.");
     }
+    println!("Press Ctrl+] to detach.");
 
     let raw_guard = RawModeGuard::new()?;
 
     let mut sender = session.sender();
     send_initial_resize(&sender).await;
 
-    let mut input_handle = spawn_input_task(sender.clone());
-    let mut resize_handle = spawn_resize_task(sender.clone());
+    let (mut input_handle, mut resize_handle, mut detach_rx) = setup_io_tasks(sender.clone());
 
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut resume_attempts: usize = 0;
+    let mut outcome = drive_session(
+        &mut session,
+        &mut stdout,
+        &mut stderr,
+        &mut detach_rx,
+        &mut exit_code,
+        &mut timed_out,
+    )
+    .await?;
 
-    while let Some(event) = session.recv().await? {
-        match event {
-            CapabilitySessionEvent::Output {
-                data,
-                stderr: is_stderr,
-                ..
-            } => {
-                if is_stderr {
-                    if stderr.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    let _ = stderr.flush().await;
-                } else {
-                    if stdout.write_all(&data).await.is_err() {
-                        break;
-                    }
-                    let _ = stdout.flush().await;
-                }
-                resume_attempts = 0;
-            }
-            CapabilitySessionEvent::Exit {
-                exit_code: code,
-                timed_out: was_timeout,
-                message,
-            } => {
-                exit_code = Some(code);
-                timed_out = was_timeout;
-                if let Some(message) = message {
-                    let mut bytes = message.into_bytes();
-                    if !bytes.ends_with(&[b'\n']) {
-                        bytes.push(b'\n');
-                    }
-                    let _ = stderr.write_all(&bytes).await;
-                    let _ = stderr.flush().await;
-                }
-            }
-            CapabilitySessionEvent::Error { message, .. } => {
-                return Err(anyhow!("Server reported capability error: {}", message));
-            }
-            CapabilitySessionEvent::HeartbeatAck { .. } => {
-                // Ignore keep-alives.
-            }
-            CapabilitySessionEvent::Closed { reason } => {
-                if exit_code.is_none() {
-                    if let Some(reason) = reason {
-                        return Err(anyhow!("Capability session closed: {}", reason));
-                    } else {
-                        return Err(anyhow!("Capability session closed unexpectedly"));
-                    }
-                }
-                break;
-            }
-        }
-
-        continue;
-    }
-
-    while exit_code.is_none() {
-        // Stream ended without an exit event; attempt to resume if possible.
+    while matches!(outcome, SessionOutcome::StreamClosed) && exit_code.is_none() {
         let resume_state = session.resume_state();
 
         println!("\nConnection interrupted. Attempting to resume...");
 
-        input_handle.abort();
-        let _ = input_handle.await;
-        if let Some(handle) = &mut resize_handle {
-            handle.abort();
-            let _ = handle.await;
-        }
+        cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
 
         match resume_capability_session(entry, resume_state).await {
             Ok(new_session) => {
                 session = new_session;
                 sender = session.sender();
                 send_initial_resize(&sender).await;
-                input_handle = spawn_input_task(sender.clone());
-                resize_handle = spawn_resize_task(sender.clone());
+
+                let handles = setup_io_tasks(sender.clone());
+                input_handle = handles.0;
+                resize_handle = handles.1;
+                detach_rx = handles.2;
+
                 resume_attempts += 1;
                 println!("Session resumed (attempt #{resume_attempts}).");
+
+                outcome = drive_session(
+                    &mut session,
+                    &mut stdout,
+                    &mut stderr,
+                    &mut detach_rx,
+                    &mut exit_code,
+                    &mut timed_out,
+                )
+                .await?;
             }
             Err(err) => {
+                cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
+                drop(raw_guard);
                 return Err(anyhow!("Failed to resume session: {}", err));
             }
         }
-
-        while let Some(event) = session.recv().await? {
-            match event {
-                CapabilitySessionEvent::Output {
-                    data,
-                    stderr: is_stderr,
-                    ..
-                } => {
-                    if is_stderr {
-                        if stderr.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = stderr.flush().await;
-                    } else {
-                        if stdout.write_all(&data).await.is_err() {
-                            break;
-                        }
-                        let _ = stdout.flush().await;
-                    }
-                }
-                CapabilitySessionEvent::Exit {
-                    exit_code: code,
-                    timed_out: was_timeout,
-                    message,
-                } => {
-                    exit_code = Some(code);
-                    timed_out = was_timeout;
-                    if let Some(message) = message {
-                        let mut bytes = message.into_bytes();
-                        if !bytes.ends_with(&[b'\n']) {
-                            bytes.push(b'\n');
-                        }
-                        let _ = stderr.write_all(&bytes).await;
-                        let _ = stderr.flush().await;
-                    }
-                    break;
-                }
-                CapabilitySessionEvent::Error { message, .. } => {
-                    return Err(anyhow!("Server reported capability error: {}", message));
-                }
-                CapabilitySessionEvent::HeartbeatAck { .. } => {}
-                CapabilitySessionEvent::Closed { reason } => {
-                    if exit_code.is_none() {
-                        if let Some(reason) = reason {
-                            return Err(anyhow!("Capability session closed: {}", reason));
-                        } else {
-                            return Err(anyhow!("Capability session closed unexpectedly"));
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if exit_code.is_some() {
-            break;
-        }
     }
 
+    let detached = matches!(outcome, SessionOutcome::Detached);
+
+    cleanup_io_tasks(&mut input_handle, &mut resize_handle).await;
     drop(raw_guard);
 
-    let _ = sender.close(None).await;
-    input_handle.abort();
-    let _ = input_handle.await;
-
-    if let Some(handle) = &mut resize_handle {
-        handle.abort();
-        let _ = handle.await;
+    if detached {
+        println!("\nDetached from session {}.", session.session_id());
+        println!(
+            "Resume later with: handcontrol-cli resume {} {}",
+            server_label,
+            session.session_id()
+        );
+        println!(
+            "You can view active sessions with: handcontrol-cli sessions {}",
+            server_label
+        );
+        return Ok(());
     }
+
+    let _ = sender.close(None).await;
 
     if timed_out {
         bail!("Realtime capability timed out");
@@ -705,7 +651,10 @@ async fn send_initial_resize(sender: &CapabilitySessionSender) {
     }
 }
 
-fn spawn_input_task(sender: CapabilitySessionSender) -> tokio::task::JoinHandle<()> {
+fn spawn_input_task(
+    sender: CapabilitySessionSender,
+    detach_tx: mpsc::UnboundedSender<()>,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 1024];
@@ -716,8 +665,38 @@ fn spawn_input_task(sender: CapabilitySessionSender) -> tokio::task::JoinHandle<
                     break;
                 }
                 Ok(n) => {
-                    if sender.send_input(buf[..n].to_vec(), false).await.is_err() {
-                        break;
+                    let start = 0;
+                    let mut detach_triggered = false;
+
+                    for (idx, byte) in buf[..n].iter().enumerate() {
+                        if *byte == 0x1d {
+                            if idx > start {
+                                if sender
+                                    .send_input(buf[start..idx].to_vec(), false)
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            let _ = detach_tx.send(());
+                            detach_triggered = true;
+                            break;
+                        }
+                    }
+
+                    if detach_triggered {
+                        return;
+                    }
+
+                    if start < n {
+                        if sender
+                            .send_input(buf[start..n].to_vec(), false)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
                 Err(_) => {
@@ -752,6 +731,286 @@ fn spawn_resize_task(sender: CapabilitySessionSender) -> Option<tokio::task::Joi
     {
         let _ = sender;
         None
+    }
+}
+
+fn setup_io_tasks(
+    sender: CapabilitySessionSender,
+) -> (
+    tokio::task::JoinHandle<()>,
+    Option<tokio::task::JoinHandle<()>>,
+    mpsc::UnboundedReceiver<()>,
+) {
+    let (detach_tx, detach_rx) = mpsc::unbounded_channel();
+    let input_handle = spawn_input_task(sender.clone(), detach_tx);
+    let resize_handle = spawn_resize_task(sender);
+    (input_handle, resize_handle, detach_rx)
+}
+
+enum SessionOutcome {
+    Exit,
+    StreamClosed,
+    Detached,
+}
+
+async fn drive_session(
+    session: &mut CapabilitySession,
+    stdout: &mut tokio::io::Stdout,
+    stderr: &mut tokio::io::Stderr,
+    detach_rx: &mut mpsc::UnboundedReceiver<()>,
+    exit_code: &mut Option<i32>,
+    timed_out: &mut bool,
+) -> Result<SessionOutcome> {
+    loop {
+        tokio::select! {
+            Some(_) = detach_rx.recv() => return Ok(SessionOutcome::Detached),
+            event = session.recv() => match event {
+                Ok(Some(CapabilitySessionEvent::Output { data, stderr: is_stderr, .. })) => {
+                    let write_result = if is_stderr {
+                        stderr.write_all(&data).await
+                    } else {
+                        stdout.write_all(&data).await
+                    };
+
+                    if write_result.is_err() {
+                        return Ok(SessionOutcome::StreamClosed);
+                    }
+
+                    let _ = if is_stderr {
+                        stderr.flush().await
+                    } else {
+                        stdout.flush().await
+                    };
+                }
+                Ok(Some(CapabilitySessionEvent::Exit { exit_code: code, timed_out: was_timeout, message })) => {
+                    *exit_code = Some(code);
+                    *timed_out = was_timeout;
+                    if let Some(message) = message {
+                        let mut bytes = message.into_bytes();
+                        if !bytes.ends_with(&[b'\n']) {
+                            bytes.push(b'\n');
+                        }
+                        let _ = stderr.write_all(&bytes).await;
+                        let _ = stderr.flush().await;
+                    }
+                    return Ok(SessionOutcome::Exit);
+                }
+                Ok(Some(CapabilitySessionEvent::Error { message, .. })) => {
+                    return Err(anyhow!("Server reported capability error: {}", message));
+                }
+                Ok(Some(CapabilitySessionEvent::HeartbeatAck { .. })) => {
+                    // keep alive
+                }
+                Ok(Some(CapabilitySessionEvent::Closed { reason })) => {
+                    if exit_code.is_none() {
+                        if let Some(reason) = reason {
+                            return Err(anyhow!("Capability session closed: {}", reason));
+                        } else {
+                            return Err(anyhow!("Capability session closed unexpectedly"));
+                        }
+                    }
+                    return Ok(SessionOutcome::StreamClosed);
+                }
+                Ok(None) => return Ok(SessionOutcome::StreamClosed),
+                Err(err) => return Err(err),
+            },
+        }
+    }
+}
+
+async fn cleanup_io_tasks(
+    input_handle: &mut tokio::task::JoinHandle<()>,
+    resize_handle: &mut Option<tokio::task::JoinHandle<()>>,
+) {
+    input_handle.abort();
+    let _ = input_handle.await;
+
+    if let Some(handle) = resize_handle.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
+}
+
+async fn run_sessions(cmd: SessionsCommand) -> Result<()> {
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&cmd.server, &registry)?.clone();
+
+    let mut sessions = fetch_sessions(&entry).await?;
+    sessions.sort_by(|a, b| a.created_at_ms.cmp(&b.created_at_ms));
+
+    if cmd.json {
+        output_json(&sessions)?;
+        return Ok(());
+    }
+
+    print_sessions_table(&sessions);
+    Ok(())
+}
+
+async fn run_resume(cmd: ResumeCommand) -> Result<()> {
+    let registry = ServerRegistry::load()?;
+    let entry = find_enrolled_server(&cmd.server, &registry)?.clone();
+
+    let sessions = fetch_sessions(&entry).await?;
+    let info = sessions
+        .into_iter()
+        .find(|s| s.session_id.eq_ignore_ascii_case(&cmd.session_id))
+        .ok_or_else(|| {
+            anyhow!(
+                "Session '{}' not found on server {}",
+                cmd.session_id,
+                entry.id
+            )
+        })?;
+
+    if info.session_mode != CommandSessionMode::Realtime {
+        bail!(
+            "Session '{}' uses '{:?}' mode which cannot be resumed interactively",
+            info.session_id,
+            info.session_mode
+        );
+    }
+
+    let state = CapabilitySessionResumeState {
+        session_id: info.session_id.clone(),
+        capability_id: info.capability_id.clone(),
+        resume_token: info.resume_token.clone(),
+        last_stdout_sequence: info.stdout_next_sequence.saturating_sub(1),
+        last_stderr_sequence: info.stderr_next_sequence.saturating_sub(1),
+        session_mode: info.session_mode,
+    };
+
+    let session = resume_capability_session(&entry, state).await?;
+    let session_label = if info.capability_name.is_empty() {
+        info.capability_id
+    } else {
+        info.capability_name
+    };
+
+    run_interactive_shell(&entry, &cmd.server, &session_label, session, true).await
+}
+
+fn print_sessions_table(sessions: &[ServerSessionInfo]) {
+    if sessions.is_empty() {
+        println!("No active sessions.");
+        return;
+    }
+
+    println!(
+        "{:<36}  {:<24}  {:<8}  {:<7}  {:<10}  {:<12}  {}",
+        "Session ID", "Capability", "Mode", "Attached", "Owner", "Age", "Last Activity"
+    );
+
+    for info in sessions {
+        let capability_display = if info.capability_name.is_empty() {
+            info.capability_id.clone()
+        } else {
+            info.capability_name.clone()
+        };
+
+        println!(
+            "{:<36}  {:<24}  {:<8}  {:<7}  {:<10}  {:<12}  {}",
+            info.session_id,
+            truncate(&capability_display, 24),
+            format!("{:?}", info.session_mode),
+            if info.attached { "yes" } else { "no" },
+            short_fingerprint(&info.owner_fingerprint),
+            format_age(info.created_at_ms),
+            format_since(info.last_activity_ms),
+        );
+    }
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    if value.len() <= width {
+        value.to_string()
+    } else if width == 0 {
+        String::new()
+    } else if width == 1 {
+        "…".to_string()
+    } else {
+        format!("{}…", &value[..width - 1])
+    }
+}
+
+fn short_fingerprint(fingerprint: &Option<String>) -> String {
+    match fingerprint {
+        Some(fp) if !fp.is_empty() => {
+            if fp.len() <= 8 {
+                fp.clone()
+            } else {
+                format!("{}…", &fp[..8])
+            }
+        }
+        _ => "-".to_string(),
+    }
+}
+
+fn timestamp_to_datetime(ms: i64) -> Option<OffsetDateTime> {
+    OffsetDateTime::from_unix_timestamp_nanos((ms as i128) * 1_000_000).ok()
+}
+
+fn format_age(ms: i64) -> String {
+    match timestamp_to_datetime(ms) {
+        Some(created) => {
+            let now = OffsetDateTime::now_utc();
+            if now >= created {
+                duration_to_brief(now - created)
+            } else {
+                "0s".to_string()
+            }
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn format_since(ms: i64) -> String {
+    match timestamp_to_datetime(ms) {
+        Some(timestamp) => {
+            let now = OffsetDateTime::now_utc();
+            if now >= timestamp {
+                format!("{} ago", duration_to_brief(now - timestamp))
+            } else {
+                "in future".to_string()
+            }
+        }
+        None => "n/a".to_string(),
+    }
+}
+
+fn duration_to_brief(duration: TimeDuration) -> String {
+    let mut seconds = duration.whole_seconds();
+    if seconds <= 0 {
+        return "0s".to_string();
+    }
+
+    let mut parts = Vec::new();
+    let days = seconds / 86_400;
+    if days > 0 {
+        parts.push(format!("{}d", days));
+        seconds -= days * 86_400;
+    }
+
+    let hours = seconds / 3_600;
+    if hours > 0 {
+        parts.push(format!("{}h", hours));
+        seconds -= hours * 3_600;
+    }
+
+    let minutes = seconds / 60;
+    if minutes > 0 && parts.len() < 2 {
+        parts.push(format!("{}m", minutes));
+        seconds -= minutes * 60;
+    }
+
+    if seconds > 0 && parts.len() < 2 {
+        parts.push(format!("{}s", seconds));
+    }
+
+    if parts.is_empty() {
+        "0s".to_string()
+    } else {
+        parts.join(" ")
     }
 }
 

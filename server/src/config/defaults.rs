@@ -259,11 +259,12 @@ fn default_interactive_shell_capability() -> CapabilityConfig {
         parameters: vec![],
         acl: CapabilityAclConfig::default(),
         definition: CapabilityDefinition::ShellInteractive(ShellInteractiveDefinition {
-            shell: if cfg!(target_os = "windows") {
+            path: if cfg!(target_os = "windows") {
                 "cmd.exe".to_string()
             } else {
                 "/bin/sh".to_string()
             },
+            argv: vec!["-i".to_string()],
             working_directory: None,
             env: HashMap::new(),
             idle_timeout_seconds: Some(600),

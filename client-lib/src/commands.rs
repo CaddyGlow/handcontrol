@@ -5,9 +5,9 @@ use crate::{
         session_client_message, session_server_message, Capability as ProtoCapability,
         CapabilityKind as ProtoCapabilityKind, CapabilityParameter as ProtoCapabilityParameter,
         CapabilityParameterType as ProtoCapabilityParameterType, ListCapabilitiesRequest,
-        SessionClientMessage, SessionClose, SessionHeartbeat, SessionInput,
-        SessionMode as ProtoSessionMode, SessionOpen, SessionResize, SessionResume,
-        SessionServerMessage,
+        ListSessionsRequest, SessionClientMessage, SessionClose, SessionHeartbeat,
+        SessionInfo as ProtoSessionInfo, SessionInput, SessionMode as ProtoSessionMode,
+        SessionOpen, SessionResize, SessionResume, SessionServerMessage,
     },
     storage::ServerRegistryEntry,
 };
@@ -337,6 +337,25 @@ pub enum CapabilitySessionEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ServerSessionInfo {
+    pub session_id: String,
+    pub capability_id: String,
+    pub capability_name: String,
+    pub session_mode: CommandSessionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_fingerprint: Option<String>,
+    pub created_at_ms: i64,
+    pub last_activity_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_detached_ms: Option<i64>,
+    pub attached: bool,
+    pub resume_token: String,
+    pub stdout_next_sequence: u64,
+    pub stderr_next_sequence: u64,
+    pub buffer_len: u32,
+}
+
 impl CommandSummary {
     fn from_proto(proto: ProtoCapability) -> Result<Self> {
         let parameters = proto
@@ -391,6 +410,29 @@ impl CommandSessionMode {
             ProtoSessionMode::Unspecified => CommandSessionMode::Unknown,
         }
     }
+}
+
+fn session_info_from_proto(info: ProtoSessionInfo) -> Result<ServerSessionInfo> {
+    let session_mode = CommandSessionMode::from_proto(info.session_mode);
+    if session_mode == CommandSessionMode::Unknown {
+        bail!("Session '{}' reported unknown mode", info.session_id);
+    }
+
+    Ok(ServerSessionInfo {
+        session_id: info.session_id,
+        capability_id: info.capability_id,
+        capability_name: info.capability_name,
+        session_mode,
+        owner_fingerprint: info.owner_fingerprint,
+        created_at_ms: info.created_at_ms,
+        last_activity_ms: info.last_activity_ms,
+        last_detached_ms: info.last_detached_ms,
+        attached: info.attached,
+        resume_token: info.resume_token,
+        stdout_next_sequence: info.stdout_next_sequence,
+        stderr_next_sequence: info.stderr_next_sequence,
+        buffer_len: info.buffer_len,
+    })
 }
 
 impl CommandParameter {
@@ -777,6 +819,25 @@ pub async fn resume_capability_session(
         last_stderr_sequence,
         pending_events,
     })
+}
+
+/// List active sessions on the target server.
+pub async fn list_sessions(entry: &ServerRegistryEntry) -> Result<Vec<ServerSessionInfo>> {
+    let cert_paths = CertificatePaths::for_server(&entry.id)?;
+    let mut client = connect_registered(entry, &cert_paths).await?;
+
+    let response = client
+        .inner()
+        .list_sessions(Request::new(ListSessionsRequest {}))
+        .await
+        .context("ListSessions RPC failed")?
+        .into_inner();
+
+    response
+        .sessions
+        .into_iter()
+        .map(session_info_from_proto)
+        .collect()
 }
 
 /// Execute a one-shot capability, invoking the callback for each stdout/stderr chunk.

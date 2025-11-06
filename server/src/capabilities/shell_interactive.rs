@@ -70,7 +70,8 @@ impl Capability for ShellInteractiveCapability {
 
         let definition = self.definition().clone();
         let capability_id = self.metadata.id.clone();
-        let shell_path = definition.shell.clone();
+        let shell_path = definition.path.clone();
+        let shell_args = definition.argv.clone();
         let working_dir = definition.working_directory.clone();
         let env = definition.env.clone();
 
@@ -81,6 +82,7 @@ impl Capability for ShellInteractiveCapability {
             if let Err(err) = run_interactive_shell(
                 &capability_id,
                 shell_path,
+                shell_args,
                 working_dir,
                 env,
                 idle_timeout,
@@ -126,6 +128,7 @@ impl Drop for PtyMaster {
 async fn run_interactive_shell(
     capability_id: &str,
     shell_path: String,
+    shell_args: Vec<String>,
     working_dir: Option<String>,
     env: std::collections::HashMap<String, String>,
     idle_timeout: Option<u64>,
@@ -152,9 +155,11 @@ async fn run_interactive_shell(
         None
     };
 
-    let mut argv = Vec::new();
+    let mut argv = Vec::with_capacity(shell_args.len() + 1);
     argv.push(CString::new(shell_path.clone())?);
-    argv.push(CString::new("-i")?);
+    for arg in shell_args {
+        argv.push(CString::new(arg)?);
+    }
 
     let (master_fd, child_pid) = spawn_shell_with_pty(
         capability_id,

@@ -1,5 +1,6 @@
 pub mod client;
 pub mod tokens;
+pub mod transport;
 
 use crate::config::parser::RelayConfig;
 use serde::{Deserialize, Serialize};

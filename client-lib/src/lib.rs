@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod enrollment;
 pub mod grpc_client;
 mod relay;
+mod transport;
 pub mod storage;
 
 pub mod proto {

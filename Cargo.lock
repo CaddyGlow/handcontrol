@@ -1240,6 +1240,7 @@ name = "handcontrol-client-lib"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "directories",
  "futures-util",

@@ -147,10 +147,18 @@ impl RemoteControlService {
                     relay_ttl_secs = ttl.as_secs(),
                     "Issued relay token"
                 );
+                let mut transports = vec!["websocket".to_string()];
+                if config.relay.quic_port.is_some() {
+                    transports.push("quic".to_string());
+                }
+
                 Some(super::proto::RelayInfo {
                     relay_url: relay_url.clone(),
                     relay_token: token,
                     relay_required: false,
+                    quic_port: config.relay.quic_port.map(|port| port as u32),
+                    quic_preferred: Some(config.relay.quic_preferred),
+                    transports,
                 })
             }
             Err(e) => {
@@ -528,6 +536,17 @@ impl RemoteControl for RemoteControlService {
                 relay_required: info.relay_required,
                 allow_self_signed_tls: config.relay.allow_self_signed_tls,
                 pinned_cert_sha256: config.relay.pinned_cert_sha256.clone(),
+                quic_port: config.relay.quic_port,
+                quic_preferred: if config.relay.quic_preferred {
+                    Some(true)
+                } else {
+                    None
+                },
+                transports: if config.relay.quic_port.is_some() {
+                    vec!["websocket".to_string(), "quic".to_string()]
+                } else {
+                    vec!["websocket".to_string()]
+                },
             });
 
         let payload = crate::utils::qr::EnrollmentQrPayload::new(

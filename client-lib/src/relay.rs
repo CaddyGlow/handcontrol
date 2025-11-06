@@ -73,6 +73,17 @@ pub async fn establish_relay_tunnel(
     let connect_json = serde_json::to_string(&connect_payload)
         .context("Failed to serialize relay connect message")?;
     let connect_url_str = connect_url.as_str().to_owned();
+    let host = connect_url
+        .host_str()
+        .ok_or_else(|| anyhow!("Relay URL is missing a host component"))?
+        .to_string();
+    let ws_port = connect_url.port_or_known_default().unwrap_or(
+        if matches!(connect_url.scheme(), "https" | "wss") {
+            443
+        } else {
+            80
+        },
+    );
 
     #[derive(Clone, Copy)]
     enum TransportKind {
@@ -89,11 +100,62 @@ pub async fn establish_relay_tunnel(
         }
     }
 
-    let attempt_order: Vec<TransportKind> = match transport_pref {
-        TransportPreference::Auto => vec![TransportKind::Quic, TransportKind::Websocket],
-        TransportPreference::Websocket => vec![TransportKind::Websocket],
-        TransportPreference::Quic => vec![TransportKind::Quic, TransportKind::Websocket],
-    };
+    let mut advertised_transports = relay.transports.clone();
+    if advertised_transports.is_empty() {
+        advertised_transports.push("websocket".to_string());
+    }
+
+    let supports_websocket = advertised_transports
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case("websocket"));
+    let quic_port = relay.quic_port;
+    let supports_quic = quic_port.is_some()
+        && advertised_transports
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case("quic"));
+    let quic_preferred = relay.quic_preferred.unwrap_or(false);
+
+    let mut attempt_order: Vec<TransportKind> = Vec::new();
+    match transport_pref {
+        TransportPreference::Auto => {
+            if supports_quic && quic_preferred {
+                attempt_order.push(TransportKind::Quic);
+                if supports_websocket {
+                    attempt_order.push(TransportKind::Websocket);
+                }
+            } else {
+                if supports_websocket {
+                    attempt_order.push(TransportKind::Websocket);
+                }
+                if supports_quic {
+                    attempt_order.push(TransportKind::Quic);
+                }
+            }
+        }
+        TransportPreference::Websocket => {
+            if supports_websocket {
+                attempt_order.push(TransportKind::Websocket);
+            }
+            if supports_quic {
+                attempt_order.push(TransportKind::Quic);
+            }
+        }
+        TransportPreference::Quic => {
+            if supports_quic {
+                attempt_order.push(TransportKind::Quic);
+            }
+            if supports_websocket {
+                attempt_order.push(TransportKind::Websocket);
+            }
+        }
+    }
+
+    if attempt_order.is_empty() {
+        bail!(
+            "Relay does not advertise any usable transports (advertised: {:?})",
+            advertised_transports
+        );
+    }
 
     let mut errors: Vec<String> = Vec::new();
 
@@ -105,6 +167,13 @@ pub async fn establish_relay_tunnel(
 
         let control_params = ControlConnectParams {
             url: connect_url_str.clone(),
+            host: host.clone(),
+            port: match kind {
+                TransportKind::Websocket => ws_port,
+                TransportKind::Quic => {
+                    quic_port.expect("quic_port must be present when attempting QUIC transport")
+                }
+            },
             subprotocol: match kind {
                 TransportKind::Websocket => Some(RELAY_PROTOCOL.to_string()),
                 TransportKind::Quic => None,

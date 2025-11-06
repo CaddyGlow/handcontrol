@@ -25,6 +25,12 @@ pub struct RelayQrInfo {
     pub allow_self_signed_tls: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_cert_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quic_preferred: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<String>,
 }
 
 impl EnrollmentQrPayload {
@@ -119,6 +125,15 @@ impl EnrollmentQrPayload {
             );
             if let Some(fingerprint) = &relay.pinned_cert_sha256 {
                 println!("Relay Pinned Cert SHA256: {}", fingerprint);
+            }
+            if let Some(port) = relay.quic_port {
+                println!("Relay QUIC Port: {}", port);
+            }
+            if let Some(preferred) = relay.quic_preferred {
+                println!("Relay QUIC Preferred: {}", preferred);
+            }
+            if !relay.transports.is_empty() {
+                println!("Relay Transports: {}", relay.transports.join(", "));
             }
         }
         println!("Valid Until: {}", self.valid_until);
@@ -220,6 +235,9 @@ mod tests {
             pinned_cert_sha256: Some(
                 "08503D93CEA2108035CAE5FA0BAC837B5401FCB743D4C5E5AD0CB4A800D8A044".to_string(),
             ),
+            quic_port: Some(8443),
+            quic_preferred: Some(true),
+            transports: vec!["websocket".to_string(), "quic".to_string()],
         };
 
         let payload = EnrollmentQrPayload::new(

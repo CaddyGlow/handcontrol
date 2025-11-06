@@ -20,6 +20,8 @@ pub struct TlsOptions {
 #[derive(Clone, Debug)]
 pub struct ControlConnectParams {
     pub url: String,
+    pub host: String,
+    pub port: u16,
     pub subprotocol: Option<String>,
     pub tls: TlsOptions,
     pub fallback_on_subprotocol_error: bool,

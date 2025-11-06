@@ -112,6 +112,12 @@ struct RawQrRelayInfo {
     allow_self_signed_tls: bool,
     #[serde(default)]
     pinned_cert_sha256: Option<String>,
+    #[serde(default)]
+    quic_port: Option<u16>,
+    #[serde(default)]
+    quic_preferred: Option<bool>,
+    #[serde(default)]
+    transports: Vec<String>,
 }
 
 fn relay_from_qr(info: &RawQrRelayInfo) -> RegistryRelayInfo {
@@ -121,6 +127,9 @@ fn relay_from_qr(info: &RawQrRelayInfo) -> RegistryRelayInfo {
         relay_required: info.relay_required,
         allow_self_signed_tls: info.allow_self_signed_tls,
         pinned_cert_sha256: info.pinned_cert_sha256.clone(),
+        transports: info.transports.clone(),
+        quic_port: info.quic_port,
+        quic_preferred: info.quic_preferred,
     }
 }
 
@@ -131,6 +140,9 @@ fn relay_from_proto(info: &crate::proto::RelayInfo) -> RegistryRelayInfo {
         relay_required: info.relay_required,
         allow_self_signed_tls: false,
         pinned_cert_sha256: None,
+        transports: info.transports.clone(),
+        quic_port: info.quic_port.map(|p| p as u16),
+        quic_preferred: info.quic_preferred,
     }
 }
 

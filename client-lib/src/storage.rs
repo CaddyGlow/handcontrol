@@ -112,6 +112,12 @@ pub struct RegistryRelayInfo {
     pub allow_self_signed_tls: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_cert_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quic_preferred: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

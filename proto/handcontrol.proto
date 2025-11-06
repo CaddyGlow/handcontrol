@@ -136,6 +136,9 @@ message RelayInfo {
   string relay_url = 1;           // Relay server URL
   string relay_token = 2;          // JWT token for relay authentication
   bool relay_required = 3;        // If true, skip direct connection attempts
+  optional uint32 quic_port = 4;  // Dedicated QUIC port (UDP), if available
+  optional bool quic_preferred = 5; // Hint that clients should try QUIC first
+  repeated string transports = 6; // Advertised transport identifiers (e.g. ["websocket","quic"])
 }
 
 // Server info

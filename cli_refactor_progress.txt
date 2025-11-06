@@ -1,22 +1,18 @@
-Capability session refactor progress
-====================================
+Capability session + QUIC transport integration progress
+========================================================
 
 Server
 ------
-- Added capability registry/session manager and removed legacy shell command modules.
-- gRPC now exposes ListCapabilities/OpenSession and bridges capability streams to clients.
-- Config defaults/validation/watchers converted to typed capability schema.
-- Interactive shell capability uses a PTY backend on Unix for proper terminal behaviour.
+- Added transport abstraction for relay control/tunnel flows with WebSocket adapter, preparing for QUIC implementation.
+- gRPC relay tests still require privileged sockets; relay QUIC endpoint implementation pending.
 
 Client
 ------
-- Client lib maps ListCapabilities/OpenSession and exposes compatibility metadata.
-- Client lib now returns reusable capability session handles for realtime streaming (input/output/resize).
-- CLI bridges realtime shell capabilities with raw terminal input/output over OpenSession.
-- CLI/TUI guard against unsupported capability kinds/session modes.
-- Android app now consumes ListCapabilities/OpenSession and filters out unsupported capability kinds/session modes.
+- Client lib owns transport trait with WebSocket implementation and QUIC scaffold; relay tunnel handshake now negotiates per transport preference.
+- Config exposes `network.relay.transport` setting plus CLI `--transport` override (`HANDCONTROL_CLIENT_TRANSPORT` env) for runtime selection.
+- Enrollment and CLI workflows honour transport preference and fall back gracefully when QUIC is unavailable.
 
 Testing
 -------
-- `cargo test` (relay integration requires privileged sockets; expected permission errors).
-- `cargo run --bin=handcontrol-cli -- --help` (OK).
+- `cargo check`
+- `cargo test` (relay integration still fails under sandboxed sockets; expected permission errors).

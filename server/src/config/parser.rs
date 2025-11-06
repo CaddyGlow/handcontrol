@@ -121,6 +121,12 @@ pub struct RelayConfig {
     /// WebSocket subprotocol advertised when connecting to the relay
     #[serde(default = "default_relay_subprotocol")]
     pub websocket_subprotocol: String,
+    /// Optional QUIC listener port (UDP). When set, clients may attempt QUIC connections.
+    #[serde(default)]
+    pub quic_port: Option<u16>,
+    /// Hint indicating whether clients should prefer QUIC when available.
+    #[serde(default)]
+    pub quic_preferred: bool,
 }
 
 impl Default for RelayConfig {
@@ -138,6 +144,8 @@ impl Default for RelayConfig {
             pinned_cert_sha256: None,
             debug_mode: false,
             websocket_subprotocol: default_relay_subprotocol(),
+            quic_port: None,
+            quic_preferred: false,
         }
     }
 }

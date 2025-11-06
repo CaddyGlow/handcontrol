@@ -11,8 +11,12 @@ pub struct QuicTransport;
 
 #[async_trait]
 impl RelayTransport for QuicTransport {
-    async fn connect_control(&self, _params: ControlConnectParams) -> Result<ControlSession> {
-        bail!("QUIC transport not implemented yet");
+    async fn connect_control(&self, params: ControlConnectParams) -> Result<ControlSession> {
+        bail!(
+            "QUIC transport not implemented yet (attempted {}:{})",
+            params.host,
+            params.port
+        );
     }
 
     async fn attach_tunnel(

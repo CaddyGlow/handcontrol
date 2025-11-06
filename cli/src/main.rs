@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{generate, Shell};
 use handcontrol_client_lib::{
     config::{self, ClientConfig, DeviceConfig},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
@@ -13,7 +14,7 @@ use handcontrol_client_lib::{
 };
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::IsTerminal;
 use std::io::{self, Read, Write};
@@ -60,6 +61,8 @@ enum Command {
     Sessions(SessionsCommand),
     /// Resume an existing interactive session
     Resume(ResumeCommand),
+    /// Generate shell completion scripts
+    Completions(CompletionCommand),
     /// Remove stored enrollment for a server
     Remove(RemoveCommand),
     /// Manage client configuration
@@ -161,6 +164,55 @@ struct ResumeCommand {
     session_id: String,
 }
 
+#[derive(Parser)]
+struct CompletionCommand {
+    #[command(subcommand)]
+    command: CompletionSubcommand,
+}
+
+#[derive(Subcommand)]
+enum CompletionSubcommand {
+    /// Generate shell completion scripts
+    Generate(GenerateCompletionCommand),
+    /// Internal helpers for dynamic shell completions
+    #[command(hide = true)]
+    Dynamic(DynamicCompletionCommand),
+}
+
+#[derive(Parser)]
+struct GenerateCompletionCommand {
+    /// Target shell to generate completions for
+    #[arg(value_enum)]
+    shell: Shell,
+    /// Write the generated script to a file instead of stdout
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
+}
+
+#[derive(Parser)]
+struct DynamicCompletionCommand {
+    #[command(subcommand)]
+    target: DynamicCompletionTarget,
+}
+
+#[derive(Subcommand)]
+enum DynamicCompletionTarget {
+    /// Suggest enrolled server identifiers
+    Servers {
+        /// Optional prefix to filter results
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+    /// Suggest resumable session identifiers for a server
+    Sessions {
+        /// Server identifier (UUID, hostname, or alias)
+        server: String,
+        /// Optional prefix to filter results
+        #[arg(value_name = "PREFIX")]
+        prefix: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Show the current configuration
@@ -247,6 +299,7 @@ async fn main() -> Result<()> {
         Command::Exec(cmd) => run_exec_command(cmd).await,
         Command::Sessions(cmd) => run_sessions(cmd).await,
         Command::Resume(cmd) => run_resume(cmd).await,
+        Command::Completions(cmd) => run_completions(cmd).await,
         Command::Remove(cmd) => run_remove(cmd),
         Command::Config { command } => run_config(command),
         Command::Enroll { command } => run_enroll(command).await,
@@ -885,16 +938,53 @@ async fn run_resume(cmd: ResumeCommand) -> Result<()> {
     let entry = find_enrolled_server(&cmd.server, &registry)?.clone();
 
     let sessions = fetch_sessions(&entry).await?;
-    let info = sessions
-        .into_iter()
-        .find(|s| s.session_id.eq_ignore_ascii_case(&cmd.session_id))
-        .ok_or_else(|| {
-            anyhow!(
+    let mut info_matches: Vec<ServerSessionInfo> = Vec::new();
+    let normalized = cmd.session_id.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+
+    for session in sessions {
+        if session.session_id.eq_ignore_ascii_case(&cmd.session_id) {
+            info_matches.clear();
+            info_matches.push(session);
+            break;
+        }
+
+        if normalized.is_empty() {
+            continue;
+        }
+
+        let canonical = session.session_id.to_ascii_lowercase();
+        let simple: String = canonical.chars().filter(|c| *c != '-').collect();
+        if canonical.starts_with(&normalized)
+            || (!compact.is_empty() && simple.starts_with(&compact))
+        {
+            info_matches.push(session);
+        }
+    }
+
+    let info = match info_matches.len() {
+        0 => {
+            bail!(
                 "Session '{}' not found on server {}",
                 cmd.session_id,
                 entry.id
             )
-        })?;
+        }
+        1 => info_matches.pop().unwrap(),
+        _ => {
+            let candidates = info_matches
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Session identifier '{}' is ambiguous on server {}; matches: {}",
+                cmd.session_id,
+                entry.id,
+                candidates
+            );
+        }
+    };
 
     if info.session_mode != CommandSessionMode::Realtime {
         bail!(
@@ -921,6 +1011,68 @@ async fn run_resume(cmd: ResumeCommand) -> Result<()> {
     };
 
     run_interactive_shell(&entry, &cmd.server, &session_label, session, true).await
+}
+
+async fn run_completions(cmd: CompletionCommand) -> Result<()> {
+    match cmd.command {
+        CompletionSubcommand::Generate(args) => generate_completion_script(args),
+        CompletionSubcommand::Dynamic(cmd) => run_dynamic_completion(cmd).await,
+    }
+}
+
+fn generate_completion_script(args: GenerateCompletionCommand) -> Result<()> {
+    let GenerateCompletionCommand { shell, output } = args;
+    let mut command = Cli::command();
+    let bin_name = command.get_name().to_string();
+
+    let mut buffer: Vec<u8> = Vec::new();
+    generate(shell, &mut command, bin_name.as_str(), &mut buffer);
+    let mut script =
+        String::from_utf8(buffer).context("Generated completion script was not UTF-8")?;
+
+    match shell {
+        Shell::Bash => enhance_bash_completion(&mut script),
+        Shell::Zsh => enhance_zsh_completion(&mut script),
+        Shell::Fish => enhance_fish_completion(&mut script),
+        _ => {}
+    }
+
+    if let Some(path) = output {
+        let mut file = fs::File::create(&path)
+            .with_context(|| format!("Failed to create completion file {}", path.display()))?;
+        file.write_all(script.as_bytes())
+            .with_context(|| format!("Failed to write completion file {}", path.display()))?;
+    } else {
+        let stdout = io::stdout();
+        let mut handle = stdout.lock();
+        handle.write_all(script.as_bytes())?;
+        handle.flush()?;
+    }
+
+    Ok(())
+}
+
+async fn run_dynamic_completion(cmd: DynamicCompletionCommand) -> Result<()> {
+    match cmd.target {
+        DynamicCompletionTarget::Servers { prefix } => {
+            let registry = ServerRegistry::load()?;
+            let prefix = prefix.unwrap_or_default();
+            for candidate in collect_server_candidates(&prefix, &registry) {
+                println!("{candidate}");
+            }
+            Ok(())
+        }
+        DynamicCompletionTarget::Sessions { server, prefix } => {
+            let registry = ServerRegistry::load()?;
+            let entry = find_enrolled_server(&server, &registry)?.clone();
+            let sessions = fetch_sessions(&entry).await?;
+            let prefix = prefix.unwrap_or_default();
+            for candidate in collect_session_candidates(&sessions, &prefix) {
+                println!("{candidate}");
+            }
+            Ok(())
+        }
+    }
 }
 
 fn print_sessions_table(sessions: &[ServerSessionInfo]) {
@@ -1393,31 +1545,89 @@ fn resolve_server_targets(
         }
     } else {
         let discovered = discover_servers(&cfg.discovery)?;
-        let query = server.to_lowercase();
+        let query = server.to_ascii_lowercase();
+        let compact_query: String = query.chars().filter(|c| *c != '-').collect();
+
+        let mut host_matches: Vec<DiscoveredServer> = Vec::new();
+        let mut id_matches: Vec<DiscoveredServer> = Vec::new();
+
         for entry in discovered {
-            let mut matched = false;
-            if let Some(id) = entry.server_id {
-                if id.to_string().eq_ignore_ascii_case(&query) || id.to_string() == server {
-                    matched = true;
-                    server_id_hint = Some(id);
-                }
-            }
-            if !matched
-                && (entry.instance_name.eq_ignore_ascii_case(&server)
-                    || entry.hostname.eq_ignore_ascii_case(&server))
+            if entry.instance_name.eq_ignore_ascii_case(server)
+                || entry.hostname.eq_ignore_ascii_case(server)
             {
-                matched = true;
                 if server_id_hint.is_none() {
                     server_id_hint = entry.server_id;
                 }
+                host_matches.push(entry);
+                continue;
             }
-            if matched {
-                addresses.extend(entry.addresses.clone());
-                if resolved_port.is_none() {
-                    resolved_port = Some(entry.port);
+
+            if let Some(id) = entry.server_id {
+                let canonical_lower = id.to_string().to_ascii_lowercase();
+                let simple_lower = id.simple().to_string().to_ascii_lowercase();
+                if canonical_lower == query
+                    || canonical_lower.starts_with(&query)
+                    || (!compact_query.is_empty() && simple_lower.starts_with(&compact_query))
+                {
+                    if server_id_hint.is_none() {
+                        server_id_hint = Some(id);
+                    }
+                    id_matches.push(entry);
                 }
             }
         }
+
+        let mut matches = if !host_matches.is_empty() {
+            host_matches
+        } else {
+            id_matches
+        };
+
+        if matches.is_empty() {
+            bail!(
+                "Unable to resolve server '{server}'. Run 'handcontrol-cli discover' or supply --address"
+            );
+        }
+
+        if matches.len() > 1 {
+            let descriptions = matches
+                .iter()
+                .map(|entry| {
+                    entry
+                        .server_id
+                        .map(|id| id.to_string())
+                        .or_else(|| {
+                            if !entry.instance_name.is_empty() {
+                                Some(entry.instance_name.clone())
+                            } else if !entry.hostname.is_empty() {
+                                Some(entry.hostname.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "<unknown>".to_string())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "Server identifier '{}' is ambiguous; matches: {}",
+                server,
+                descriptions
+            );
+        }
+
+        let entry = matches.pop().unwrap();
+        let entry_port = entry.port;
+        let entry_server_id = entry.server_id;
+        let entry_addresses = entry.addresses;
+
+        if resolved_port.is_none() {
+            resolved_port = Some(entry_port);
+        }
+        if server_id_hint.is_none() {
+            server_id_hint = entry_server_id;
+        }
+        addresses.extend(entry_addresses);
     }
 
     addresses.sort();
@@ -1615,11 +1825,273 @@ fn find_enrolled_server<'a>(
         }
     }
 
+    let normalized = identifier.to_ascii_lowercase();
+    if !normalized.is_empty() {
+        let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+        let matches: Vec<&ServerRegistryEntry> = registry
+            .iter()
+            .filter(|entry| {
+                let canonical = entry.id.to_string().to_ascii_lowercase();
+                let simple = entry.id.simple().to_string().to_ascii_lowercase();
+                canonical.starts_with(&normalized)
+                    || (!compact.is_empty() && simple.starts_with(&compact))
+            })
+            .collect();
+
+        match matches.len() {
+            0 => {}
+            1 => return Ok(matches[0]),
+            _ => {
+                let candidates = matches
+                    .iter()
+                    .map(|entry| entry.id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!(
+                    "Server identifier '{}' is ambiguous. Matching IDs: {}",
+                    identifier,
+                    candidates
+                );
+            }
+        }
+    }
+
     bail!(
         "Server '{}' is not enrolled. Run 'handcontrol-cli enroll' to register it first.",
         identifier
     );
 }
+
+fn collect_server_candidates(prefix: &str, registry: &ServerRegistry) -> Vec<String> {
+    let normalized = prefix.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+    let mut candidates: HashSet<String> = HashSet::new();
+
+    for entry in registry.iter() {
+        let id_str = entry.id.to_string();
+        let id_lower = id_str.to_ascii_lowercase();
+        let simple_lower = entry.id.simple().to_string().to_ascii_lowercase();
+        let id_matches = normalized.is_empty()
+            || id_lower.starts_with(&normalized)
+            || (!compact.is_empty() && simple_lower.starts_with(&compact));
+        if id_matches {
+            candidates.insert(id_str);
+        }
+
+        if let Some(host) = &entry.hostname {
+            if normalized.is_empty() || host.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(host.clone());
+            }
+        }
+
+        if let Some(ip) = &entry.ip {
+            if normalized.is_empty() || ip.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(ip.clone());
+            }
+        }
+
+        for address in &entry.addresses {
+            if normalized.is_empty() || address.to_ascii_lowercase().starts_with(&normalized) {
+                candidates.insert(address.clone());
+            }
+        }
+    }
+
+    let mut results: Vec<String> = candidates.into_iter().collect();
+    results.sort();
+    results
+}
+
+fn collect_session_candidates(sessions: &[ServerSessionInfo], prefix: &str) -> Vec<String> {
+    let normalized = prefix.to_ascii_lowercase();
+    let compact: String = normalized.chars().filter(|c| *c != '-').collect();
+    let mut results: Vec<String> = sessions
+        .iter()
+        .filter_map(|session| {
+            let id_lower = session.session_id.to_ascii_lowercase();
+            let simple_lower: String = id_lower.chars().filter(|c| *c != '-').collect();
+            if normalized.is_empty()
+                || id_lower.starts_with(&normalized)
+                || (!compact.is_empty() && simple_lower.starts_with(&compact))
+            {
+                Some(session.session_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    results.sort();
+    results.dedup();
+    results
+}
+
+fn enhance_bash_completion(script: &mut String) {
+    if let Some(idx) = script.find("\n# HandControl dynamic completion helpers") {
+        script.truncate(idx);
+    }
+
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+
+    script.push_str(
+        r#"
+# HandControl dynamic completion helpers
+__handcontrol_cli_collect_servers() {
+    local prefix="${1-}"
+    HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic servers "${prefix}"
+}
+
+__handcontrol_cli_collect_sessions() {
+    local server="$1"
+    local prefix="${2-}"
+    if [[ -z "$server" ]]; then
+        return
+    fi
+    HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic sessions "${server}" "${prefix}"
+}
+
+__handcontrol_cli_complete_dynamic() {
+    local cur prev
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev=""
+    if (( COMP_CWORD > 0 )); then
+        prev="${COMP_WORDS[COMP_CWORD-1]}"
+    fi
+
+    if [[ "$cur" == -* || "$prev" == -* ]]; then
+        _handcontrol-cli
+        return
+    fi
+
+    local primary=""
+    local secondary=""
+    local server_arg=""
+    local positional_after_primary=0
+    for ((i=1; i<COMP_CWORD; ++i)); do
+        local word="${COMP_WORDS[i]}"
+        if [[ "$word" == -* ]]; then
+            continue
+        fi
+        if [[ -z "$primary" ]]; then
+            primary="$word"
+            continue
+        fi
+        if [[ "$primary" == "enroll" && -z "$secondary" ]]; then
+            secondary="$word"
+            continue
+        fi
+        if [[ -z "$server_arg" ]]; then
+            server_arg="$word"
+            positional_after_primary=1
+            continue
+        fi
+        positional_after_primary=2
+        break
+    done
+
+    case "$primary" in
+        info|list|exec|sessions|remove)
+            if [[ -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+        resume)
+            if [[ -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            elif (( positional_after_primary == 1 )); then
+                local server="$server_arg"
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_sessions "$server" "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+        enroll)
+            if [[ "$secondary" == "approve" && -z "$server_arg" ]]; then
+                local suggestions
+                suggestions=$(__handcontrol_cli_collect_servers "$cur" 2>/dev/null)
+                if [[ -n "$suggestions" ]]; then
+                    COMPREPLY=($(compgen -W "$suggestions" -- "$cur"))
+                    return
+                fi
+            fi
+            ;;
+    esac
+
+    _handcontrol-cli
+}
+complete -F __handcontrol_cli_complete_dynamic -o nosort -o bashdefault -o default handcontrol-cli
+"#,
+    );
+}
+
+fn enhance_zsh_completion(script: &mut String) {
+    if let Some(idx) = script.find("\n_handcontrol_cli_servers()") {
+        script.truncate(idx);
+    }
+
+    if !script.ends_with('\n') {
+        script.push('\n');
+    }
+
+    let server_patterns = [
+        ":server -- Server identifier (UUID, instance name, or hostname):_default",
+        ":server -- Server identifier (UUID, hostname, or alias):_default",
+    ];
+
+    for pattern in server_patterns {
+        if script.contains(pattern) {
+            let replacement = pattern.replace("_default", "_handcontrol_cli_servers");
+            *script = script.replace(pattern, &replacement);
+        }
+    }
+
+    let session_pattern = ":session-id -- Session identifier (UUID):_default";
+    if script.contains(session_pattern) {
+        *script = script.replace(
+            session_pattern,
+            ":session-id -- Session identifier (UUID):_handcontrol_cli_sessions",
+        );
+    }
+
+    script.push_str(
+        r#"
+_handcontrol_cli_servers() {
+    local -a suggestions
+    local prefix="$words[CURRENT]"
+    suggestions=(${(f)"$(HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic servers \"$prefix\" 2>/dev/null)"})
+    compadd -Q -- "${suggestions[@]}"
+}
+
+_handcontrol_cli_sessions() {
+    local server="$words[3]"
+    local prefix="$words[CURRENT]"
+    if [[ -z "$server" ]]; then
+        return
+    fi
+    local -a suggestions
+    suggestions=(${(f)"$(HANDCONTROL_CLI_SUPPRESS_COMPLETION=1 handcontrol-cli completions dynamic sessions \"$server\" \"$prefix\" 2>/dev/null)"})
+    compadd -Q -- "${suggestions[@]}"
+}
+"#,
+    );
+}
+
+fn enhance_fish_completion(_script: &mut String) {}
 
 fn set_config_value(cfg: &mut ClientConfig, key: &str, value: &str) -> Result<()> {
     let parts: Vec<&str> = key.split('.').collect();

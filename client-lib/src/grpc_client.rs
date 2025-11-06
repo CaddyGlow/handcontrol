@@ -122,6 +122,12 @@ async fn connect_channel(
         let server_name = server_name.clone();
         let tls_connector = tls_connector.clone();
         async move {
+            debug!(
+                target: "handcontrol_client_lib::grpc_client",
+                host = %address,
+                "connecting to server"
+            );
+
             let tcp = timeout(
                 Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS),
                 TcpStream::connect(address),
@@ -129,12 +135,22 @@ async fn connect_channel(
             .await
             .map_err(|_| anyhow!("TCP connect timed out"))??;
 
-            let tls_stream = timeout(
-                Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS),
-                tls_connector.connect(server_name.clone(), tcp),
-            )
-            .await
-            .map_err(|_| anyhow!("TLS handshake timed out"))??;
+            debug!(
+                target: "handcontrol_client_lib::grpc_client",
+                server = ?server_name,
+                "starting TLS handshake"
+            );
+
+            let tls_future = tls_connector.connect(server_name.clone(), tcp);
+            let tls_stream = timeout(Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS), tls_future)
+                .await
+                .map_err(|_| anyhow!("TLS handshake timed out"))??;
+
+            debug!(
+                target: "handcontrol_client_lib::grpc_client",
+                server = ?server_name,
+                "TLS handshake completed"
+            );
 
             Ok::<_, anyhow::Error>(TokioIo::new(tls_stream))
         }
@@ -155,6 +171,8 @@ async fn connect_channel(
     })
 }
 
+const DEFAULT_SNI_HOSTNAME: &str = "handcontrol.local";
+
 async fn connect_channel_with_stream(
     stream_holder: Arc<AsyncMutex<Option<DuplexStream>>>,
     endpoint_uri: String,
@@ -169,9 +187,23 @@ async fn connect_channel_with_stream(
         .connect_timeout(Duration::from_secs(DEFAULT_CONNECT_TIMEOUT_SECONDS));
 
     let tls_connector = TlsConnector::from(tls_config);
+
+    let mut tls_server_name = server_name.clone();
+    if let ServerName::IpAddress(ref ip) = server_name {
+        let override_name = ServerName::try_from(DEFAULT_SNI_HOSTNAME)
+            .map_err(|_| anyhow!("Invalid default SNI hostname '{}'", DEFAULT_SNI_HOSTNAME))?
+            .to_owned();
+        tracing::debug!(
+            target: "handcontrol_client_lib::grpc_client",
+            original = ?ip,
+            override_host = DEFAULT_SNI_HOSTNAME,
+            "Overriding relay TLS server name to satisfy SNI requirements"
+        );
+        tls_server_name = override_name;
+    }
     let connector = service_fn(move |_: Uri| {
         let tls_connector = tls_connector.clone();
-        let server_name = server_name.clone();
+        let server_name = tls_server_name.clone();
         let stream_holder = stream_holder.clone();
         async move {
             let mut guard = stream_holder.lock().await;
@@ -180,12 +212,20 @@ async fn connect_channel_with_stream(
                 .ok_or_else(|| anyhow!("Relay stream already consumed"))?;
             drop(guard);
 
-            let tls_stream = timeout(
-                Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS),
-                tls_connector.connect(server_name.clone(), stream),
-            )
-            .await
-            .map_err(|_| anyhow!("TLS handshake timed out"))??;
+            debug!(
+                target: "handcontrol_client_lib::grpc_client",
+                "Starting TLS handshake over relay tunnel"
+            );
+
+            let tls_future = tls_connector.connect(server_name.clone(), stream);
+            let tls_stream = timeout(Duration::from_secs(HANDSHAKE_TIMEOUT_SECONDS), tls_future)
+                .await
+                .map_err(|_| anyhow!("TLS handshake timed out"))??;
+
+            debug!(
+                target: "handcontrol_client_lib::grpc_client",
+                "TLS handshake over relay tunnel completed"
+            );
 
             Ok::<_, anyhow::Error>(TokioIo::new(tls_stream))
         }
@@ -682,6 +722,12 @@ async fn connect_via_relay(
     let (authority_host, override_port) =
         derive_relay_authority(entry, tunnel.server_authority.as_deref());
     let port = override_port.unwrap_or(default_port);
+    debug!(
+        target: "handcontrol_client_lib::grpc_client",
+        host = %authority_host,
+        port,
+        "Establishing gRPC tunnel via relay"
+    );
     let (endpoint_uri, server_name) =
         build_uri_and_server_name(&authority_host, port).context("Invalid relay authority")?;
 

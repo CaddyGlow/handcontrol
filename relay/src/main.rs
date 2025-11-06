@@ -4,10 +4,15 @@ use crate::config::{RelayConfig, default_config_path, load_config};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Router,
+    body::Body,
     extract::{
         Path, Query, State,
+        connect_info::ConnectInfo,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
+    http::{Request, Version, header},
+    middleware,
+    middleware::Next,
     response::IntoResponse,
     routing::get,
 };
@@ -21,6 +26,7 @@ use handcontrol_relay::tunnel::state::TunnelState;
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
 use quinn::{Endpoint, ReadExactError};
 use rand::RngCore;
+use rustls::crypto;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -53,6 +59,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
     tracing_subscriber::fmt::init();
 
@@ -97,7 +104,11 @@ async fn main() -> Result<()> {
         (None, None) => {
             info!("Starting relay without TLS on {}", state.listen_addr);
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app.into_make_service()).await?;
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await?;
         }
         _ => {
             anyhow::bail!(
@@ -114,7 +125,71 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/register", get(register_handler))
         .route("/connect", get(connect_handler))
         .route("/tunnel/:tunnel_id", get(tunnel_handler))
+        .layer(middleware::from_fn(trace_http_requests))
         .with_state(state)
+}
+
+async fn trace_http_requests(req: Request<Body>, next: Next) -> impl IntoResponse {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let version = req.version();
+    let headers = req.headers();
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_owned())
+        .unwrap_or_else(|| "-".to_string());
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_owned())
+        .unwrap_or_else(|| "-".to_string());
+    let scheme = uri
+        .scheme_str()
+        .map(|value| value.to_owned())
+        .or_else(|| {
+            headers
+                .get("x-forwarded-proto")
+                .and_then(|value| value.to_str().ok().map(|value| value.to_owned()))
+        })
+        .unwrap_or_else(|| "-".to_string());
+
+    let remote_addr = req
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let path = uri.path().to_string();
+    let query = uri.query().unwrap_or("");
+    let protocol = http_version_label(version);
+
+    trace!(
+        target: "handcontrol_relay::http",
+        remote_addr = %remote_addr,
+        host = %host,
+        user_agent = %user_agent,
+        method = %method,
+        path = %path,
+        query = query,
+        scheme = %scheme,
+        protocol = protocol,
+        "Incoming HTTP request"
+    );
+
+    next.run(req).await
+}
+
+fn http_version_label(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2",
+        Version::HTTP_3 => "HTTP/3",
+        _ => "HTTP/UNKNOWN",
+    }
 }
 
 async fn serve_with_tls(
@@ -148,16 +223,21 @@ async fn serve_with_tls(
         .context("No private key found")?;
 
     // Configure TLS
-    let server_config = rustls::ServerConfig::builder()
+    let mut server_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("Failed to build TLS config")?;
+    server_config.alpn_protocols = vec![
+        b"h2".to_vec(),
+        b"http/1.1".to_vec(),
+        RELAY_SUBPROTOCOL.as_bytes().to_vec(),
+    ];
 
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
 
     // Serve with TLS using axum-server
     axum_server::bind_rustls(addr, tls_config)
-        .serve(app.into_make_service())
+        .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .context("TLS server failed")
 }
@@ -404,9 +484,13 @@ async fn handle_quic_register(
                         let _ = quic_write_frame(&mut *guard, QuicFrameType::Pong, payload.as_slice()).await;
                         trace!("Control channel ping handled for server {}", server_id);
                     }
-                    Ok(Some(QuicFrame::Pong(_))) => {
-                        trace!("Control channel pong received for server {}", server_id);
-                    }
+                Ok(Some(QuicFrame::Pong(payload))) => {
+                    trace!(
+                        "Control channel pong received for server {} ({} bytes)",
+                        server_id,
+                        payload.len()
+                    );
+                }
                     Ok(Some(QuicFrame::Close)) | Ok(None) => break,
                     Ok(Some(QuicFrame::Binary(_))) => {
                         trace!("Ignoring unexpected binary frame on register control channel");
@@ -649,7 +733,13 @@ async fn handle_quic_connect(
             Some(QuicFrame::Ping(payload)) => {
                 quic_write_frame(&mut send, QuicFrameType::Pong, payload.as_slice()).await?;
             }
-            Some(QuicFrame::Pong(_)) => {}
+            Some(QuicFrame::Pong(payload)) => {
+                trace!(
+                    tunnel = %tunnel_id,
+                    size = payload.len(),
+                    "Received QUIC pong frame during handshake"
+                );
+            }
             Some(QuicFrame::Binary(_)) => {
                 warn!("Client sent unexpected binary frame before tunnel_ready");
             }
@@ -2271,7 +2361,7 @@ async fn pipe_quic_stream(
             Some(QuicFrame::Text(_)) => {
                 trace!(
                     tunnel = %tunnel_id,
-                    %direction,
+                    direction = direction,
                     "Ignoring unexpected text frame on QUIC tunnel"
                 );
             }
@@ -2279,10 +2369,11 @@ async fn pipe_quic_stream(
                 let mut guard = source_send.lock().await;
                 quic_write_frame(&mut *guard, QuicFrameType::Pong, payload.as_slice()).await?;
             }
-            Some(QuicFrame::Pong(_)) => {
+            Some(QuicFrame::Pong(payload)) => {
                 trace!(
                     tunnel = %tunnel_id,
-                    %direction,
+                    direction = direction,
+                    size = payload.len(),
                     "Received QUIC pong frame"
                 );
             }
@@ -2290,7 +2381,11 @@ async fn pipe_quic_stream(
         }
     }
 
-    trace!(tunnel = %tunnel_id, %direction, "QUIC stream pipeline finished");
+    trace!(
+        tunnel = %tunnel_id,
+        direction = direction,
+        "QUIC stream pipeline finished"
+    );
     Ok(())
 }
 

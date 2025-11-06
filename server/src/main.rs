@@ -19,6 +19,7 @@ use handcontrol::storage::clients::ClientStore;
 use handcontrol::storage::paths;
 use handcontrol::utils::logging;
 use handcontrol::utils::network::get_all_local_ips;
+use rustls::crypto;
 use std::fs;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::AtomicU64;
@@ -63,6 +64,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = crypto::ring::default_provider().install_default();
     // Parse CLI arguments
     let cli = Cli::parse();
 

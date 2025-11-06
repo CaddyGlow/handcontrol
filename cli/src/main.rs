@@ -12,6 +12,7 @@ use handcontrol_client_lib::{
     CommandSessionMode, CommandStreamEvent, CommandSummary, DiscoveredServer, QrEnrollmentInput,
     ServerSessionInfo,
 };
+use rustls::crypto;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -315,6 +316,7 @@ struct ApproveEnrollCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let _ = crypto::ring::default_provider().install_default();
     if tracing_subscriber::fmt::try_init().is_err() {
         debug!("Tracing subscriber already initialized");
     }

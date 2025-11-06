@@ -37,7 +37,7 @@ use super::{
 };
 
 const FRAME_HEADER_LEN: usize = 5;
-const QUIC_ALPN: &[u8] = b"handctrl-relay.v1";
+const QUIC_ALPN: &[u8] = b"handcontrol-relay.v1";
 const TUNNEL_BUFFER: usize = 16 * 1024;
 
 #[derive(Debug, Default, Clone)]

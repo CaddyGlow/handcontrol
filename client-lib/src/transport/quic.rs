@@ -33,7 +33,7 @@ use super::{
 
 const DUPLEX_BUFFER_SIZE: usize = 64 * 1024;
 const FRAME_HEADER_LEN: usize = 5;
-const QUIC_ALPN: &[u8] = b"handctrl-relay.v1";
+const QUIC_ALPN: &[u8] = b"handcontrol-relay.v1";
 
 #[derive(Debug, Default, Clone)]
 pub struct QuicTransport;

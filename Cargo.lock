@@ -1239,6 +1239,7 @@ dependencies = [
  "clap_complete",
  "crossterm",
  "handcontrol-client-lib",
+ "rustls",
  "serde",
  "serde_json",
  "time",

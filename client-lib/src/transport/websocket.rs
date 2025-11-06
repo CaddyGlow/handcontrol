@@ -9,17 +9,18 @@ use sha2::{Digest, Sha256};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+    connect_async, connect_async_tls_with_config,
     tungstenite::{
-        client::IntoClientRequest, error::ProtocolError, http::HeaderValue, Error as WsError,
-        Message, protocol::frame::Payload,
+        client::IntoClientRequest, error::ProtocolError, http::HeaderValue,
+        protocol::frame::Payload, Error as WsError, Message,
     },
+    Connector, MaybeTlsStream, WebSocketStream,
 };
 use tracing::{debug, trace, warn};
 
 use super::{
-    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport,
-    TunnelAttachParams, TunnelConnection, TlsOptions,
+    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport, TlsOptions,
+    TunnelAttachParams, TunnelConnection,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -33,13 +34,12 @@ pub struct WebSocketTransport;
 #[async_trait]
 impl RelayTransport for WebSocketTransport {
     async fn connect_control(&self, params: ControlConnectParams) -> Result<ControlSession> {
-        let attempts: Vec<Option<String>> = if params.subprotocol.is_some()
-            && params.fallback_on_subprotocol_error
-        {
-            vec![params.subprotocol.clone(), None]
-        } else {
-            vec![params.subprotocol.clone()]
-        };
+        let attempts: Vec<Option<String>> =
+            if params.subprotocol.is_some() && params.fallback_on_subprotocol_error {
+                vec![params.subprotocol.clone(), None]
+            } else {
+                vec![params.subprotocol.clone()]
+            };
         let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in attempts {
@@ -65,7 +65,9 @@ impl RelayTransport for WebSocketTransport {
         }
 
         Err(last_err.unwrap_or_else(|| {
-            anyhow!("Failed to establish relay control connection (subprotocol negotiation exhausted)")
+            anyhow!(
+                "Failed to establish relay control connection (subprotocol negotiation exhausted)"
+            )
         }))
     }
 
@@ -290,11 +292,7 @@ fn is_subprotocol_error(err: &WsError) -> bool {
     )
 }
 
-async fn connect_once(
-    url: &str,
-    subprotocol: Option<&str>,
-    tls: TlsOptions,
-) -> Result<WsStream> {
+async fn connect_once(url: &str, subprotocol: Option<&str>, tls: TlsOptions) -> Result<WsStream> {
     let mut request = url
         .into_client_request()
         .context("Failed to construct relay connect request")?;

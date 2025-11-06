@@ -1,5 +1,6 @@
 use crate::{
     certificates::CertificatePaths,
+    config,
     grpc_client::{
         connect_unauthenticated, connect_unauthenticated_via_relay, connect_unverified,
         persist_fingerprint,
@@ -15,6 +16,7 @@ use std::time::Duration;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::time::{sleep, Instant};
 use tonic::{transport::Channel, Request};
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug)]
@@ -329,6 +331,12 @@ async fn attempt_qr_enrollment_via_relay(
     device_name: &str,
     enrollment_token: &str,
 ) -> Result<(Option<Uuid>, Option<RegistryRelayInfo>)> {
+    let transport_pref = config::load()
+        .map(|cfg| cfg.network.relay.transport)
+        .unwrap_or_else(|err| {
+            warn!("Failed to load client config: {err:#}; defaulting to automatic transport");
+            config::ClientConfig::default().network.relay.transport
+        });
     let client_uuid = Uuid::parse_str(enrollment_token)
         .context("Enrollment token must be a UUID when using relay enrollment")?;
     let mut client = connect_unauthenticated_via_relay(
@@ -339,6 +347,7 @@ async fn attempt_qr_enrollment_via_relay(
         addresses,
         port,
         server_fingerprint,
+        transport_pref,
     )
     .await?;
 

@@ -1,6 +1,6 @@
 use crate::{
     certificates::CertificatePaths,
-    config,
+    config::{self, TransportPreference},
     proto::remote_control_client::RemoteControlClient,
     relay::establish_relay_tunnel,
     storage::{RegistryRelayInfo, ServerRegistryEntry},
@@ -593,6 +593,7 @@ pub async fn connect_registered(
                     &fingerprint,
                     &cert_chain,
                     &key_pem,
+                    relay_prefs.transport,
                 )
                 .await
                 {
@@ -672,8 +673,9 @@ async fn connect_via_relay(
     fingerprint: &str,
     cert_chain: &[CertificateDer<'static>],
     key_pem: &[u8],
+    transport_pref: TransportPreference,
 ) -> Result<HandControlClient> {
-    let tunnel = establish_relay_tunnel(relay_info, entry.id, &client_id)
+    let tunnel = establish_relay_tunnel(relay_info, entry.id, &client_id, transport_pref)
         .await
         .context("Failed to establish relay tunnel")?;
 
@@ -759,8 +761,9 @@ pub async fn connect_unauthenticated_via_relay(
     addresses: &[String],
     default_port: u16,
     expected_fingerprint: &str,
+    transport_pref: TransportPreference,
 ) -> Result<RemoteControlClient<Channel>> {
-    let tunnel = establish_relay_tunnel(relay_info, server_id, &client_uuid)
+    let tunnel = establish_relay_tunnel(relay_info, server_id, &client_uuid, transport_pref)
         .await
         .context("Failed to establish relay tunnel")?;
 

@@ -47,6 +47,7 @@ pub trait TransportSession {
 - Extend `proto/handcontrol.proto` `RelayInfo` message with `repeated string transports`, `uint32 quic_port`, and `bool quic_preferred`. Regenerate bindings in `client-lib` and server to keep the API backwards-compatible (fields are optional).
 - Include the negotiated transport inside the existing `/register` JSON ack (`register_ack`) so the relay control loop can surface fallback reasons without impacting non-QUIC clients.
 - Update `server/src/config/parser.rs` to parse new `[relay.transports]` config, mapping into the runtime struct that powers both WebSocket and QUIC listeners.
+- Introduce a runtime transport selector surfaced through `client-lib` config (`network.relay.transport`) and a CLI override flag (`--transport`) so operators can force WebSocket, QUIC, or auto mode without editing TOML (`cli/src/main.rs`, `client-lib/src/config.rs`).
 
 ### 4.3 QUIC Stack Selection
 - Evaluate Rust libraries: `quinn` (Rust-native, Tokio-friendly) vs `quiche` (C binding). Favor `quinn` for ecosystem fit unless blockers emerge.
@@ -101,6 +102,7 @@ pub trait TransportSession {
 - Create `server/src/relay/transport/quic.rs` leveraging `quinn::Endpoint`. Integrate with the main relay runtime (likely in `server/src/main.rs`) behind a `RelayTransportKind::Quic` enum.
 - Reuse existing JWT token validation by calling into `RelayClient::issue_tunnel_token` prior to admitting a QUIC session.
 - Add integration test `server/tests/relay_quic_transport.rs` that spins up a QUIC endpoint and verifies tunnel data can round-trip to a local TCP echo server.
+- Scaffold client-side QUIC support behind the transport trait so the CLI can gracefully report when QUIC is unavailable (`client-lib/src/transport/quic.rs`).
 
 ### Phase 3 – Client Integration (2 weeks)
 - Extend CLI and client lib to open QUIC connections using the chosen library (e.g., `quinn` client).

@@ -1,7 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use handcontrol_client_lib::{
-    config::{self, ClientConfig, DeviceConfig},
+    config::{self, ClientConfig, DeviceConfig, TransportPreference, TRANSPORT_OVERRIDE_ENV},
     discover_servers, enroll_via_approval, enroll_via_qr, execute_command, fetch_server_info,
     list_commands as fetch_command_list, open_capability_session, resume_capability_session,
     storage::{ServerRegistry, ServerRegistryEntry},
@@ -37,8 +37,38 @@ use tokio::signal::unix::{signal, SignalKind};
     long_about = "HandControl CLI provides terminal-based access to HandControl servers."
 )]
 struct Cli {
+    /// Override the relay transport to use for this invocation
+    #[arg(long, value_enum)]
+    transport: Option<TransportCliChoice>,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum TransportCliChoice {
+    Auto,
+    Websocket,
+    Quic,
+}
+
+impl TransportCliChoice {
+    fn as_env_value(&self) -> &'static str {
+        match self {
+            TransportCliChoice::Auto => "auto",
+            TransportCliChoice::Websocket => "websocket",
+            TransportCliChoice::Quic => "quic",
+        }
+    }
+}
+
+impl From<TransportCliChoice> for TransportPreference {
+    fn from(value: TransportCliChoice) -> Self {
+        match value {
+            TransportCliChoice::Auto => TransportPreference::Auto,
+            TransportCliChoice::Websocket => TransportPreference::Websocket,
+            TransportCliChoice::Quic => TransportPreference::Quic,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -214,8 +244,14 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    let transport_override = cli.transport;
+    let command = cli.command;
 
-    match cli.command {
+    if let Some(choice) = transport_override {
+        std::env::set_var(TRANSPORT_OVERRIDE_ENV, choice.as_env_value());
+    }
+
+    match command {
         Command::Discover(cmd) => run_discover(cmd),
         Command::ListServers(cmd) => run_list_servers(cmd),
         Command::Info(cmd) => run_info(cmd).await,
@@ -1364,6 +1400,11 @@ fn set_config_value(cfg: &mut ClientConfig, key: &str, value: &str) -> Result<()
         }
         ["network", "relay", "max_direct_attempts"] => {
             cfg.network.relay.max_direct_attempts = parse_u32_arg(key, value)?;
+        }
+        ["network", "relay", "transport"] => {
+            cfg.network.relay.transport = value
+                .parse::<TransportPreference>()
+                .with_context(|| format!("Invalid value '{value}' for network.relay.transport"))?;
         }
         ["tui", "show_timestamps"] => {
             cfg.tui.show_timestamps = parse_bool_arg(value)?;

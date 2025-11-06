@@ -1,10 +1,13 @@
+use crate::config::TransportPreference;
 use crate::storage::RegistryRelayInfo;
+use crate::transport::quic::QuicTransport;
 use crate::transport::websocket::WebSocketTransport;
 use crate::transport::{
-    ControlConnectParams, ControlFrame, RelayTransport, TunnelAttachParams, TlsOptions,
+    ControlConnectParams, ControlFrame, RelayTransport, TlsOptions, TunnelAttachParams,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tokio::io::DuplexStream;
 use tracing::debug;
 use url::Url;
@@ -46,6 +49,7 @@ pub async fn establish_relay_tunnel(
     relay: &RegistryRelayInfo,
     server_id: Uuid,
     client_id: &Uuid,
+    transport_pref: TransportPreference,
 ) -> Result<RelayTunnel> {
     let connect_url = build_connect_url(&relay.relay_url)?;
     debug!(url = %connect_url, "Connecting to relay server");
@@ -55,17 +59,6 @@ pub async fn establish_relay_tunnel(
         allow_self_signed: relay.allow_self_signed_tls,
         pinned_cert_sha256: pinned,
     };
-
-    let transport = WebSocketTransport::default();
-    let mut session = transport
-        .connect_control(ControlConnectParams {
-            url: connect_url.as_str().to_owned(),
-            subprotocol: Some(RELAY_PROTOCOL.to_string()),
-            tls: tls_options,
-            fallback_on_subprotocol_error: true,
-        })
-        .await
-        .context("Failed to establish relay control connection")?;
 
     let server_id_str = server_id.to_string();
     let client_id_str = client_id.to_string();
@@ -79,55 +72,122 @@ pub async fn establish_relay_tunnel(
 
     let connect_json = serde_json::to_string(&connect_payload)
         .context("Failed to serialize relay connect message")?;
-    session
-        .sink()
-        .send_text(&connect_json)
-        .await
-        .context("Failed to send relay connect message")?;
+    let connect_url_str = connect_url.as_str().to_owned();
 
-    let ack_frame = session
-        .next()
-        .await
-        .ok_or_else(|| anyhow!("Relay closed connection before connect_ack"))?
-        .context("Relay connect_ack frame failed")?;
+    #[derive(Clone, Copy)]
+    enum TransportKind {
+        Websocket,
+        Quic,
+    }
 
-    let ack = match ack_frame {
-        ControlFrame::Text(text) => serde_json::from_str::<ConnectAck>(text.as_str())
-            .context("Failed to parse connect_ack from relay")?,
-        other => {
-            bail!("Relay returned unexpected frame before connect_ack: {other:?}");
+    impl TransportKind {
+        fn label(&self) -> &'static str {
+            match self {
+                TransportKind::Websocket => "websocket",
+                TransportKind::Quic => "quic",
+            }
         }
+    }
+
+    let attempt_order: Vec<TransportKind> = match transport_pref {
+        TransportPreference::Auto => vec![TransportKind::Quic, TransportKind::Websocket],
+        TransportPreference::Websocket => vec![TransportKind::Websocket],
+        TransportPreference::Quic => vec![TransportKind::Quic, TransportKind::Websocket],
     };
 
-    if ack.r#type != "connect_ack" {
-        bail!("Relay response missing connect_ack (got {})", ack.r#type);
-    }
+    let mut errors: Vec<String> = Vec::new();
 
-    if ack.status != "ok" {
-        let reason = ack.error.as_deref().unwrap_or("relay rejected connection");
-        bail!("Relay rejected connection: {reason}");
-    }
+    for kind in attempt_order {
+        let transport: Arc<dyn RelayTransport> = match kind {
+            TransportKind::Websocket => Arc::new(WebSocketTransport::default()),
+            TransportKind::Quic => Arc::new(QuicTransport::default()),
+        };
 
-    let tunnel_id = ack
-        .tunnel_id
-        .clone()
-        .ok_or_else(|| anyhow!("Relay connect_ack missing tunnel_id"))?;
-
-    let tunnel_connection = transport
-        .attach_tunnel(
-            session,
-            TunnelAttachParams {
-                tunnel_id: tunnel_id.clone(),
-                role: "client",
+        let control_params = ControlConnectParams {
+            url: connect_url_str.clone(),
+            subprotocol: match kind {
+                TransportKind::Websocket => Some(RELAY_PROTOCOL.to_string()),
+                TransportKind::Quic => None,
             },
-        )
-        .await
-        .context("Failed to attach relay tunnel")?;
+            tls: tls_options,
+            fallback_on_subprotocol_error: matches!(kind, TransportKind::Websocket),
+        };
 
-    Ok(RelayTunnel {
-        stream: tunnel_connection.stream,
-        server_authority: ack.server_authority,
-    })
+        let attempt_result: Result<RelayTunnel> = async {
+            let mut session = transport
+                .connect_control(control_params)
+                .await
+                .context("Failed to establish relay control connection")?;
+
+            session
+                .sink()
+                .send_text(&connect_json)
+                .await
+                .context("Failed to send relay connect message")?;
+
+            let ack_frame = session
+                .next()
+                .await
+                .ok_or_else(|| anyhow!("Relay closed connection before connect_ack"))?
+                .context("Relay connect_ack frame failed")?;
+
+            let ack = match ack_frame {
+                ControlFrame::Text(text) => serde_json::from_str::<ConnectAck>(text.as_str())
+                    .context("Failed to parse connect_ack from relay")?,
+                other => {
+                    bail!("Relay returned unexpected frame before connect_ack: {other:?}");
+                }
+            };
+
+            if ack.r#type != "connect_ack" {
+                bail!("Relay response missing connect_ack (got {})", ack.r#type);
+            }
+
+            if ack.status != "ok" {
+                let reason = ack.error.as_deref().unwrap_or("relay rejected connection");
+                bail!("Relay rejected connection: {reason}");
+            }
+
+            let tunnel_id = ack
+                .tunnel_id
+                .clone()
+                .ok_or_else(|| anyhow!("Relay connect_ack missing tunnel_id"))?;
+            let server_authority = ack.server_authority.clone();
+
+            let tunnel_connection = transport
+                .attach_tunnel(
+                    session,
+                    TunnelAttachParams {
+                        tunnel_id,
+                        role: "client",
+                    },
+                )
+                .await
+                .context("Failed to attach relay tunnel")?;
+
+            Ok(RelayTunnel {
+                stream: tunnel_connection.stream,
+                server_authority,
+            })
+        }
+        .await;
+
+        match attempt_result {
+            Ok(tunnel) => return Ok(tunnel),
+            Err(err) => {
+                errors.push(format!("{} transport: {:#}", kind.label(), err));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        bail!("Relay transport negotiation failed with no attempts executed");
+    }
+
+    bail!(
+        "All relay transport attempts failed:\n{}",
+        errors.join("\n")
+    );
 }
 
 fn build_connect_url(base_url: &str) -> Result<Url> {

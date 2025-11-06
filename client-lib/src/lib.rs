@@ -5,8 +5,8 @@ pub mod discovery;
 pub mod enrollment;
 pub mod grpc_client;
 mod relay;
-mod transport;
 pub mod storage;
+mod transport;
 
 pub mod proto {
     tonic::include_proto!("handcontrol.v1");
@@ -21,7 +21,7 @@ pub use commands::{
 };
 pub use config::{
     CliConfig, ClientConfig, ConnectionConfig, DeviceConfig, DiscoveryConfig, NetworkConfig,
-    RelayBehaviorConfig, TuiConfig,
+    RelayBehaviorConfig, TransportPreference, TuiConfig, TRANSPORT_OVERRIDE_ENV,
 };
 pub use discovery::{discover_servers, DiscoveredServer};
 pub use enrollment::{

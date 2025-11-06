@@ -1,11 +1,11 @@
 use crate::config::parser::{DEFAULT_RELAY_SUBPROTOCOL, RelayConfig};
 use crate::relay::tokens::TokenIssuer;
-use crate::relay::transport::{
-    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport,
-    TunnelConnectParams, TlsOptions,
-};
 use crate::relay::transport::websocket::WebSocketTransport;
-use anyhow::{anyhow, bail, Context, Result};
+use crate::relay::transport::{
+    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport, TlsOptions,
+    TunnelConnectParams,
+};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,8 +63,7 @@ impl RelayClient {
         token_issuer: Arc<TokenIssuer>,
         local_grpc_endpoint: SocketAddr,
     ) -> Self {
-        let transport: Arc<dyn RelayTransport> =
-            Arc::new(WebSocketTransport::default());
+        let transport: Arc<dyn RelayTransport> = Arc::new(WebSocketTransport::default());
 
         Self {
             config,
@@ -237,10 +236,7 @@ impl RelayClient {
         result
     }
 
-    async fn listen_control_channel(
-        &self,
-        session: &mut ControlSession,
-    ) -> Result<()> {
+    async fn listen_control_channel(&self, session: &mut ControlSession) -> Result<()> {
         while let Some(frame) = session.next().await {
             match frame {
                 Ok(ControlFrame::Text(payload)) => {
@@ -265,10 +261,7 @@ impl RelayClient {
         Ok(())
     }
 
-    fn spawn_control_keepalive(
-        &self,
-        sink: Arc<dyn ControlSink>,
-    ) -> JoinHandle<()> {
+    fn spawn_control_keepalive(&self, sink: Arc<dyn ControlSink>) -> JoinHandle<()> {
         let server_id = self.server_id;
         tokio::spawn(async move {
             let mut ticker = interval(Duration::from_secs(CONTROL_PING_INTERVAL_SECS));

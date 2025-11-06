@@ -124,9 +124,7 @@
             }
           else
             null;
-        nativeBuildInputs =
-          [ pkgs.pkg-config ]
-          ++ lib.optionals isLinux [ androidEmulator ];
+        nativeBuildInputs = [ pkgs.pkg-config ] ++ lib.optionals isLinux [ androidEmulator ];
         commonDevPackages = [
           pkgs.rustc
           pkgs.cargo
@@ -143,6 +141,8 @@
           pkgs.openssl
           javaToolchain
           pkgs.gradle
+          pkgs.grpcurl
+          pkgs.grpc
         ];
         linuxDevPackages =
           if isLinux then
@@ -152,12 +152,8 @@
               pkgs.androidStudioPackages.dev
             ]
           else
-            [];
-        darwinDevPackages =
-          if isDarwin then
-            [ pkgs.libiconv ]
-          else
-            [];
+            [ ];
+        darwinDevPackages = if isDarwin then [ pkgs.libiconv ] else [ ];
 
       in
       {
@@ -192,20 +188,19 @@
 
           inherit nativeBuildInputs;
 
-          shellHook =
-            ''
-              export JAVA_HOME=${javaToolchain}
-            ''
-            + lib.optionalString isLinux ''
-              export ANDROID_HOME=${androidPackages.androidsdk}
-              export ANDROID_SDK_ROOT=${androidPackages.androidsdk}
-              export QT_QPA_PLATFORM=xcb
-              export NIX_ANDROID_EMULATOR_FLAGS="-no-snapshot -gpu swiftshader_indirect"
-              if [ -d "${androidPackages.androidsdk}/ndk" ]; then
-                export ANDROID_NDK_HOME=$(ls -d ${androidPackages.androidsdk}/ndk/* | head -n1)
-                export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
-              fi
-            '';
+          shellHook = ''
+            export JAVA_HOME=${javaToolchain}
+          ''
+          + lib.optionalString isLinux ''
+            export ANDROID_HOME=${androidPackages.androidsdk}
+            export ANDROID_SDK_ROOT=${androidPackages.androidsdk}
+            export QT_QPA_PLATFORM=xcb
+            export NIX_ANDROID_EMULATOR_FLAGS="-no-snapshot -gpu swiftshader_indirect"
+            if [ -d "${androidPackages.androidsdk}/ndk" ]; then
+              export ANDROID_NDK_HOME=$(ls -d ${androidPackages.androidsdk}/ndk/* | head -n1)
+              export ANDROID_NDK_ROOT=$ANDROID_NDK_HOME
+            fi
+          '';
         };
 
         formatter = pkgs.alejandra;

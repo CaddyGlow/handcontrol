@@ -1,6 +1,6 @@
 use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use rustls::DigitallySignedStruct;
@@ -8,16 +8,16 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{
-    connect_async, connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
+    Connector, MaybeTlsStream, WebSocketStream, connect_async, connect_async_tls_with_config,
     tungstenite::{
-        client::IntoClientRequest, http::HeaderValue, Message, protocol::frame::Payload,
+        Message, client::IntoClientRequest, http::HeaderValue, protocol::frame::Payload,
     },
 };
 use tracing::{error, info, trace};
 
 use super::{
-    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport,
-    TunnelConnectParams, TlsOptions,
+    ControlConnectParams, ControlFrame, ControlSession, ControlSink, RelayTransport, TlsOptions,
+    TunnelConnectParams,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
@@ -60,10 +60,7 @@ impl RelayTransport for WebSocketTransport {
             Err(err) => Err(anyhow!("WebSocket error: {}", err)),
         });
 
-        Ok(ControlSession::new(
-            control_sink,
-            Box::pin(control_stream),
-        ))
+        Ok(ControlSession::new(control_sink, Box::pin(control_stream)))
     }
 
     async fn spawn_tunnel(&self, params: TunnelConnectParams) -> Result<()> {
@@ -76,8 +73,14 @@ impl RelayTransport for WebSocketTransport {
         } = params;
 
         tokio::spawn(async move {
-            if let Err(err) =
-                handle_tunnel(tunnel_url, tunnel_id.clone(), local_endpoint, tls, subprotocol).await
+            if let Err(err) = handle_tunnel(
+                tunnel_url,
+                tunnel_id.clone(),
+                local_endpoint,
+                tls,
+                subprotocol,
+            )
+            .await
             {
                 error!(%tunnel_id, "Tunnel task failed: {err:#}");
             }
@@ -338,7 +341,5 @@ fn build_tls_connector(tls_options: TlsOptions) -> Result<Option<Connector>> {
 
     client_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
-    Ok(Some(Connector::Rustls(std::sync::Arc::new(
-        client_config,
-    ))))
+    Ok(Some(Connector::Rustls(std::sync::Arc::new(client_config))))
 }

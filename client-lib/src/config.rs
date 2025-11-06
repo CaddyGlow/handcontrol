@@ -1,12 +1,13 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{fmt, fs, path::PathBuf, str::FromStr};
 
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "";
 const APPLICATION: &str = "handcontrol";
 const CONFIG_FILE_NAME: &str = "client.toml";
+pub const TRANSPORT_OVERRIDE_ENV: &str = "HANDCONTROL_CLIENT_TRANSPORT";
 
 /// Top-level client configuration loaded from `client.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +66,8 @@ pub struct RelayBehaviorConfig {
     pub relay_only_mode: bool,
     #[serde(default = "default_max_direct_attempts")]
     pub max_direct_attempts: u32,
+    #[serde(default)]
+    pub transport: TransportPreference,
 }
 
 impl Default for RelayBehaviorConfig {
@@ -73,6 +76,7 @@ impl Default for RelayBehaviorConfig {
             prefer_relay: false,
             relay_only_mode: false,
             max_direct_attempts: default_max_direct_attempts(),
+            transport: TransportPreference::default(),
         }
     }
 }
@@ -198,18 +202,24 @@ pub fn load() -> Result<ClientConfig> {
     let path = config_path()?;
 
     if !path.exists() {
-        return Ok(ClientConfig::default());
+        let mut cfg = ClientConfig::default();
+        apply_env_overrides(&mut cfg);
+        return Ok(cfg);
     }
 
     let contents =
         fs::read_to_string(&path).with_context(|| format!("Failed to read {}", path.display()))?;
 
     if contents.trim().is_empty() {
-        return Ok(ClientConfig::default());
+        let mut cfg = ClientConfig::default();
+        apply_env_overrides(&mut cfg);
+        return Ok(cfg);
     }
 
-    toml::from_str(&contents)
-        .with_context(|| format!("Failed to parse client config at {}", path.display()))
+    let mut cfg: ClientConfig = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse client config at {}", path.display()))?;
+    apply_env_overrides(&mut cfg);
+    Ok(cfg)
 }
 
 /// Persist configuration to disk, creating parent directories as needed.
@@ -238,6 +248,57 @@ fn default_command_timeout() -> u64 {
 
 fn default_max_direct_attempts() -> u32 {
     3
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TransportPreference {
+    Auto,
+    Websocket,
+    Quic,
+}
+
+impl Default for TransportPreference {
+    fn default() -> Self {
+        TransportPreference::Auto
+    }
+}
+
+impl fmt::Display for TransportPreference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            TransportPreference::Auto => "auto",
+            TransportPreference::Websocket => "websocket",
+            TransportPreference::Quic => "quic",
+        })
+    }
+}
+
+impl FromStr for TransportPreference {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let normalized = s.trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "auto" => Ok(TransportPreference::Auto),
+            "websocket" | "ws" => Ok(TransportPreference::Websocket),
+            "quic" => Ok(TransportPreference::Quic),
+            other => Err(anyhow::anyhow!(
+                "Unsupported transport preference '{other}'"
+            )),
+        }
+    }
+}
+
+fn apply_env_overrides(config: &mut ClientConfig) {
+    if let Ok(value) = std::env::var(TRANSPORT_OVERRIDE_ENV) {
+        match value.parse::<TransportPreference>() {
+            Ok(pref) => config.network.relay.transport = pref,
+            Err(err) => {
+                tracing::warn!("Ignoring transport override '{}': {:#}", value, err);
+            }
+        }
+    }
 }
 
 fn default_retry_attempts() -> u32 {

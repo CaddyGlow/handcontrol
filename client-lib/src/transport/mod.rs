@@ -6,6 +6,7 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use tokio::io::DuplexStream;
 
+pub mod quic;
 pub mod websocket;
 
 /// TLS configuration shared across relay transports.

@@ -1,10 +1,30 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use directories::ProjectDirs;
 use std::fs;
 use std::path::PathBuf;
 
+const CONFIG_DIR_ENV_VAR: &str = "HANDCONTROL_CONFIG_DIR";
+
 /// Get the base configuration directory for HandControl
 pub fn config_dir() -> Result<PathBuf> {
+    if let Some(custom) = std::env::var_os(CONFIG_DIR_ENV_VAR) {
+        let dir = PathBuf::from(custom);
+        if dir.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "{CONFIG_DIR_ENV_VAR} is set but empty; provide a valid directory path"
+            ));
+        }
+        if !dir.exists() {
+            fs::create_dir_all(&dir).with_context(|| {
+                format!(
+                    "Failed to create config directory {} from {CONFIG_DIR_ENV_VAR}",
+                    dir.display()
+                )
+            })?;
+        }
+        return Ok(dir);
+    }
+
     let proj_dirs = ProjectDirs::from("", "", "handcontrol")
         .context("Failed to determine project directories")?;
 

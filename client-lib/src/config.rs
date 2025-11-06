@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
@@ -7,6 +7,7 @@ const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "";
 const APPLICATION: &str = "handcontrol";
 const CONFIG_FILE_NAME: &str = "client.toml";
+const CONFIG_DIR_ENV_VAR: &str = "HANDCONTROL_CONFIG_DIR";
 
 /// Top-level client configuration loaded from `client.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,8 +182,24 @@ pub struct DeviceConfig {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
+    if let Some(custom) = std::env::var_os(CONFIG_DIR_ENV_VAR) {
+        let dir = PathBuf::from(custom);
+        if dir.as_os_str().is_empty() {
+            return Err(anyhow!(
+                "{CONFIG_DIR_ENV_VAR} is set but empty; provide a valid directory path"
+            ));
+        }
+        fs::create_dir_all(&dir).with_context(|| {
+            format!(
+                "Failed to create config directory {} from {CONFIG_DIR_ENV_VAR}",
+                dir.display()
+            )
+        })?;
+        return Ok(dir);
+    }
+
     let project_dirs = ProjectDirs::from(QUALIFIER, ORGANIZATION, APPLICATION)
-        .ok_or_else(|| anyhow::anyhow!("Unable to determine configuration directory"))?;
+        .ok_or_else(|| anyhow!("Unable to determine configuration directory"))?;
 
     let config_dir = project_dirs.config_dir().to_path_buf();
     fs::create_dir_all(&config_dir)

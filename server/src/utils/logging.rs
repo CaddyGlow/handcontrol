@@ -9,7 +9,7 @@ pub fn init_logging() -> Result<()> {
 
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(fmt::layer())
+        .with(fmt::layer().with_writer(std::io::stderr))
         .init();
 
     Ok(())

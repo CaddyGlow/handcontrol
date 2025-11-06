@@ -285,7 +285,11 @@ struct ApproveEnrollCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    if tracing_subscriber::fmt::try_init().is_err() {
+    if tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .try_init()
+        .is_err()
+    {
         debug!("Tracing subscriber already initialized");
     }
 

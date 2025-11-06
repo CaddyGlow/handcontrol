@@ -15,9 +15,11 @@ import com.handcontrol.data.commands.ValidationResult
 import com.handcontrol.data.commands.defaultValueFor
 import com.handcontrol.data.commands.toProtoParameter
 import com.handcontrol.data.commands.validateParameterValue
+import com.termux.terminal.RemoteTerminalSession
+import com.termux.terminal.TerminalSession
+import com.termux.terminal.TerminalSessionClient
 import dagger.hilt.android.lifecycle.HiltViewModel
 import javax.inject.Inject
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -29,7 +31,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import timber.log.Timber
 
-private const val MAX_OUTPUT_LINES = 500
 private const val DEFAULT_TERMINAL_COLS = 120
 private const val DEFAULT_TERMINAL_ROWS = 32
 
@@ -49,7 +50,8 @@ class ShellSessionViewModel @Inject constructor(
     private var parameterStates: Map<String, ParameterInputState> = emptyMap()
     private var dynamicLoadingStates: MutableMap<String, Boolean> = mutableMapOf()
     private var activeSession: ShellSession? = null
-    private var sessionJob: Job? = null
+    private var remoteTerminalSession: RemoteTerminalSession? = null
+    private var terminalBridge: ComposeTerminalBridgeHandle? = null
 
     fun load(serverId: String, commandId: String) {
         if (currentServerId == serverId && currentCommand?.id == commandId) return
@@ -92,8 +94,9 @@ class ShellSessionViewModel @Inject constructor(
                     dynamicLoading = dynamicLoadingStates.toMap(),
                     isFormValid = initialStates.values.all { it.validationResult is ValidationResult.Valid },
                     connectionState = ShellConnectionState.NotStarted,
-                    outputLines = emptyList(),
-                    errorMessage = null
+                    errorMessage = null,
+                    terminalSession = null,
+                    statusMessage = null
                 )
 
                 // Kick off dynamic default fetches (non-blocking)
@@ -111,8 +114,9 @@ class ShellSessionViewModel @Inject constructor(
                     dynamicLoading = emptyMap(),
                     isFormValid = false,
                     connectionState = ShellConnectionState.NotStarted,
-                    outputLines = emptyList(),
-                    errorMessage = e.message ?: "Failed to load capability"
+                    errorMessage = e.message ?: "Failed to load capability",
+                    terminalSession = null,
+                    statusMessage = null
                 )
             }
         }
@@ -191,7 +195,8 @@ class ShellSessionViewModel @Inject constructor(
             _uiState.update {
                 it.copy(
                     connectionState = ShellConnectionState.Connecting,
-                    outputLines = emptyList()
+                    terminalSession = null,
+                    statusMessage = null
                 )
             }
 
@@ -212,75 +217,26 @@ class ShellSessionViewModel @Inject constructor(
                 return@launch
             }
 
-            activeSession = result.getOrThrow()
-            sessionJob = launch {
-                try {
-                    activeSession?.events?.collect { event ->
-                        when (event) {
-                            is ShellSessionEvent.Ready -> {
-                                _uiState.update {
-                                    it.copy(
-                                        connectionState = ShellConnectionState.Active(event.message)
-                                    )
-                                }
-                                event.message?.let { msg ->
-                                    appendSystemLine(msg)
-                                }
-                            }
-                            is ShellSessionEvent.Output -> {
-                                appendShellLine(
-                                    text = event.text,
-                                    isError = event.isError,
-                                    isSystem = event.isBinary
-                                )
-                            }
-                            is ShellSessionEvent.Exit -> {
-                                val message = event.message?.takeIf { it.isNotBlank() }
-                                if (message != null) {
-                                    appendSystemLine(message)
-                                }
-                                _uiState.update {
-                                    it.copy(
-                                        connectionState = ShellConnectionState.Completed(
-                                            exitCode = event.exitCode,
-                                            message = event.message
-                                        )
-                                    )
-                                }
-                            }
-                            is ShellSessionEvent.Error -> {
-                                appendSystemLine(
-                                    text = event.message,
-                                    isError = true
-                                )
-                                _uiState.update {
-                                    it.copy(
-                                        connectionState = ShellConnectionState.Failed(event.message)
-                                    )
-                                }
-                            }
-                            is ShellSessionEvent.Heartbeat -> {
-                                // Heartbeats are informational; no UI update required.
-                            }
-                            is ShellSessionEvent.Closed -> {
-                                val message = event.reason?.takeIf { it.isNotBlank() }
-                                if (message != null) {
-                                    appendSystemLine("Session closed: $message")
-                                } else {
-                                    appendSystemLine("Session closed")
-                                }
-                                _uiState.update {
-                                    it.copy(
-                                        connectionState = ShellConnectionState.Closed(event.reason)
-                                    )
-                                }
-                            }
-                        }
-                    }
-                } finally {
-                    activeSession = null
-                    sessionJob = null
-                }
+            val shellSession = result.getOrThrow()
+            activeSession = shellSession
+
+            remoteTerminalSession?.finishIfRunning()
+
+            val terminalSession = RemoteTerminalSession(
+                scope = viewModelScope,
+                shellSession = shellSession,
+                transcriptRows = null,
+                client = NoOpTerminalSessionClient,
+                onEvent = ::handleTerminalEvent
+            )
+
+            remoteTerminalSession = terminalSession
+            _uiState.update {
+                it.copy(
+                    connectionState = ShellConnectionState.Connecting,
+                    terminalSession = terminalSession,
+                    statusMessage = null
+                )
             }
         }
     }
@@ -323,21 +279,43 @@ class ShellSessionViewModel @Inject constructor(
     }
 
     fun closeSession(reason: String? = null) {
-        val session = activeSession ?: return
+        val session = remoteTerminalSession ?: return
         viewModelScope.launch {
             try {
-                session.close(reason)
+                terminalBridge?.hideKeyboard()
+                session.dispose(reason)
             } catch (e: Exception) {
                 Timber.e(e, "Failed to close shell session")
                 emitToast(e.message ?: "Failed to close session")
+            } finally {
+                remoteTerminalSession = null
+                activeSession = null
+                terminalBridge = null
+                _uiState.update {
+                    it.copy(
+                        terminalSession = null,
+                        connectionState = ShellConnectionState.Closed(reason),
+                        statusMessage = reason
+                    )
+                }
             }
         }
     }
 
+    fun registerTerminalBridge(handle: ComposeTerminalBridgeHandle) {
+        terminalBridge = handle
+    }
+
+    fun toggleKeyboard() {
+        terminalBridge?.toggleKeyboard()
+    }
+
     override fun onCleared() {
         super.onCleared()
-        sessionJob?.cancel()
+        remoteTerminalSession?.finishIfRunning()
+        remoteTerminalSession = null
         activeSession = null
+        terminalBridge = null
     }
 
     private fun updateFormState() {
@@ -414,35 +392,63 @@ class ShellSessionViewModel @Inject constructor(
         }
     }
 
-    private fun appendShellLine(text: String, isError: Boolean = false, isSystem: Boolean = false) {
-        _uiState.update { state ->
-            val line = ShellLine(
-                text = text,
-                isError = isError,
-                isSystem = isSystem
-            )
-            val updated = (state.outputLines + line).takeLast(MAX_OUTPUT_LINES)
-            state.copy(outputLines = updated)
-        }
-    }
-
-private fun appendSystemLine(text: String, isError: Boolean = false) {
-        appendShellLine(text = text, isError = isError, isSystem = true)
-    }
-
     private fun emitToast(message: String) {
         viewModelScope.launch {
             _toastMessages.emit(message)
         }
     }
-}
 
-data class ShellLine(
-    val text: String,
-    val isError: Boolean = false,
-    val isSystem: Boolean = false,
-    val timestampMs: Long = System.currentTimeMillis()
-)
+    private fun handleTerminalEvent(event: ShellSessionEvent) {
+        when (event) {
+            is ShellSessionEvent.Ready -> {
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Active(event.message),
+                        statusMessage = event.message
+                    )
+                }
+            }
+            is ShellSessionEvent.Output -> {
+                // Text rendering is handled by the terminal view directly.
+            }
+            is ShellSessionEvent.Exit -> {
+                activeSession = null
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Completed(
+                            exitCode = event.exitCode,
+                            message = event.message
+                        ),
+                        statusMessage = event.message
+                    )
+                }
+            }
+            is ShellSessionEvent.Error -> {
+                activeSession = null
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Failed(event.message),
+                        statusMessage = event.message
+                    )
+                }
+                emitToast(event.message)
+            }
+            is ShellSessionEvent.Heartbeat -> {
+                // No-op; we may surface latency information later.
+            }
+            is ShellSessionEvent.Closed -> {
+                activeSession = null
+                val message = event.reason ?: "Session closed"
+                _uiState.update {
+                    it.copy(
+                        connectionState = ShellConnectionState.Closed(event.reason),
+                        statusMessage = message
+                    )
+                }
+            }
+        }
+    }
+}
 
 sealed class ShellConnectionState {
     data object NotStarted : ShellConnectionState()
@@ -460,6 +466,32 @@ data class ShellSessionUiState(
     val dynamicLoading: Map<String, Boolean> = emptyMap(),
     val isFormValid: Boolean = false,
     val connectionState: ShellConnectionState = ShellConnectionState.NotStarted,
-    val outputLines: List<ShellLine> = emptyList(),
-    val errorMessage: String? = null
+    val errorMessage: String? = null,
+    val terminalSession: TerminalSession? = null,
+    val statusMessage: String? = null
 )
+
+private object NoOpTerminalSessionClient : TerminalSessionClient {
+    override fun onTextChanged(changedSession: TerminalSession) = Unit
+    override fun onTitleChanged(changedSession: TerminalSession) = Unit
+    override fun onSessionFinished(finishedSession: TerminalSession) = Unit
+    override fun onCopyTextToClipboard(session: TerminalSession, text: String) = Unit
+    override fun onPasteTextFromClipboard(session: TerminalSession) = Unit
+    override fun onBell(session: TerminalSession) = Unit
+    override fun onColorsChanged(session: TerminalSession) = Unit
+    override fun onTerminalCursorStateChange(state: Boolean) = Unit
+    override fun getTerminalCursorStyle(): Int? = null
+    override fun logError(tag: String, message: String) = Timber.e("$tag: $message")
+    override fun logWarn(tag: String, message: String) = Timber.w("$tag: $message")
+    override fun logInfo(tag: String, message: String) = Timber.i("$tag: $message")
+    override fun logDebug(tag: String, message: String) = Timber.d("$tag: $message")
+    override fun logVerbose(tag: String, message: String) = Timber.v("$tag: $message")
+    override fun logStackTraceWithMessage(tag: String, message: String, e: Exception) =
+        Timber.e(e, "$tag: $message")
+    override fun logStackTrace(tag: String, e: Exception) = Timber.e(e, tag)
+}
+
+interface ComposeTerminalBridgeHandle {
+    fun toggleKeyboard()
+    fun hideKeyboard()
+}

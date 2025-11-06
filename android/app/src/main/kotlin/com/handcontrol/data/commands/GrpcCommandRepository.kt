@@ -393,24 +393,18 @@ class GrpcCommandRepository @Inject constructor(
                                 val output = message.output
                                 val rawBinary = output.binary ?: false
                                 val dataBytes = output.data.toByteArray()
-                                val decoded = try {
+                                val decoded = runCatching {
                                     dataBytes.toString(Charsets.UTF_8)
-                                } catch (_: Exception) {
-                                    ""
-                                }
-                                val hasReplacement = decoded.contains('\uFFFD')
-                                val displayText = if (rawBinary && (decoded.isEmpty() || hasReplacement)) {
-                                    "[binary output: ${dataBytes.size} bytes]"
-                                } else {
-                                    decoded
-                                }
+                                }.getOrNull()
+                                val hasReplacement = decoded?.contains('\uFFFD') == true
 
                                 trySend(
                                     ShellSessionEvent.Output(
-                                        text = displayText,
+                                        data = dataBytes,
                                         isError = output.stderr ?: false,
-                                        isBinary = rawBinary && (decoded.isEmpty() || hasReplacement),
-                                        timestampMs = output.timestampMs
+                                        isBinary = rawBinary || hasReplacement,
+                                        timestampMs = output.timestampMs,
+                                        text = decoded
                                     )
                                 )
                             }

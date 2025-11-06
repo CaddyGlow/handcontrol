@@ -1,5 +1,6 @@
 package com.handcontrol.feature.commands.shell
 
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -9,18 +10,13 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Keyboard
-import androidx.compose.material.icons.filled.Send
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
@@ -30,31 +26,33 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.handcontrol.data.commands.Command
 import com.handcontrol.data.commands.ParameterInputState
 import com.handcontrol.ui.components.parameters.ParameterInput
+import com.termux.terminal.TerminalSession
+import com.termux.terminal.TerminalSessionClient
+import com.termux.view.TerminalView
+import com.termux.view.TerminalViewClient
+import timber.log.Timber
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -67,17 +65,8 @@ fun ShellSessionScreen(
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val snackbarHostState = remember { SnackbarHostState() }
-    val outputListState = rememberLazyListState()
-    var inputValue by rememberSaveable { mutableStateOf("") }
-
     LaunchedEffect(serverId, commandId) {
         viewModel.load(serverId, commandId)
-    }
-
-    LaunchedEffect(uiState.outputLines.size) {
-        if (uiState.outputLines.isNotEmpty()) {
-            outputListState.animateScrollToItem(uiState.outputLines.lastIndex)
-        }
     }
 
     LaunchedEffect(Unit) {
@@ -109,9 +98,16 @@ fun ShellSessionScreen(
                     }
                 },
                 actions = {
-                    if (uiState.connectionState is ShellConnectionState.Active ||
-                        uiState.connectionState is ShellConnectionState.Connecting
-                    ) {
+                    val terminalActive = uiState.connectionState is ShellConnectionState.Active
+                    if (terminalActive || uiState.connectionState is ShellConnectionState.Connecting) {
+                        if (terminalActive) {
+                            IconButton(onClick = viewModel::toggleKeyboard) {
+                                Icon(
+                                    imageVector = Icons.Filled.Keyboard,
+                                    contentDescription = "Toggle keyboard"
+                                )
+                            }
+                        }
                         IconButton(onClick = { viewModel.closeSession("Client closed") }) {
                             Icon(
                                 imageVector = Icons.Filled.Cancel,
@@ -140,15 +136,10 @@ fun ShellSessionScreen(
                     onUpdateParameter = viewModel::updateParameter,
                     onRefreshDefault = viewModel::refreshDefault,
                     onStartSession = viewModel::startSession,
-                    onSendInput = { text ->
-                        viewModel.sendText(text)
-                        inputValue = ""
-                    },
                     onSendCtrlC = viewModel::sendCtrlC,
+                    onRegisterBridge = viewModel::registerTerminalBridge,
+                    onToggleKeyboard = viewModel::toggleKeyboard,
                     onCloseSession = viewModel::closeSession,
-                    outputListState = outputListState,
-                    inputValue = inputValue,
-                    onInputChange = { inputValue = it },
                     modifier = Modifier.padding(paddingValues)
                 )
             }
@@ -162,12 +153,10 @@ private fun ShellSessionContent(
     onUpdateParameter: (String, String) -> Unit,
     onRefreshDefault: (String) -> Unit,
     onStartSession: () -> Unit,
-    onSendInput: (String) -> Unit,
     onSendCtrlC: () -> Unit,
+    onRegisterBridge: (ComposeTerminalBridgeHandle) -> Unit,
+    onToggleKeyboard: () -> Unit,
     onCloseSession: (String?) -> Unit,
-    outputListState: androidx.compose.foundation.lazy.LazyListState,
-    inputValue: String,
-    onInputChange: (String) -> Unit,
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -217,9 +206,11 @@ private fun ShellSessionContent(
 
         ConnectionStatus(uiState.connectionState)
 
-        SessionOutputList(
-            lines = uiState.outputLines,
-            state = outputListState,
+        TerminalPane(
+            terminalSession = uiState.terminalSession,
+            connectionState = uiState.connectionState,
+            statusMessage = uiState.statusMessage,
+            onBridgeReady = onRegisterBridge,
             modifier = Modifier
                 .weight(1f)
                 .fillMaxWidth()
@@ -231,20 +222,60 @@ private fun ShellSessionContent(
 
         when (uiState.connectionState) {
             is ShellConnectionState.Active -> {
-                InputToolbar(
-                    inputValue = inputValue,
-                    onInputChange = onInputChange,
-                    onSendInput = onSendInput,
+                TerminalShortcutRow(
                     onSendCtrlC = onSendCtrlC,
+                    onToggleKeyboard = onToggleKeyboard,
                     onCloseSession = onCloseSession
                 )
             }
             is ShellConnectionState.Connecting -> {
-                LinearProgressIndicator(
-                    modifier = Modifier.fillMaxWidth()
+                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            }
+            is ShellConnectionState.Completed -> {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    uiState.statusMessage?.takeIf { it.isNotBlank() }?.let { message ->
+                        Text(
+                            text = message,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                    Button(
+                        onClick = onStartSession,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Restart Session")
+                    }
+                }
+            }
+            is ShellConnectionState.Failed -> {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = uiState.connectionState.message,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.error
+                    )
+                    Button(
+                        onClick = onStartSession,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Retry")
+                    }
+                }
+            }
+            is ShellConnectionState.Closed -> {
+                Text(
+                    text = uiState.statusMessage ?: "Session closed",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            else -> Unit
+            ShellConnectionState.NotStarted -> Unit
         }
     }
 }
@@ -274,32 +305,285 @@ private fun ParameterSection(
 }
 
 @Composable
-private fun SessionOutputList(
-    lines: List<ShellLine>,
-    state: androidx.compose.foundation.lazy.LazyListState,
+private fun TerminalPane(
+    terminalSession: TerminalSession?,
+    connectionState: ShellConnectionState,
+    statusMessage: String?,
+    onBridgeReady: (ComposeTerminalBridgeHandle) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    LazyColumn(
-        state = state,
+    Box(
         modifier = modifier
-            .padding(12.dp)
+            .padding(12.dp),
+        contentAlignment = Alignment.Center
     ) {
-        itemsIndexed(lines) { _, line ->
-            val color = when {
-                line.isError -> MaterialTheme.colorScheme.error
-                line.isSystem -> MaterialTheme.colorScheme.secondary
-                else -> MaterialTheme.colorScheme.onSurface
-            }
-            Text(
-                text = line.text,
-                color = color,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 2.dp)
+        if (terminalSession != null) {
+            TerminalSurface(
+                session = terminalSession,
+                onBridgeReady = onBridgeReady,
+                modifier = Modifier.fillMaxSize()
             )
+        } else {
+            TerminalPlaceholder(connectionState)
         }
+
+        statusMessage?.takeIf { it.isNotBlank() }?.let { message ->
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .background(
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.86f),
+                        shape = RoundedCornerShape(8.dp)
+                    )
+                    .padding(8.dp)
+            ) {
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun TerminalSurface(
+    session: TerminalSession,
+    onBridgeReady: (ComposeTerminalBridgeHandle) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val bridge = remember { ComposeTerminalBridge(context) }
+
+    LaunchedEffect(bridge) {
+        onBridgeReady(bridge)
+    }
+
+    AndroidView(
+        modifier = modifier.clip(RoundedCornerShape(10.dp)),
+        factory = { ctx ->
+            TerminalView(ctx, null).apply {
+                isFocusable = true
+                isFocusableInTouchMode = true
+                setTerminalViewClient(bridge)
+                bridge.bindView(this)
+                bridge.bindSession(session)
+                attachSession(session)
+                requestFocus()
+            }
+        },
+        update = { view ->
+            bridge.bindView(view)
+            bridge.bindSession(session)
+            if (view.attachSession(session)) {
+                session.updateTerminalSessionClient(bridge)
+            }
+        }
+    )
+
+    LaunchedEffect(session.mHandle) {
+        bridge.focusAndShowKeyboard()
+    }
+}
+
+@Composable
+private fun TerminalPlaceholder(connectionState: ShellConnectionState) {
+    val message = when (connectionState) {
+        ShellConnectionState.NotStarted,
+        is ShellConnectionState.Closed,
+        is ShellConnectionState.Completed -> "Start the session to open a terminal."
+        is ShellConnectionState.Connecting -> "Starting remote terminal..."
+        is ShellConnectionState.Failed -> "Session unavailable."
+        is ShellConnectionState.Active -> "Preparing terminal view…"
+    }
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Filled.Keyboard,
+            contentDescription = null,
+            modifier = Modifier.size(32.dp),
+            tint = MaterialTheme.colorScheme.outline
+        )
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun TerminalShortcutRow(
+    onSendCtrlC: () -> Unit,
+    onToggleKeyboard: () -> Unit,
+    onCloseSession: (String?) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        OutlinedButton(onClick = onSendCtrlC) {
+            Text("Ctrl+C")
+        }
+        OutlinedButton(onClick = onToggleKeyboard) {
+            Text("Toggle Keyboard")
+        }
+        OutlinedButton(onClick = { onCloseSession("Client closed") }) {
+            Text("Close Session")
+        }
+        Spacer(modifier = Modifier.weight(1f))
+    }
+}
+
+private class ComposeTerminalBridge(
+    private val context: android.content.Context
+) : TerminalSessionClient, TerminalViewClient, ComposeTerminalBridgeHandle {
+
+    private val clipboard =
+        context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+    private val inputMethodManager =
+        context.getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as InputMethodManager
+    private var terminalView: TerminalView? = null
+    private var boundSession: TerminalSession? = null
+    private var textSizeDp = 14
+    private var keyboardVisible = false
+
+    fun bindView(view: TerminalView) {
+        terminalView = view
+        view.setTextSize(textSizeDp)
+        keyboardVisible = inputMethodManager.isActive(view)
+    }
+
+    fun bindSession(session: TerminalSession) {
+        boundSession = session
+        session.updateTerminalSessionClient(this)
+    }
+
+    fun focusAndShowKeyboard() {
+        val view = terminalView ?: return
+        view.requestFocus()
+        view.post {
+            inputMethodManager.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+            keyboardVisible = true
+        }
+    }
+
+    override fun toggleKeyboard() {
+        val view = terminalView ?: return
+        if (keyboardVisible) {
+            hideKeyboard()
+        } else {
+            focusAndShowKeyboard()
+        }
+    }
+
+    override fun hideKeyboard() {
+        val view = terminalView ?: return
+        inputMethodManager.hideSoftInputFromWindow(view.windowToken, 0)
+        keyboardVisible = false
+    }
+
+    override fun onTextChanged(changedSession: TerminalSession) {
+        terminalView?.onScreenUpdated()
+        terminalView?.postInvalidateOnAnimation()
+    }
+
+    override fun onTitleChanged(changedSession: TerminalSession) = Unit
+
+    override fun onSessionFinished(finishedSession: TerminalSession) {
+        Timber.i("Terminal session finished")
+    }
+
+    override fun onCopyTextToClipboard(session: TerminalSession, text: String) {
+        clipboard.setPrimaryClip(android.content.ClipData.newPlainText("terminal", text))
+    }
+
+    override fun onPasteTextFromClipboard(session: TerminalSession) {
+        val paste = clipboard.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        if (!paste.isNullOrEmpty()) {
+            session.write(paste)
+        }
+    }
+
+    override fun onBell(session: TerminalSession) {
+        terminalView?.performHapticFeedback(android.view.HapticFeedbackConstants.VIRTUAL_KEY)
+    }
+
+    override fun onColorsChanged(session: TerminalSession) {
+        terminalView?.postInvalidateOnAnimation()
+    }
+
+    override fun onTerminalCursorStateChange(state: Boolean) {
+        terminalView?.postInvalidateOnAnimation()
+    }
+
+    override fun getTerminalCursorStyle(): Int? = null
+
+    override fun logError(tag: String, message: String) = Timber.e("$tag: $message")
+    override fun logWarn(tag: String, message: String) = Timber.w("$tag: $message")
+    override fun logInfo(tag: String, message: String) = Timber.i("$tag: $message")
+    override fun logDebug(tag: String, message: String) = Timber.d("$tag: $message")
+    override fun logVerbose(tag: String, message: String) = Timber.v("$tag: $message")
+    override fun logStackTraceWithMessage(tag: String, message: String, e: Exception) =
+        Timber.e(e, "$tag: $message")
+    override fun logStackTrace(tag: String, e: Exception) = Timber.e(e, tag)
+
+    override fun onScale(scale: Float): Float {
+        if (scale < 0.9f || scale > 1.1f) {
+            textSizeDp = (textSizeDp + if (scale > 1f) 1 else -1).coerceIn(8, 24)
+            terminalView?.setTextSize(textSizeDp)
+            return 1f
+        }
+        return scale
+    }
+
+    override fun onSingleTapUp(e: android.view.MotionEvent) {
+        focusAndShowKeyboard()
+    }
+
+    override fun shouldBackButtonBeMappedToEscape(): Boolean = false
+
+    override fun shouldEnforceCharBasedInput(): Boolean = true
+
+    override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
+
+    override fun isTerminalViewSelected(): Boolean = terminalView?.isFocused == true
+
+    override fun copyModeChanged(copyMode: Boolean) = Unit
+
+    override fun onKeyDown(
+        keyCode: Int,
+        e: android.view.KeyEvent,
+        session: TerminalSession
+    ): Boolean = false
+
+    override fun onKeyUp(keyCode: Int, e: android.view.KeyEvent): Boolean = false
+
+    override fun onLongPress(event: android.view.MotionEvent): Boolean = false
+
+    override fun readControlKey(): Boolean = false
+
+    override fun readAltKey(): Boolean = false
+
+    override fun readShiftKey(): Boolean = false
+
+    override fun readFnKey(): Boolean = false
+
+    override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession): Boolean =
+        false
+
+    override fun onEmulatorSet() {
+        Timber.d("Terminal emulator attached")
+        focusAndShowKeyboard()
     }
 }
 
@@ -313,7 +597,7 @@ private fun ConnectionStatus(state: ShellConnectionState) {
             message to MaterialTheme.colorScheme.primary
         }
         is ShellConnectionState.Completed -> {
-            val message = if (state.exitCode == 0) {
+            val message = state.message?.takeIf { it.isNotBlank() } ?: if (state.exitCode == 0) {
                 "Exited successfully"
             } else {
                 "Exited (${state.exitCode})"
@@ -344,50 +628,6 @@ private fun ConnectionStatus(state: ShellConnectionState) {
             )
         }
     )
-}
-
-@Composable
-private fun InputToolbar(
-    inputValue: String,
-    onInputChange: (String) -> Unit,
-    onSendInput: (String) -> Unit,
-    onSendCtrlC: () -> Unit,
-    onCloseSession: (String?) -> Unit
-) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedTextField(
-                value = inputValue,
-                onValueChange = onInputChange,
-                modifier = Modifier.weight(1f),
-                label = { Text("Send input") },
-                singleLine = true
-            )
-            Button(
-                onClick = { onSendInput(inputValue) },
-                enabled = inputValue.isNotBlank()
-            ) {
-                Icon(imageVector = Icons.Filled.Send, contentDescription = null)
-                Spacer(modifier = Modifier.width(4.dp))
-                Text("Send")
-            }
-        }
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            OutlinedButton(onClick = onSendCtrlC) {
-                Text("Ctrl+C")
-            }
-            Spacer(modifier = Modifier.weight(1f))
-            TextButton(onClick = { onCloseSession("Client closed") }) {
-                Text("Close Session")
-            }
-        }
-    }
 }
 
 @Composable

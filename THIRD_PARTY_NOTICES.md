@@ -10,8 +10,9 @@ collects attribution and licensing requirements for those dependencies.
 - Original upstream project:
   [jackpal/Android-Terminal-Emulator](https://github.com/jackpal/Android-Terminal-Emulator)
 - License: Apache License 2.0 (see `licenses/Apache-2.0-Termux-Terminal.txt`)
-- HandControl modifications: integration glue to bridge the Termux terminal
-  session with the remote gRPC shell adapter (documented in `docs/android-terminal-integration-plan.md`)
+- HandControl modifications: made `TerminalSession` extensible and added a Kotlin
+  `RemoteTerminalSession` bridge to stream remote PTY data into the Termux emulator
+  (documented in `docs/android-terminal-integration-plan.md`)
 
 Future third-party additions should extend this file with the component name,
 upstream URL, license, and a brief summary of local changes.

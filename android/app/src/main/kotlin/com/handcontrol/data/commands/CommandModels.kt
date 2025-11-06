@@ -121,10 +121,11 @@ data class TerminalSize(val cols: Int, val rows: Int)
 sealed class ShellSessionEvent {
     data class Ready(val capabilityId: String, val message: String?) : ShellSessionEvent()
     data class Output(
-        val text: String,
+        val data: ByteArray,
         val isError: Boolean,
         val isBinary: Boolean,
-        val timestampMs: Long?
+        val timestampMs: Long?,
+        val text: String?
     ) : ShellSessionEvent()
     data class Exit(val exitCode: Int, val timedOut: Boolean, val message: String?) : ShellSessionEvent()
     data class Error(val message: String, val code: Int? = null) : ShellSessionEvent()

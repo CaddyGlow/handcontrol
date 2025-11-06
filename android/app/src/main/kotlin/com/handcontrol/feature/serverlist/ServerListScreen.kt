@@ -331,7 +331,7 @@ private fun ServerCard(
 
                 val dateFormat = remember { SimpleDateFormat("MMM d, yyyy h:mm a", Locale.getDefault()) }
                 val lastConnectedText = if (server.lastConnected != null) {
-                    "Last used: ${dateFormat.format(Date(server.lastConnected))}"
+                    "Last seen: ${dateFormat.format(Date(server.lastConnected))}"
                 } else {
                     "Enrolled: ${dateFormat.format(Date(server.enrolledAt))}"
                 }

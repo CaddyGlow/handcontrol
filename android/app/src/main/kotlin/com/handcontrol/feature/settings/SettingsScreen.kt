@@ -205,16 +205,26 @@ fun SettingsScreen(
                         title = "Build Number",
                         value = BuildConfig.VERSION_CODE.toString()
                     )
+                    val openExternalUrl: (String) -> Unit = { url ->
+                        val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                        if (intent.resolveActivity(context.packageManager) != null) {
+                            context.startActivity(intent)
+                        } else {
+                            snackbarMessage = "No application available to view licenses"
+                        }
+                    }
                     ClickablePreference(
-                        title = "Open Source Licenses",
+                        title = "Project License (MIT)",
+                        subtitle = "Repository LICENSE file",
                         onClick = {
-                            val licenseUrl = "https://github.com/hand-engineering/handcontrol/blob/main/LICENSE"
-                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(licenseUrl))
-                            if (intent.resolveActivity(context.packageManager) != null) {
-                                context.startActivity(intent)
-                            } else {
-                                snackbarMessage = "No application available to view licenses"
-                            }
+                            openExternalUrl("https://github.com/hand-engineering/handcontrol/blob/main/LICENSE")
+                        }
+                    )
+                    ClickablePreference(
+                        title = "Third-Party Notices",
+                        subtitle = "Termux terminal components (Apache-2.0)",
+                        onClick = {
+                            openExternalUrl("https://github.com/hand-engineering/handcontrol/blob/main/THIRD_PARTY_NOTICES.md")
                         }
                     )
                 }

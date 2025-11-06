@@ -127,6 +127,7 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraXVersion")
     implementation("androidx.camera:camera-view:$cameraXVersion")
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    implementation(project(":terminal-view"))
 
     debugImplementation(composeBom)
     debugImplementation("androidx.compose.ui:ui-tooling")

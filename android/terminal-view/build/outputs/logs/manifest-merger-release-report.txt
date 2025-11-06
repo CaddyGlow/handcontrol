@@ -1,0 +1,15 @@
+-- Merging decision tree log ---
+manifest
+ADDED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml:1:1-2:12
+INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml:1:1-2:12
+	package
+		ADDED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml:1:11-36
+		INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml
+uses-sdk
+INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml reason: use-sdk injection requested
+INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml
+INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml
+	android:targetSdkVersion
+		INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml
+	android:minSdkVersion
+		INJECTED from /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/AndroidManifest.xml

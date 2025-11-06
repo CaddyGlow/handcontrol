@@ -18,3 +18,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "HandControl"
 include(":app")
+include(":terminal-emulator")
+include(":terminal-view")

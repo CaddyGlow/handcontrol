@@ -47,8 +47,8 @@ class ServerListViewModel @Inject constructor(
 
     fun connectToServer(serverId: String) {
         viewModelScope.launch {
-            Timber.i("Connecting to server: $serverId")
-            enrolledServerRepository.updateLastConnected(serverId)
+            Timber.i("Navigating to server: $serverId")
+            // Note: lastConnected is updated by updateConnectionMode() when connection succeeds
         }
     }
 }

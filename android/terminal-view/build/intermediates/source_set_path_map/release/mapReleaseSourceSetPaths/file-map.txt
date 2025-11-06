@@ -1,0 +1,8 @@
+com.termux.view.terminal-view-release-0 /home/rick/projects-caddy/handcontrol/android/terminal-emulator/build/intermediates/packaged_res/release/packageReleaseResources
+com.termux.view.terminal-view-pngs-1 /home/rick/projects-caddy/handcontrol/android/terminal-view/build/generated/res/pngs/release
+com.termux.view.terminal-view-resValues-2 /home/rick/projects-caddy/handcontrol/android/terminal-view/build/generated/res/resValues/release
+com.termux.view.terminal-view-mergeReleaseResources-3 /home/rick/projects-caddy/handcontrol/android/terminal-view/build/intermediates/incremental/release/mergeReleaseResources/merged.dir
+com.termux.view.terminal-view-mergeReleaseResources-4 /home/rick/projects-caddy/handcontrol/android/terminal-view/build/intermediates/incremental/release/mergeReleaseResources/stripped.dir
+com.termux.view.terminal-view-release-5 /home/rick/projects-caddy/handcontrol/android/terminal-view/build/intermediates/merged_res/release/mergeReleaseResources
+com.termux.view.terminal-view-main-6 /home/rick/projects-caddy/handcontrol/android/terminal-view/src/main/res
+com.termux.view.terminal-view-release-7 /home/rick/projects-caddy/handcontrol/android/terminal-view/src/release/res

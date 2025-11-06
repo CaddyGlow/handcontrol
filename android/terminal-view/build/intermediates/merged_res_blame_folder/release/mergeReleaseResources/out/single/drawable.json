@@ -1,0 +1,10 @@
+[
+    {
+        "merged": "com.termux.view.terminal-view-release-4:/drawable/text_select_handle_left_material.xml",
+        "source": "com.termux.view.terminal-view-main-5:/drawable/text_select_handle_left_material.xml"
+    },
+    {
+        "merged": "com.termux.view.terminal-view-release-4:/drawable/text_select_handle_right_material.xml",
+        "source": "com.termux.view.terminal-view-main-5:/drawable/text_select_handle_right_material.xml"
+    }
+]

@@ -39,6 +39,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::timeout;
 use tracing::{Span, field, instrument};
@@ -774,6 +775,10 @@ async fn handle_quic_connect(
     tunnel_entry.notify.notify_waiters();
     trace!("Client readiness recorded for tunnel {}", tunnel_id);
 
+    // Set up notification listener BEFORE attaching endpoint
+    // This ensures we catch any notifications from the other side
+    let notified = tunnel_entry.notify.notified();
+
     let endpoint = QuicTunnelEndpoint::new(send, recv);
 
     if let Some(pair) = tunnel_entry.attach_client_quic(endpoint).await {
@@ -787,8 +792,19 @@ async fn handle_quic_connect(
     let handle_cleanup = tunnel_entry.clone();
     let state_clone = state.clone();
     let wait_result = timeout(state.handshake_timeout, async move {
+        let mut notified = notified;
+
         loop {
-            handle_wait.notify.notified().await;
+            // Check for pair before waiting to avoid race condition
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                info!("Tunnel {} is now active", tunnel_id);
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            notified.await;
+            // Reset for next iteration
+            notified = handle_wait.notify.notified();
 
             if let Some(pair) = handle_wait.take_pair_if_ready().await {
                 info!("Tunnel {} is now active", tunnel_id);
@@ -876,6 +892,10 @@ async fn handle_quic_server_tunnel(
     entry.notify.notify_waiters();
     trace!("Server readiness recorded for tunnel {}", tunnel_id);
 
+    // Set up notification listener BEFORE attaching endpoint
+    // This ensures we catch any notifications from the other side
+    let notified = entry.notify.notified();
+
     let endpoint = QuicTunnelEndpoint::new(send, recv);
 
     if let Some(pair) = entry.attach_server_quic(endpoint).await {
@@ -888,8 +908,18 @@ async fn handle_quic_server_tunnel(
     let handle_cleanup = entry.clone();
     let state_clone = state.clone();
     let wait_result = timeout(state.handshake_timeout, async move {
+        let mut notified = notified;
+
         loop {
-            handle_wait.notify.notified().await;
+            // Check for pair before waiting to avoid race condition
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            notified.await;
+            // Reset for next iteration
+            notified = handle_wait.notify.notified();
 
             if let Some(pair) = handle_wait.take_pair_if_ready().await {
                 spawn_forwarders(state_clone.clone(), tunnel_id, pair);
@@ -1053,6 +1083,7 @@ impl TunnelHandle {
         // Prefer WebSocket pairing if both sides are present.
         if let Some(client_ws) = self.client_ws.lock().await.take() {
             if let Some(server_ws) = self.server_ws.lock().await.take() {
+                debug!("take_pair_if_ready: returning WebSocket pair");
                 return Some(TunnelPair::WebSocket(client_ws, server_ws));
             } else {
                 let mut guard = self.client_ws.lock().await;
@@ -1060,15 +1091,21 @@ impl TunnelHandle {
             }
         }
 
-        if let Some(client_quic) = self.client_quic.lock().await.take() {
-            if let Some(server_quic) = self.server_quic.lock().await.take() {
-                return Some(TunnelPair::Quic(client_quic, server_quic));
-            } else {
-                let mut guard = self.client_quic.lock().await;
-                *guard = Some(client_quic);
-            }
+        // Lock both endpoints together to avoid race conditions
+        let mut client_guard = self.client_quic.lock().await;
+        let mut server_guard = self.server_quic.lock().await;
+
+        debug!("take_pair_if_ready: client_quic={} server_quic={}", client_guard.is_some(), server_guard.is_some());
+
+        // Only take if BOTH are present
+        if client_guard.is_some() && server_guard.is_some() {
+            let client_quic = client_guard.take().unwrap();
+            let server_quic = server_guard.take().unwrap();
+            debug!("take_pair_if_ready: returning QUIC pair");
+            return Some(TunnelPair::Quic(client_quic, server_quic));
         }
 
+        debug!("take_pair_if_ready: no pair available");
         None
     }
 
@@ -2009,8 +2046,21 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     let handle_cleanup = tunnel_entry.clone();
     let state_clone = state.clone();
     let wait_result = timeout(state.handshake_timeout, async move {
+        // Set up notification listener first, then check for pair
+        // This ensures we don't miss notifications between check and wait
+        let mut notified = handle_wait.notify.notified();
+
         loop {
-            handle_wait.notify.notified().await;
+            // Check for pair before waiting to avoid race condition
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                info!("Tunnel {} is now active", tunnel_id);
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            notified.await;
+            // Reset for next iteration
+            notified = handle_wait.notify.notified();
 
             if let Some(pair) = handle_wait.take_pair_if_ready().await {
                 info!("Tunnel {} is now active", tunnel_id);
@@ -2160,8 +2210,20 @@ async fn handle_tunnel_socket(
     let handle_cleanup = entry.clone();
     let state_clone = state.clone();
     let wait_result = timeout(state.handshake_timeout, async move {
+        // Set up notification listener first, then check for pair
+        // This ensures we don't miss notifications between check and wait
+        let mut notified = handle_wait.notify.notified();
+
         loop {
-            handle_wait.notify.notified().await;
+            // Check for pair before waiting to avoid race condition
+            if let Some(pair) = handle_wait.take_pair_if_ready().await {
+                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
+                break;
+            }
+
+            notified.await;
+            // Reset for next iteration
+            notified = handle_wait.notify.notified();
 
             if let Some(pair) = handle_wait.take_pair_if_ready().await {
                 spawn_forwarders(state_clone.clone(), tunnel_id, pair);
@@ -2207,25 +2269,26 @@ async fn handle_tunnel_socket(
 
 #[instrument(level = "trace", skip(state, pair))]
 fn spawn_forwarders(state: Arc<AppState>, tunnel_id: Uuid, pair: TunnelPair) {
-    trace!("Spawning forwarders for tunnel {}", tunnel_id);
     match pair {
         TunnelPair::WebSocket(client_ws, server_ws) => {
+            info!("Tunnel {} forwarding via websocket transport", tunnel_id);
             tokio::spawn(async move {
                 if let Err(err) = forward_bidirectional(tunnel_id, client_ws, server_ws).await {
-                    warn!("Tunnel {tunnel_id} forwarding error: {err:?}");
+                    warn!("Tunnel {tunnel_id} websocket forwarding error: {err:?}");
                 }
-                trace!("Tunnel {tunnel_id} forwarding task finished");
+                trace!("Tunnel {tunnel_id} websocket forwarding task finished");
                 state.remove_tunnel(&tunnel_id).await;
             });
         }
         TunnelPair::Quic(client_quic, server_quic) => {
+            info!("Tunnel {} forwarding via quic transport", tunnel_id);
             tokio::spawn(async move {
                 if let Err(err) =
                     forward_quic_bidirectional(tunnel_id, client_quic, server_quic).await
                 {
-                    warn!("Tunnel {tunnel_id} QUIC forwarding error: {err:?}");
+                    warn!("Tunnel {tunnel_id} quic forwarding error: {err:?}");
                 }
-                trace!("Tunnel {tunnel_id} QUIC forwarding task finished");
+                trace!("Tunnel {tunnel_id} quic forwarding task finished");
                 state.remove_tunnel(&tunnel_id).await;
             });
         }
@@ -2473,7 +2536,10 @@ async fn quic_write_frame(
             .await
             .context("Failed to write QUIC frame payload")?;
     }
-    Ok(())
+    stream
+        .flush()
+        .await
+        .context("Failed to flush QUIC frame payload")
 }
 
 async fn quic_send_text(endpoint: &QuicTunnelEndpoint, text: &str) -> Result<()> {

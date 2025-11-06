@@ -27,7 +27,7 @@ use tokio::{
     sync::{Mutex, mpsc},
 };
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{trace, warn};
+use tracing::{info, trace, warn};
 use url::Url;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -63,6 +63,8 @@ impl RelayTransport for QuicTransport {
     }
 
     async fn spawn_tunnel(&self, params: TunnelConnectParams) -> Result<()> {
+        info!("Spawning tunnel {} via quic transport", params.tunnel_id);
+
         let url = Url::parse(&params.tunnel_url)
             .with_context(|| format!("Invalid relay tunnel URL {}", params.tunnel_url))?;
         let host = url
@@ -431,7 +433,10 @@ async fn write_frame(stream: &mut SendStream, frame_type: FrameType, payload: &[
             .await
             .context("Failed to write QUIC frame payload")?;
     }
-    Ok(())
+    stream
+        .flush()
+        .await
+        .context("Failed to flush QUIC frame payload")
 }
 
 fn build_tls_config(tls: TlsOptions) -> Result<ClientConfig> {

@@ -73,6 +73,8 @@ impl RelayTransport for WebSocketTransport {
             quic_port: _,
         } = params;
 
+        info!("Spawning tunnel {} via websocket transport", tunnel_id);
+
         tokio::spawn(async move {
             if let Err(err) = handle_tunnel(
                 tunnel_url,

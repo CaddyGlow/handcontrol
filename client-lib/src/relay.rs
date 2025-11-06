@@ -9,7 +9,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::io::DuplexStream;
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 use uuid::Uuid;
 
@@ -160,6 +160,8 @@ pub async fn establish_relay_tunnel(
     let mut errors: Vec<String> = Vec::new();
 
     for kind in attempt_order {
+        info!("Attempting relay connection via {} transport", kind.label());
+
         let transport: Arc<dyn RelayTransport> = match kind {
             TransportKind::Websocket => Arc::new(WebSocketTransport::default()),
             TransportKind::Quic => Arc::new(QuicTransport::default()),
@@ -242,8 +244,12 @@ pub async fn establish_relay_tunnel(
         .await;
 
         match attempt_result {
-            Ok(tunnel) => return Ok(tunnel),
+            Ok(tunnel) => {
+                info!("Successfully established relay tunnel via {} transport", kind.label());
+                return Ok(tunnel);
+            }
             Err(err) => {
+                debug!("Failed to connect via {} transport: {:#}", kind.label(), err);
                 errors.push(format!("{} transport: {:#}", kind.label(), err));
             }
         }

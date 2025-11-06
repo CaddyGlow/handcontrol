@@ -538,6 +538,9 @@ async fn run_interactive_shell(
         bail!("Realtime capabilities require an interactive TTY");
     }
 
+    let config = config::load()?;
+    let jiggle_resize = config.cli.jiggle_resize_on_resume;
+
     if resumed {
         println!("Resumed interactive session '{session_name}'.");
     } else if let Some(message) = session.ready_message() {
@@ -561,6 +564,7 @@ async fn run_interactive_shell(
     let mut exit_code: Option<i32> = None;
     let mut timed_out = false;
     let mut resume_attempts: usize = 0;
+    maybe_jiggle(jiggle_resize, &mut sender).await?;
     let mut outcome = drive_session(
         &mut session,
         &mut stdout,
@@ -583,6 +587,7 @@ async fn run_interactive_shell(
                 session = new_session;
                 sender = session.sender();
                 send_initial_resize(&sender).await;
+                maybe_jiggle(jiggle_resize, &mut sender).await?;
 
                 let handles = setup_io_tasks(sender.clone());
                 input_handle = handles.0;
@@ -616,6 +621,7 @@ async fn run_interactive_shell(
     drop(raw_guard);
 
     if detached {
+        let _ = sender.close(Some("Client detached".to_string())).await;
         println!("\nDetached from session {}.", session.session_id());
         println!(
             "Resume later with: handcontrol-cli resume {} {}",
@@ -829,6 +835,33 @@ async fn cleanup_io_tasks(
         handle.abort();
         let _ = handle.await;
     }
+}
+
+async fn maybe_jiggle(enabled: bool, sender: &mut CapabilitySessionSender) -> Result<()> {
+    if enabled {
+        jiggle_terminal(sender).await?;
+    }
+    Ok(())
+}
+
+async fn jiggle_terminal(sender: &mut CapabilitySessionSender) -> Result<()> {
+    if let Ok((cols, rows)) = terminal_size() {
+        if cols == 0 || rows == 0 {
+            return Ok(());
+        }
+
+        sender
+            .send_resize(u32::from(cols.saturating_add(1)), u32::from(rows))
+            .await
+            .ok();
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        sender
+            .send_resize(u32::from(cols), u32::from(rows))
+            .await
+            .ok();
+    }
+
+    Ok(())
 }
 
 async fn run_sessions(cmd: SessionsCommand) -> Result<()> {

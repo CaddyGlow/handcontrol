@@ -158,6 +158,8 @@ pub struct CliConfig {
     pub show_headers: bool,
     #[serde(default = "default_color_output")]
     pub color_output: String,
+    #[serde(default = "default_true")]
+    pub jiggle_resize_on_resume: bool,
 }
 
 impl Default for CliConfig {
@@ -166,6 +168,7 @@ impl Default for CliConfig {
             output_format: "tsv".to_string(),
             show_headers: true,
             color_output: "auto".to_string(),
+            jiggle_resize_on_resume: true,
         }
     }
 }

@@ -245,11 +245,18 @@ pub async fn establish_relay_tunnel(
 
         match attempt_result {
             Ok(tunnel) => {
-                info!("Successfully established relay tunnel via {} transport", kind.label());
+                info!(
+                    "Successfully established relay tunnel via {} transport",
+                    kind.label()
+                );
                 return Ok(tunnel);
             }
             Err(err) => {
-                debug!("Failed to connect via {} transport: {:#}", kind.label(), err);
+                debug!(
+                    "Failed to connect via {} transport: {:#}",
+                    kind.label(),
+                    err
+                );
                 errors.push(format!("{} transport: {:#}", kind.label(), err));
             }
         }

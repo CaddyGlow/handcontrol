@@ -40,6 +40,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::futures::Notified;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio::time::timeout;
 use tracing::{Span, field, instrument};
@@ -788,44 +789,15 @@ async fn handle_quic_connect(
         return Ok(());
     }
 
-    let handle_wait = tunnel_entry.clone();
     let handle_cleanup = tunnel_entry.clone();
-    let state_clone = state.clone();
-    let wait_result = timeout(state.handshake_timeout, async move {
-        let mut notified = notified;
-
-        loop {
-            // Check for pair before waiting to avoid race condition
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                info!("Tunnel {} is now active", tunnel_id);
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            notified.await;
-            // Reset for next iteration
-            notified = handle_wait.notify.notified();
-
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                info!("Tunnel {} is now active", tunnel_id);
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            let already_active = {
-                let guard = handle_wait.state.lock().await;
-                guard.is_fully_ready()
-            };
-
-            if already_active {
-                trace!(
-                    "Tunnel {} already active; connect handler exiting",
-                    tunnel_id
-                );
-                break;
-            }
-        }
-    })
+    let wait_result = wait_for_tunnel_activation(
+        tunnel_entry.clone(),
+        state.clone(),
+        tunnel_id,
+        state.handshake_timeout,
+        notified,
+        "client quic",
+    )
     .await;
 
     if wait_result.is_err() {
@@ -904,42 +876,15 @@ async fn handle_quic_server_tunnel(
         return Ok(());
     }
 
-    let handle_wait = entry.clone();
     let handle_cleanup = entry.clone();
-    let state_clone = state.clone();
-    let wait_result = timeout(state.handshake_timeout, async move {
-        let mut notified = notified;
-
-        loop {
-            // Check for pair before waiting to avoid race condition
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            notified.await;
-            // Reset for next iteration
-            notified = handle_wait.notify.notified();
-
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            let already_active = {
-                let guard = handle_wait.state.lock().await;
-                guard.is_fully_ready()
-            };
-
-            if already_active {
-                trace!(
-                    "Tunnel {} already active; server QUIC handler exiting",
-                    tunnel_id
-                );
-                break;
-            }
-        }
-    })
+    let wait_result = wait_for_tunnel_activation(
+        entry.clone(),
+        state.clone(),
+        tunnel_id,
+        state.handshake_timeout,
+        notified,
+        "server quic",
+    )
     .await;
 
     if wait_result.is_err() {
@@ -1095,7 +1040,11 @@ impl TunnelHandle {
         let mut client_guard = self.client_quic.lock().await;
         let mut server_guard = self.server_quic.lock().await;
 
-        debug!("take_pair_if_ready: client_quic={} server_quic={}", client_guard.is_some(), server_guard.is_some());
+        debug!(
+            "take_pair_if_ready: client_quic={} server_quic={}",
+            client_guard.is_some(),
+            server_guard.is_some()
+        );
 
         // Only take if BOTH are present
         if client_guard.is_some() && server_guard.is_some() {
@@ -2030,6 +1979,9 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
     tunnel_entry.notify.notify_waiters();
     trace!("Client readiness recorded");
 
+    // Register listener before attaching to avoid missing server notifications
+    let notified = tunnel_entry.notify.notified();
+
     info!(
         "Client {} waiting for server tunnel {}",
         client_id, tunnel_id
@@ -2042,48 +1994,15 @@ async fn handle_connect_socket(mut socket: WebSocket, state: Arc<AppState>) -> R
         return Ok(());
     }
 
-    let handle_wait = tunnel_entry.clone();
     let handle_cleanup = tunnel_entry.clone();
-    let state_clone = state.clone();
-    let wait_result = timeout(state.handshake_timeout, async move {
-        // Set up notification listener first, then check for pair
-        // This ensures we don't miss notifications between check and wait
-        let mut notified = handle_wait.notify.notified();
-
-        loop {
-            // Check for pair before waiting to avoid race condition
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                info!("Tunnel {} is now active", tunnel_id);
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            notified.await;
-            // Reset for next iteration
-            notified = handle_wait.notify.notified();
-
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                info!("Tunnel {} is now active", tunnel_id);
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            let already_active = {
-                let guard = handle_wait.state.lock().await;
-                guard.is_fully_ready()
-            };
-
-            if already_active {
-                trace!(
-                    "Tunnel {} already active; connect handler exiting",
-                    tunnel_id
-                );
-                break;
-            }
-
-            trace!("Notified but tunnel pair not ready yet");
-        }
-    })
+    let wait_result = wait_for_tunnel_activation(
+        tunnel_entry.clone(),
+        state.clone(),
+        tunnel_id,
+        state.handshake_timeout,
+        notified,
+        "client websocket",
+    )
     .await;
 
     if wait_result.is_err() {
@@ -2198,6 +2117,9 @@ async fn handle_tunnel_socket(
     entry.notify.notify_waiters();
     trace!("Server readiness recorded");
 
+    // Register listener before attaching to avoid missing client notifications
+    let notified = entry.notify.notified();
+
     info!("Server confirmed tunnel {}", tunnel_id);
 
     if let Some(pair) = entry.attach_server_ws(socket).await {
@@ -2206,44 +2128,15 @@ async fn handle_tunnel_socket(
         return Ok(());
     }
 
-    let handle_wait = entry.clone();
     let handle_cleanup = entry.clone();
-    let state_clone = state.clone();
-    let wait_result = timeout(state.handshake_timeout, async move {
-        // Set up notification listener first, then check for pair
-        // This ensures we don't miss notifications between check and wait
-        let mut notified = handle_wait.notify.notified();
-
-        loop {
-            // Check for pair before waiting to avoid race condition
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            notified.await;
-            // Reset for next iteration
-            notified = handle_wait.notify.notified();
-
-            if let Some(pair) = handle_wait.take_pair_if_ready().await {
-                spawn_forwarders(state_clone.clone(), tunnel_id, pair);
-                break;
-            }
-
-            let already_active = {
-                let guard = handle_wait.state.lock().await;
-                guard.is_fully_ready()
-            };
-
-            if already_active {
-                trace!(
-                    "Tunnel {} already active; server handler exiting",
-                    tunnel_id
-                );
-                break;
-            }
-        }
-    })
+    let wait_result = wait_for_tunnel_activation(
+        entry.clone(),
+        state.clone(),
+        tunnel_id,
+        state.handshake_timeout,
+        notified,
+        "server websocket",
+    )
     .await;
 
     if wait_result.is_err() {
@@ -2293,6 +2186,50 @@ fn spawn_forwarders(state: Arc<AppState>, tunnel_id: Uuid, pair: TunnelPair) {
             });
         }
     }
+}
+
+async fn wait_for_tunnel_activation<'a>(
+    handle: Arc<TunnelHandle>,
+    state: Arc<AppState>,
+    tunnel_id: Uuid,
+    handshake_timeout: Duration,
+    initial_notified: Notified<'a>,
+    wait_context: &'static str,
+) -> Result<(), tokio::time::error::Elapsed> {
+    timeout(handshake_timeout, async move {
+        let mut pending_notified = Some(initial_notified);
+
+        loop {
+            if let Some(pair) = handle.take_pair_if_ready().await {
+                info!("Tunnel {} is now active ({})", tunnel_id, wait_context);
+                spawn_forwarders(state.clone(), tunnel_id, pair);
+                break;
+            }
+
+            let notified = pending_notified
+                .take()
+                .expect("pending notified future missing");
+            notified.await;
+            pending_notified = Some(handle.notify.notified());
+
+            if let Some(pair) = handle.take_pair_if_ready().await {
+                info!("Tunnel {} is now active ({})", tunnel_id, wait_context);
+                spawn_forwarders(state.clone(), tunnel_id, pair);
+                break;
+            }
+
+            let already_active = {
+                let guard = handle.state.lock().await;
+                guard.is_fully_ready()
+            };
+
+            if already_active {
+                trace!("Tunnel {} already active ({})", tunnel_id, wait_context);
+                break;
+            }
+        }
+    })
+    .await
 }
 
 #[instrument(level = "trace", skip(client_ws, server_ws))]
